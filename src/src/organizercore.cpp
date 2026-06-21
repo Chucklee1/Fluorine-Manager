@@ -809,7 +809,14 @@ void OrganizerCore::prepareVFS()
     m_USVFS.setRootBuilderEnabled(vfsRootBuilder, storageDir.toStdString());
   }
 
-  m_USVFS.updateMapping(fileMapping(m_CurrentProfile->name(), QString()));
+  // Games that manage their own VFS (e.g. OpenMW via openmw.cfg) opt out of the
+  // FUSE mount; Fluorine must not overlay Data Files for them.
+  if (managedGame() == nullptr || managedGame()->usesVFS()) {
+    m_USVFS.updateMapping(fileMapping(m_CurrentProfile->name(), QString()));
+  } else {
+    log::debug("prepareVFS: skipping FUSE mount; managed game manages its own "
+               "VFS (usesVFS=false)");
+  }
 }
 
 void OrganizerCore::unmountVFS()
@@ -2687,8 +2694,14 @@ bool OrganizerCore::beforeRun(
   }
 
   try {
-    m_USVFS.updateMapping(fileMapping(profileName, customOverwrite));
-    m_USVFS.updateForcedLibraries(forcedLibraries);
+    // OpenMW and other self-managed-VFS games skip the FUSE mount (usesVFS()).
+    if (managedGame() == nullptr || managedGame()->usesVFS()) {
+      m_USVFS.updateMapping(fileMapping(profileName, customOverwrite));
+      m_USVFS.updateForcedLibraries(forcedLibraries);
+    } else {
+      log::debug("beforeRun: skipping FUSE mount; managed game manages its own "
+                 "VFS (usesVFS=false)");
+    }
   } catch (const FuseConnectorException& e) {
     log::error("VFS mount failed: {}", e.what());
     return false;
