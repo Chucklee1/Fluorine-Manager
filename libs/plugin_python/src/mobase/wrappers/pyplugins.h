@@ -434,6 +434,10 @@ namespace mo2::python {
         {
             PYBIND11_OVERRIDE(bool, IPluginGame, isNativeLinux, );
         }
+        bool usesVFS() const override
+        {
+            PYBIND11_OVERRIDE(bool, IPluginGame, usesVFS, );
+        }
         QIcon gameIcon() const override
         {
             PYBIND11_OVERRIDE_PURE(QIcon, IPluginGame, gameIcon, );
