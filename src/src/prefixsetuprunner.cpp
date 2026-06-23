@@ -220,19 +220,6 @@ static const char* DOTNET8_X64_URL =
     "https://download.visualstudio.microsoft.com/download/pr/136f4593-e3cd-4d52-bc25-579cdf46e80c/"
     "8b98c1347293b48c56c3a68d72f586a1/dotnet-runtime-8.0.12-win-x64.exe";
 
-static const char* DOTNET_DESKTOP6_X86_URL =
-    "https://download.visualstudio.microsoft.com/download/pr/cdc314df-4a4c-4709-868d-b974f336f77f/"
-    "acd5ab7637e456c8a3aa667661324f6d/windowsdesktop-runtime-6.0.36-win-x86.exe";
-static const char* DOTNET_DESKTOP6_X64_URL =
-    "https://download.visualstudio.microsoft.com/download/pr/f6b6c5dc-e02d-4738-9559-296e938dabcb/"
-    "b66d365729359df8e8ea131197715076/windowsdesktop-runtime-6.0.36-win-x64.exe";
-
-static const QStringList DOTNET_DESKTOP6_X86_SHA256 = {
-    QStringLiteral("4e77bd970df0a06528ee88d33e4a8c9fb85beedbdd7219b017083acf0c3aa39e"),
-};
-static const QStringList DOTNET_DESKTOP6_X64_SHA256 = {
-    QStringLiteral("0d20debb26fc8b2bc84f25fbd9d4596a6364af8517ebf012e8b871127b798941"),
-};
 static const QStringList DOTNET6_X86_SHA256 = {
     QStringLiteral("3b3cb4636251a582158f4b6b340f20b3861e6793eb9a3e64bda29cbf32da3604"),
 };
@@ -682,13 +669,6 @@ void PrefixSetupRunner::buildStepList()
   // Runtime installers (run via Wine).
   addStep("vcrun2022", "Visual C++ 2022",
           [this] { return stepVcrun2022(); });
-  addStep("dotnetdesktop6", ".NET Desktop Runtime 6",
-          [this] {
-            return stepDotNetInstallPair(
-                DOTNET_DESKTOP6_X86_URL, DOTNET_DESKTOP6_X64_URL,
-                ".NET Desktop 6", DOTNET_DESKTOP6_X86_SHA256,
-                DOTNET_DESKTOP6_X64_SHA256);
-          });
   addStep("dotnet_runtimes", ".NET Runtimes (6-9)",
           [this] { return stepDotNetRuntimes(); });
   addStep("dotnet10_sdk", ".NET 10 SDK",

@@ -92,7 +92,7 @@ TEST(VfsFileOps, CreateFileReturnsWritableStagingHandle)
 
   OverwriteManager overwriteManager(staging.string(), overwrite.string());
   std::string realPath;
-  const int fd = overwriteManager.createFile("ShaderCache/Lighting/test.pso",
+  const int fd = overwriteManager.createFile("Data/ShaderCache/Lighting/test.pso",
                                              0600, &realPath);
   ASSERT_GE(fd, 0);
 
@@ -100,8 +100,30 @@ TEST(VfsFileOps, CreateFileReturnsWritableStagingHandle)
   ASSERT_EQ(write(fd, payload, sizeof(payload) - 1), ssize_t(sizeof(payload) - 1));
   close(fd);
 
-  EXPECT_EQ(fs::path(realPath), staging / "ShaderCache/Lighting/test.pso");
+  EXPECT_EQ(fs::path(realPath), staging / "Data/ShaderCache/Lighting/test.pso");
   EXPECT_EQ(readText(realPath), "shader");
+}
+
+TEST(VfsFileOps, CreateShaderCacheFileReusesExistingCaseVariant)
+{
+  TempRoot tmp;
+  ASSERT_FALSE(tmp.path().empty());
+
+  const fs::path staging = tmp.path() / "staging";
+  const fs::path overwrite = tmp.path() / "overwrite";
+  fs::create_directories(staging / "Data" / "ShaderCache" / "Lighting");
+
+  OverwriteManager overwriteManager(staging.string(), overwrite.string());
+  std::error_code ec;
+  std::string realPath;
+  const int fd = overwriteManager.createFile("data/shadercache/lighting/test.pso",
+                                             0600, &realPath, &ec);
+  ASSERT_GE(fd, 0);
+  ASSERT_FALSE(ec);
+  close(fd);
+
+  EXPECT_EQ(fs::path(realPath),
+            staging / "Data" / "ShaderCache" / "Lighting" / "test.pso");
 }
 
 TEST(VfsFileOps, CreateFileReusesExistingCaseVariant)

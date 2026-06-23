@@ -166,6 +166,21 @@ static QString tempArchivePath(const QString& archivePath)
   return QDir(QDir::tempPath()).filePath(normalizeArchivePath(archivePath));
 }
 
+static QString fomodFilePath(const QString& fomodPath, const QString& fomodDirName,
+                             const QString& fileName)
+{
+  const QString directory = tempArchivePath(joinArchivePath(fomodPath, fomodDirName));
+  const QDir dir(directory);
+
+  for (const QString& candidate : dir.entryList(QDir::Files | QDir::NoDotAndDotDot)) {
+    if (candidate.compare(fileName, Qt::CaseInsensitive) == 0) {
+      return dir.filePath(candidate);
+    }
+  }
+
+  return dir.filePath(fileName);
+}
+
 QByteArray skipXmlHeader(QIODevice& file)
 {
   static const unsigned char UTF16LE_BOM[] = {0xFF, 0xFE};
@@ -265,8 +280,7 @@ void FomodInstallerDialog::readXml(QFile& file,
 
 void FomodInstallerDialog::readInfoXml()
 {
-  QFile file(tempArchivePath(joinArchivePath(
-      joinArchivePath(m_FomodPath, m_FomodDirName), "info.xml")));
+  QFile file(fomodFilePath(m_FomodPath, m_FomodDirName, "info.xml"));
 
   // We don't need a info.xml file, so we just return if we cannot open it:
   if (!file.open(QIODevice::ReadOnly)) {
@@ -277,8 +291,7 @@ void FomodInstallerDialog::readInfoXml()
 
 void FomodInstallerDialog::readModuleConfigXml()
 {
-  QFile file(tempArchivePath(joinArchivePath(
-      joinArchivePath(m_FomodPath, m_FomodDirName), "ModuleConfig.xml")));
+  QFile file(fomodFilePath(m_FomodPath, m_FomodDirName, "ModuleConfig.xml"));
   if (!file.open(QIODevice::ReadOnly)) {
     throw Exception(tr("%1 missing.").arg(file.fileName()));
   }

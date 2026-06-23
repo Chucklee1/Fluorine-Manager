@@ -64,6 +64,7 @@ if(HAS_NO_DIRECT_EXTERN_ACCESS)
 endif()
 
 option(BUILD_TESTING "Build tests" OFF)
+option(BUILD_FLUORINE_TESTING "Build Fluorine standalone tests" OFF)
 option(BUILD_BSA_FFI "Build Rust BSA/BA2 FFI library" ON)
 option(BUILD_DOTNET_PLUGINS "Build C++/CLI .NET plugins (Windows+MSVC only)" OFF)
 option(BUILD_PLUGIN_PYTHON "Build plugin_python bridge on Linux" ON)
@@ -285,7 +286,7 @@ endif()
 # Main organizer executable
 add_subdirectory(src/src)
 
-if (BUILD_TESTING)
+if (BUILD_FLUORINE_TESTING)
     enable_testing()
     add_subdirectory(src/tests)
 endif()

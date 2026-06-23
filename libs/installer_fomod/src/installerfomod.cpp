@@ -1,5 +1,7 @@
 #include "installerfomod.h"
 
+#include <algorithm>
+
 #include <QImageReader>
 #include <QStringList>
 #include <QtPlugin>
@@ -115,10 +117,14 @@ InstallerFomod::findFomodDirectory(std::shared_ptr<const IFileTree> tree) const
 bool InstallerFomod::isArchiveSupported(std::shared_ptr<const IFileTree> tree) const
 {
   tree = findFomodDirectory(tree);
-  if (tree != nullptr) {
-    return tree->exists("ModuleConfig.xml", FileTreeEntry::FILE);
+  if (tree == nullptr) {
+    return false;
   }
-  return false;
+
+  return std::any_of(tree->begin(), tree->end(), [](const auto& entry) {
+    return entry->isFile() &&
+           entry->name().compare("ModuleConfig.xml", Qt::CaseInsensitive) == 0;
+  });
 }
 
 void InstallerFomod::appendImageFiles(
@@ -145,7 +151,8 @@ InstallerFomod::buildFomodTree(std::shared_ptr<const IFileTree> tree) const
 
   for (auto entry : *fomodTree) {
     if (entry->isFile() &&
-        (entry->compare("info.xml") == 0 || entry->compare("ModuleConfig.xml") == 0)) {
+        (entry->name().compare("info.xml", Qt::CaseInsensitive) == 0 ||
+         entry->name().compare("ModuleConfig.xml", Qt::CaseInsensitive) == 0)) {
       entries.push_back(entry);
     }
   }
