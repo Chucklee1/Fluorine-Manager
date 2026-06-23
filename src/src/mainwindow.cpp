@@ -95,6 +95,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <QAbstractItemDelegate>
 #include <QAction>
 #include <QApplication>
+#include <QGuiApplication>
 #include <QBuffer>
 #include <QButtonGroup>
 #include <QCheckBox>
@@ -2254,8 +2255,15 @@ void MainWindow::readSettings()
 {
   const auto& s = m_OrganizerCore.settings();
 
-  if (!s.geometry().restoreGeometry(this)) {
-    resize(1300, 800);
+  // Qt Wayland's session-management client restores the geometry before the
+  // first surface commit.  Calling restoreGeometry() ourselves races that
+  // protocol and prevents the compositor from restoring the prior window
+  // position.  X11/XWayland still relies on the existing Qt geometry state.
+  if (!QGuiApplication::platformName().startsWith(QStringLiteral("wayland"),
+                                                   Qt::CaseInsensitive)) {
+    if (!s.geometry().restoreGeometry(this)) {
+      resize(1300, 800);
+    }
   }
 
   s.geometry().restoreState(this);
