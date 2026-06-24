@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -1380,6 +1381,54 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
   const auto lr = lookupChild(ctx, parent, name);
 
   if (!lr.found) {
+    // USVFS-parity: games (e.g. Starfield) sometimes skip mkdir for intermediate
+    // directories and go straight to CreateFile("ShaderCache/Lighting/X.pso").
+    // USVFS intercepts at Win32 level and auto-creates parent dirs in overwrite.
+    // FUSE sits below the kernel path-resolver, so ENOENT here prevents mo2_create
+    // from ever being called. Work around it: if the requested name looks like a
+    // directory (no '.' — file-like names are excluded to avoid spurious dirs),
+    // auto-create it in staging so the kernel can continue resolving the path.
+    // createDirectory uses create_directories internally, so staging parent dirs
+    // are also created if the parent came from overwrite rather than this session.
+    const std::string_view nameView(name);
+    if (nameView.find('.') == std::string_view::npos) {
+      bool parentOk = false;
+      const std::string parentPath = inodeToPath(ctx, parent, &parentOk);
+      if (parentOk) {
+        const std::string childName = canonicalChildName(ctx, parentPath, name);
+        const std::string childPath = joinPath(parentPath, childName);
+        std::error_code createErr;
+        if (ctx->overwrite->createDirectory(childPath, &createErr)) {
+          {
+            std::unique_lock lock(ctx->tree_mutex);
+            ctx->tree->root.insertDirectory(splitPath(childPath));
+            ++ctx->tree->dir_count;
+            invalidateNodeCache(ctx, childPath);
+          }
+          invalidateDirCache(ctx, parentPath);
+          fuse_ino_t dirIno;
+          {
+            std::unique_lock lock(ctx->inode_mutex);
+            dirIno = ctx->inodes->getOrCreate(childPath);
+          }
+          struct fuse_entry_param e;
+          std::memset(&e, 0, sizeof(e));
+          e.ino           = dirIno;
+          e.attr_timeout  = TTL_SECONDS;
+          e.entry_timeout = TTL_SECONDS;
+          fillStatForDir(&e.attr, dirIno, ctx->uid, ctx->gid);
+          {
+            std::scoped_lock cacheLock(ctx->lookup_cache_mutex);
+            ctx->lookup_cache[cacheKey] =
+                Mo2FsContext::LookupCacheEntry{.child_ino=dirIno, .entry=e};
+          }
+          std::fprintf(stderr, "[VFS] auto-mkdir staging: %s\n", childPath.c_str());
+          fuse_reply_entry(req, &e);
+          return;
+        }
+      }
+    }
+
     struct fuse_entry_param e;
     std::memset(&e, 0, sizeof(e));
     e.ino           = 0;
@@ -1849,6 +1898,9 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
           openMtime = std::chrono::system_clock::now();
           updateFileNodeKnown(ctx, path, realPath, originForPath(ctx, realPath),
                               openSize, openMtime);
+          // Flush stale kernel page cache so the next read sees the truncated
+          // content, not the pre-truncation data cached from a prior open.
+          fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
         }
       } else {
         // Mod file disappeared — fall through to normal handling
@@ -1868,6 +1920,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
         openMtime = std::chrono::system_clock::now();
         updateFileNodeKnown(ctx, path, realPath, originForPath(ctx, realPath),
                             openSize, openMtime);
+        fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
       }
     } else if (fd < 0 && truncateOnOpen) {
       try {
@@ -1887,6 +1940,10 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
           openMtime   = std::chrono::system_clock::now();
           updateFileNodeKnown(ctx, path, newPath, originForPath(ctx, newPath),
                               openSize, openMtime);
+          // The file's backing path changed from mod/base-game to staging.
+          // Flush the kernel page cache so subsequent reads go through FUSE
+          // and see the staging content, not the pre-COW cached data.
+          fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
         }
       } catch (...) {
         fuse_reply_err(req, EIO);
@@ -2016,7 +2073,7 @@ void mo2_read(fuse_req_t req, fuse_ino_t /*ino*/, size_t size, off_t off,
   fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
 }
 
-void mo2_write(fuse_req_t req, fuse_ino_t /*ino*/, const char* buf, size_t size,
+void mo2_write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
                off_t off, struct fuse_file_info* fi)
 {
   Mo2FsContext* ctx = getContext(req);
@@ -2089,6 +2146,13 @@ void mo2_write(fuse_req_t req, fuse_ino_t /*ino*/, const char* buf, size_t size,
       }
       realPath = newPath;
       updateFileNode(ctx, relativePath, newPath, originForPath(ctx, newPath));
+      // Lazy COW: backing path just changed to staging. Flush the kernel page
+      // cache so the caller's next read sees staging content, not the stale
+      // pre-COW pages. This is the counterpart to the O_TRUNC invalidation in
+      // mo2_open — without it, repeated WritePrivateProfileString calls on the
+      // same INI file each read the old mod-file content and only the last
+      // write survives.
+      fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
     } catch (...) {
       fuse_reply_err(req, EIO);
       return;
