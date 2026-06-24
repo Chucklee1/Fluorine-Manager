@@ -173,6 +173,10 @@ struct Mo2FsContext
   uid_t uid = 0;
   gid_t gid = 0;
 
+  // Set once after fuse_session_new(); used by notify_inval_inode calls to
+  // flush stale kernel page cache without needing fuse_req_session(req).
+  struct fuse_session* session = nullptr;
+
 };
 
 void mo2_init(void* userdata, struct fuse_conn_info* conn);

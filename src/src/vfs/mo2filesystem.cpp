@@ -1900,7 +1900,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
                               openSize, openMtime);
           // Flush stale kernel page cache so the next read sees the truncated
           // content, not the pre-truncation data cached from a prior open.
-          fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
+          fuse_lowlevel_notify_inval_inode(ctx->session, ino, 0, 0);
         }
       } else {
         // Mod file disappeared — fall through to normal handling
@@ -1920,7 +1920,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
         openMtime = std::chrono::system_clock::now();
         updateFileNodeKnown(ctx, path, realPath, originForPath(ctx, realPath),
                             openSize, openMtime);
-        fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
+        fuse_lowlevel_notify_inval_inode(ctx->session, ino, 0, 0);
       }
     } else if (fd < 0 && truncateOnOpen) {
       try {
@@ -1943,7 +1943,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
           // The file's backing path changed from mod/base-game to staging.
           // Flush the kernel page cache so subsequent reads go through FUSE
           // and see the staging content, not the pre-COW cached data.
-          fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
+          fuse_lowlevel_notify_inval_inode(ctx->session, ino, 0, 0);
         }
       } catch (...) {
         fuse_reply_err(req, EIO);
@@ -2152,7 +2152,7 @@ void mo2_write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
       // mo2_open — without it, repeated WritePrivateProfileString calls on the
       // same INI file each read the old mod-file content and only the last
       // write survives.
-      fuse_lowlevel_notify_inval_inode(fuse_req_session(req), ino, 0, 0);
+      fuse_lowlevel_notify_inval_inode(ctx->session, ino, 0, 0);
     } catch (...) {
       fuse_reply_err(req, EIO);
       return;

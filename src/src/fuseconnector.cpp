@@ -578,6 +578,7 @@ bool FuseConnector::mount(
     m_backingFd = -1;
     throw FuseConnectorException(QObject::tr("Failed to create FUSE session"));
   }
+  m_context->session = m_session;
 
   if (fuse_session_mount(m_session, m_mountPoint.c_str()) != 0) {
     fuse_session_destroy(m_session);
