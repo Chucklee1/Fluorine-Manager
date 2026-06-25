@@ -1390,6 +1390,12 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
     // auto-create it in staging so the kernel can continue resolving the path.
     // createDirectory uses create_directories internally, so staging parent dirs
     // are also created if the parent came from overwrite rather than this session.
+    // USVFS-parity: games sometimes skip mkdir for intermediate directories and
+    // go straight to CreateFile("ShaderCache/Lighting/X.pso"). The kernel's
+    // path-resolver needs a positive inode for each component before it can
+    // call mo2_create. Insert a phantom virtual directory — no physical creation.
+    // createFile() calls create_directories on the parent path, so the real dir
+    // will materialize on disk only when a file is actually written inside it.
     const std::string_view nameView(name);
     if (nameView.find('.') == std::string_view::npos) {
       bool parentOk = false;
@@ -1397,35 +1403,31 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
       if (parentOk) {
         const std::string childName = canonicalChildName(ctx, parentPath, name);
         const std::string childPath = joinPath(parentPath, childName);
-        std::error_code createErr;
-        if (ctx->overwrite->createDirectory(childPath, &createErr)) {
-          {
-            std::unique_lock lock(ctx->tree_mutex);
-            ctx->tree->root.insertDirectory(splitPath(childPath));
-            ++ctx->tree->dir_count;
-            invalidateNodeCache(ctx, childPath);
-          }
-          invalidateDirCache(ctx, parentPath);
-          fuse_ino_t dirIno;
-          {
-            std::unique_lock lock(ctx->inode_mutex);
-            dirIno = ctx->inodes->getOrCreate(childPath);
-          }
-          struct fuse_entry_param e;
-          std::memset(&e, 0, sizeof(e));
-          e.ino           = dirIno;
-          e.attr_timeout  = TTL_SECONDS;
-          e.entry_timeout = TTL_SECONDS;
-          fillStatForDir(&e.attr, dirIno, ctx->uid, ctx->gid);
-          {
-            std::scoped_lock cacheLock(ctx->lookup_cache_mutex);
-            ctx->lookup_cache[cacheKey] =
-                Mo2FsContext::LookupCacheEntry{.child_ino=dirIno, .entry=e};
-          }
-          std::fprintf(stderr, "[VFS] auto-mkdir staging: %s\n", childPath.c_str());
-          fuse_reply_entry(req, &e);
-          return;
+        {
+          std::unique_lock lock(ctx->tree_mutex);
+          ctx->tree->root.insertDirectory(splitPath(childPath));
+          ++ctx->tree->dir_count;
+          invalidateNodeCache(ctx, childPath);
         }
+        invalidateDirCache(ctx, parentPath);
+        fuse_ino_t dirIno;
+        {
+          std::unique_lock lock(ctx->inode_mutex);
+          dirIno = ctx->inodes->getOrCreate(childPath);
+        }
+        struct fuse_entry_param e;
+        std::memset(&e, 0, sizeof(e));
+        e.ino           = dirIno;
+        e.attr_timeout  = TTL_SECONDS;
+        e.entry_timeout = TTL_SECONDS;
+        fillStatForDir(&e.attr, dirIno, ctx->uid, ctx->gid);
+        {
+          std::scoped_lock cacheLock(ctx->lookup_cache_mutex);
+          ctx->lookup_cache[cacheKey] =
+              Mo2FsContext::LookupCacheEntry{.child_ino=dirIno, .entry=e};
+        }
+        fuse_reply_entry(req, &e);
+        return;
       }
     }
 

@@ -92,6 +92,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include "shared/filesorigin.h"
 
 #include "slrmanager.h"
+#include "lootmanager.h"
 #include <QAbstractItemDelegate>
 #include <QAction>
 #include <QApplication>
@@ -348,6 +349,11 @@ MainWindow::MainWindow(Settings& settings, OrganizerCore& organizerCore,
   auto& features = m_OrganizerCore.gameFeatures();
   if (!features.gameFeature<GamePlugins>()) {
     ui->tabWidget->removeTab(ui->tabWidget->indexOf(ui->espTab));
+  }
+  if (m_OrganizerCore.managedGame() &&
+      m_OrganizerCore.managedGame()->sortMechanism() !=
+          MOBase::IPluginGame::SortMechanism::LOOT) {
+    ui->sortButton->setVisible(false);
   }
   if (!features.gameFeature<DataArchives>()) {
     ui->tabWidget->removeTab(ui->tabWidget->indexOf(ui->bsaTab));
@@ -4018,6 +4024,58 @@ bool MainWindow::createBackup(const QString& filePath, const QDateTime& time)
   } else {
     return false;
   }
+}
+
+void MainWindow::on_sortButton_clicked()
+{
+  if (!isLootInstalled()) {
+    auto* progress = new QProgressDialog(
+        tr("Downloading LOOT...\nThis is required for plugin sorting."),
+        tr("Cancel"), 0, 0, this);
+    progress->setWindowTitle(tr("LOOT"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+
+    int cancelFlag = 0;
+    connect(progress, &QProgressDialog::canceled, this,
+            [&cancelFlag] { cancelFlag = 1; });
+
+    QFutureWatcher<QString> watcher;
+    QEventLoop loop;
+    connect(&watcher, &QFutureWatcher<QString>::finished, &loop, &QEventLoop::quit);
+    watcher.setFuture(
+        QtConcurrent::run([&cancelFlag]() -> QString {
+          return downloadLoot(nullptr, nullptr, &cancelFlag);
+        }));
+    progress->show();
+    loop.exec();
+    progress->close();
+    progress->deleteLater();
+
+    if (cancelFlag)
+      return;
+    const QString err = watcher.result();
+    if (!err.isEmpty()) {
+      log::error("[LOOT] Download failed: {}", err);
+      QMessageBox::warning(this, tr("LOOT"),
+                           tr("LOOT download failed:\n%1").arg(err));
+      return;
+    }
+  }
+
+  const QString lootExe = getLootExePath();
+  if (lootExe.isEmpty()) {
+    QMessageBox::warning(this, tr("LOOT"),
+                         tr("LOOT executable not found after install."));
+    return;
+  }
+
+  m_OrganizerCore.processRunner()
+      .setBinary(QFileInfo(lootExe))
+      .setCurrentDirectory(QDir(lootInstallDir()))
+      .setHooked(true)
+      .setWaitForCompletion(ProcessRunner::TriggerRefresh)
+      .run();
 }
 
 void MainWindow::on_saveButton_clicked()

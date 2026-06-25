@@ -820,6 +820,16 @@
                 </spacer>
                </item>
                <item>
+                <widget class="QPushButton" name="sortButton">
+                 <property name="toolTip">
+                  <string>Sort plugins using LOOT.</string>
+                 </property>
+                 <property name="text">
+                  <string>Sort</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
                 <widget class="QPushButton" name="restoreButton">
                  <property name="toolTip">
                   <string>Restore a backup.</string>

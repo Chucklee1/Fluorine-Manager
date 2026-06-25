@@ -480,6 +480,7 @@ private slots:  // ui slots
   void on_showHiddenBox_toggled(bool checked);
   void on_bsaList_itemChanged(QTreeWidgetItem* item, int column);
 
+  void on_sortButton_clicked();
   void on_saveButton_clicked();
   void on_restoreButton_clicked();
   void on_restoreModsButton_clicked();
