@@ -38,6 +38,7 @@ static const QMap<QString, QString> s_MO2ToBethiniName = {
     {"Fallout 4", "Fallout 4"},
     {"Fallout New Vegas", "Fallout New Vegas"},
     {"New Vegas", "Fallout New Vegas"},
+    {"TTW", "Fallout New Vegas"},
     {"Starfield", "Starfield"},
 };
 
