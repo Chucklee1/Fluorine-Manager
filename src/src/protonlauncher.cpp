@@ -169,6 +169,14 @@ bool shouldExposeMountPointToPressureVessel(const QString& mountPoint,
                                             const QString& fsType,
                                             const QString& source)
 {
+  // Always expose our VFS FUSE mount explicitly.  pressure-vessel's default
+  // sharing of /run/media (and home) uses non-recursive bind mounts that do
+  // not propagate FUSE submounts into the container — games on SD card end up
+  // writing to the real game directory and bypassing the VFS entirely.
+  if (fsType == QStringLiteral("fuse.mo2linux")) {
+    return !mountPoint.isEmpty() && mountPoint != "/";
+  }
+
   if (mountPoint.isEmpty() || mountPoint == "/" ||
       pressureVesselSharesByDefault(mountPoint) ||
       isSystemRootPath(mountPoint)) {
