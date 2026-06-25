@@ -457,7 +457,8 @@ void wrapInTerminal(QString& program, QStringList& arguments)
 
 bool startWithEnv(const QString& program, const QStringList& arguments,
                   const QString& workingDir,
-                  const QProcessEnvironment& environment, qint64& pid)
+                  const QProcessEnvironment& environment, qint64& pid,
+                  bool forwardAllChannels = false)
 {
   auto* process = new QProcess();
   process->setProgram(program);
@@ -468,23 +469,38 @@ bool startWithEnv(const QString& program, const QStringList& arguments,
   }
 
   process->setProcessEnvironment(environment);
-  process->setProcessChannelMode(QProcess::ForwardedOutputChannel);
 
-  // Filter noisy Wine/Proton stderr (GStreamer warnings, etc.) while
-  // forwarding everything else to our stderr.
-  QObject::connect(process, &QProcess::readyReadStandardError, process, [process]() {
-    const QByteArray data = process->readAllStandardError();
-    for (const QByteArray& line : data.split('\n')) {
-      if (line.isEmpty())
-        continue;
-      if (line.contains("GStreamer-WARNING") || line.contains("Failed to load plugin") ||
-          line.contains("ProtonFixes[") || line.contains("wineserver: NTSync") ||
-          line.contains("[MANGOHUD]") || line.contains("radv is not a conformant"))
-        continue;
-      std::fwrite(line.constData(), 1, line.size(), stderr);
-      std::fputc('\n', stderr);
-    }
-  });
+  if (forwardAllChannels) {
+    // Forward BOTH stdout and stderr straight to our own fds, with no
+    // QProcess-managed pipe. This is required for native launches that hand
+    // off to a longer-lived child: e.g. openmw-launcher spawns the OpenMW
+    // engine, the engine inherits the launcher's stderr, then the launcher
+    // exits. With a piped stderr (ForwardedOutputChannel below), the QProcess
+    // is destroyed on `finished` and closes the pipe's read end — the engine's
+    // next write to stderr would hit a broken pipe and die with SIGPIPE (no
+    // coredump). Forwarding to our real stderr fd (which lives as long as
+    // Fluorine does) makes the child immune. Native games don't emit the
+    // Proton/Wine stderr noise the filter below targets, so we lose nothing.
+    process->setProcessChannelMode(QProcess::ForwardedChannels);
+  } else {
+    process->setProcessChannelMode(QProcess::ForwardedOutputChannel);
+
+    // Filter noisy Wine/Proton stderr (GStreamer warnings, etc.) while
+    // forwarding everything else to our stderr.
+    QObject::connect(process, &QProcess::readyReadStandardError, process, [process]() {
+      const QByteArray data = process->readAllStandardError();
+      for (const QByteArray& line : data.split('\n')) {
+        if (line.isEmpty())
+          continue;
+        if (line.contains("GStreamer-WARNING") || line.contains("Failed to load plugin") ||
+            line.contains("ProtonFixes[") || line.contains("wineserver: NTSync") ||
+            line.contains("[MANGOHUD]") || line.contains("radv is not a conformant"))
+          continue;
+        std::fwrite(line.constData(), 1, line.size(), stderr);
+        std::fputc('\n', stderr);
+      }
+    });
+  }
 
   QObject::connect(process,
                    QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
@@ -1022,7 +1038,11 @@ bool ProtonLauncher::launchDirect(qint64& pid) const
     wrapInTerminal(program, arguments);
   }
 
-  return startWithEnv(program, arguments, m_workingDir, env, pid);
+  // Native direct launch: forward both channels so a launcher-spawned engine
+  // (openmw-launcher -> openmw) can't be SIGPIPE'd when the launcher exits and
+  // the QProcess closes its stderr pipe. See startWithEnv for the full rationale.
+  return startWithEnv(program, arguments, m_workingDir, env, pid,
+                      /*forwardAllChannels=*/true);
 }
 
 bool ProtonLauncher::ensureSteamRunning()

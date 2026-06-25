@@ -53,6 +53,7 @@ namespace mo2::python {
             .def("listSaves", &IPluginGame::listSaves, "folder"_a)
             .def("isInstalled", &IPluginGame::isInstalled)
             .def("isNativeLinux", &IPluginGame::isNativeLinux)
+            .def("usesVFS", &IPluginGame::usesVFS)
             .def("gameIcon", &IPluginGame::gameIcon)
             .def("gameDirectory", &IPluginGame::gameDirectory)
             .def("dataDirectory", &IPluginGame::dataDirectory)

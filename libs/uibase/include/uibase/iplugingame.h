@@ -154,6 +154,19 @@ public:
   /**
    * this function may be called before init()
    *
+   * @return true if Fluorine should mount its FUSE VFS over the game's data
+   *         directory for this game (the default).  Return false for games that
+   *         manage their own virtual file system — e.g. OpenMW, which reads mods
+   *         from data= entries in openmw.cfg — so Fluorine skips the mount
+   *         entirely and lets the engine resolve its own load order.  This is
+   *         distinct from isNativeLinux(): a native Linux game (e.g. Stardew
+   *         Valley) can still rely on the VFS to expose its mods.
+   */
+  virtual bool usesVFS() const { return true; }
+
+  /**
+   * this function may be called before init()
+   *
    * @return an icon for this game
    */
   virtual QIcon gameIcon() const = 0;

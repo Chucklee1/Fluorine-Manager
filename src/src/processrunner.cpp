@@ -595,8 +595,16 @@ DWORD exitCodeFromWaitStatus(int status)
   return 0;
 }
 
+// killTreeOnUnlock: when the user force-unlocks/cancels the lock dialog, SIGKILL
+// the launched process tree (and the wineserver) so the wineprefix/FUSE VFS can
+// be torn down cleanly. This is correct for Proton games and for native games
+// that still rely on the FUSE VFS (e.g. Stardew Valley). It must be FALSE for
+// native, non-VFS games like OpenMW (usesVFS()==false): there is nothing to tear
+// down, and killing the tree would take down a launcher-spawned engine the user
+// is actively using. See OrganizerCore::managedGame()->usesVFS() at the caller.
 ProcessRunner::Results waitForPid(pid_t pid, LPDWORD exitCode,
-                                  UILocker::Session* ls, const QStringList& expected)
+                                  UILocker::Session* ls, const QStringList& expected,
+                                  bool killTreeOnUnlock)
 {
   if (pid <= 0) {
     return ProcessRunner::Error;
@@ -777,6 +785,23 @@ ProcessRunner::Results waitForPid(pid_t pid, LPDWORD exitCode,
       case UILocker::ForceUnlocked:
       case UILocker::Cancelled: {
         const bool cancelled = (UILocker::Session::result() == UILocker::Cancelled);
+
+        // The teardown below exists only to clean up the wineprefix and let the
+        // FUSE VFS unmount. A native, non-VFS game (OpenMW, usesVFS()==false)
+        // has neither, and its launcher spawns the real engine as a child the
+        // user is still playing — so force-unlock here must release the lock
+        // without killing the process tree.
+        if (!killTreeOnUnlock) {
+          log::debug("waiting for {} {} by user; non-VFS game, releasing lock "
+                     "but leaving the process tree running",
+                     displayPid, cancelled ? "cancelled" : "force unlocked");
+          if (exitCode != nullptr) {
+            *exitCode = 0;
+          }
+          return cancelled ? ProcessRunner::Cancelled
+                           : ProcessRunner::ForceUnlocked;
+        }
+
         log::debug("waiting for {} {} by user, terminating", displayPid,
                    cancelled ? "cancelled" : "force unlocked");
 
@@ -825,14 +850,17 @@ ProcessRunner::Results waitForPid(pid_t pid, LPDWORD exitCode,
 
 ProcessRunner::Results waitForProcess(HANDLE initialProcess, LPDWORD exitCode,
                                       UILocker::Session* ls,
-                                      const QStringList& expected)
+                                      const QStringList& expected,
+                                      bool killTreeOnUnlock)
 {
-  return waitForPid(handleToPid(initialProcess), exitCode, ls, expected);
+  return waitForPid(handleToPid(initialProcess), exitCode, ls, expected,
+                    killTreeOnUnlock);
 }
 
 ProcessRunner::Results waitForProcesses(const std::vector<HANDLE>& initialProcesses,
                                         UILocker::Session* ls,
-                                        const QStringList& expected)
+                                        const QStringList& expected,
+                                        bool killTreeOnUnlock)
 {
   if (initialProcesses.empty()) {
     return ProcessRunner::Completed;
@@ -840,7 +868,8 @@ ProcessRunner::Results waitForProcesses(const std::vector<HANDLE>& initialProces
 
   for (HANDLE h : initialProcesses) {
     DWORD ignored = 0;
-    const auto r  = waitForPid(handleToPid(h), &ignored, ls, expected);
+    const auto r  = waitForPid(handleToPid(h), &ignored, ls, expected,
+                               killTreeOnUnlock);
     if (r != ProcessRunner::Completed) {
       return r;
     }
@@ -1324,9 +1353,18 @@ ProcessRunner::Results ProcessRunner::postRun()
     }
   }
 
+  // Only tear down the launched process tree on force-unlock for games that
+  // have a wineprefix/FUSE VFS to clean up. Native, non-VFS games (OpenMW)
+  // must keep running when the user releases the lock — same usesVFS() gate as
+  // the FUSE mount in OrganizerCore (default true = unchanged for every other
+  // game).
+  const auto* game        = m_core.managedGame();
+  const bool killTreeOnUnlock = (game == nullptr) || game->usesVFS();
+
   auto r = Error;
   withLock([&](auto& ls) {
-    r = waitForProcess(m_handle.get(), &m_exitCode, &ls, expectedExecutables);
+    r = waitForProcess(m_handle.get(), &m_exitCode, &ls, expectedExecutables,
+                       killTreeOnUnlock);
   });
 
   if (shouldRefresh(r)) {
