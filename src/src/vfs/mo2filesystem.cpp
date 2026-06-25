@@ -2228,6 +2228,11 @@ void mo2_create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode
     fd = open(realPath.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC,
               mode != 0 ? (mode & 07777) : 0644);
     if (fd < 0) {
+      std::fprintf(stderr,
+                   "[VFS] tracked create failed path='%s' real='%s' errno=%d "
+                   "message='%s'\n",
+                   relative.c_str(), realPath.c_str(), errno,
+                   std::strerror(errno));
       // Fall back to staging
       trackedMod.clear();
     }
@@ -2237,6 +2242,12 @@ void mo2_create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode
     std::error_code createError;
     fd = ctx->overwrite->createFile(relative, mode, &realPath, &createError);
     if (fd < 0) {
+      const std::string stagingPath = ctx->overwrite->stagingPath(relative);
+      std::fprintf(stderr,
+                   "[VFS] create failed path='%s' staging='%s' error=%d "
+                   "message='%s'\n",
+                   relative.c_str(), stagingPath.c_str(), createError.value(),
+                   createError.message().c_str());
       fuse_reply_err(req, fuseErrnoFromError(createError));
       return;
     }
@@ -2729,6 +2740,12 @@ void mo2_mkdir(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t /*mod
 
   std::error_code createError;
   if (!ctx->overwrite->createDirectory(relative, &createError)) {
+    const std::string stagingPath = ctx->overwrite->stagingPath(relative);
+    std::fprintf(stderr,
+                 "[VFS] mkdir failed path='%s' staging='%s' error=%d "
+                 "message='%s'\n",
+                 relative.c_str(), stagingPath.c_str(), createError.value(),
+                 createError.message().c_str());
     fuse_reply_err(req, fuseErrnoFromError(createError));
     return;
   }
