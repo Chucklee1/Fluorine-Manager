@@ -207,6 +207,19 @@ void mo2_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup);
 void mo2_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi);
 void mo2_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
                struct fuse_file_info* fi);
+void mo2_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
+               struct flock* lock);
+void mo2_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
+               struct flock* lock, int sleep);
+void mo2_flock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi, int op);
+void mo2_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
+                   off_t length, struct fuse_file_info* fi);
+void mo2_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
+                         struct fuse_file_info* fi_in, fuse_ino_t ino_out,
+                         off_t off_out, struct fuse_file_info* fi_out,
+                         size_t len, int flags);
+void mo2_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
+               struct fuse_file_info* fi);
 #if FUSE_USE_VERSION < 35
 void mo2_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void* arg,
                struct fuse_file_info* fi, unsigned flags, const void* in_buf,

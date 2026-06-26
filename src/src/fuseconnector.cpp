@@ -329,6 +329,67 @@ void wrap_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
   MO2_TRY_REPLY(req, "fsync", ino, EIO)
 }
 
+void wrap_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
+                struct flock* lock) noexcept
+{
+  try { mo2_getlk(req, ino, fi, lock); }
+  MO2_TRY_REPLY(req, "getlk", ino, EIO)
+}
+
+void wrap_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
+                struct flock* lock, int sleep) noexcept
+{
+  try { mo2_setlk(req, ino, fi, lock, sleep); }
+  MO2_TRY_REPLY(req, "setlk", ino, EIO)
+}
+
+void wrap_flock(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
+                int op) noexcept
+{
+  try { mo2_flock(req, ino, fi, op); }
+  MO2_TRY_REPLY(req, "flock", ino, EIO)
+}
+
+void wrap_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
+                    off_t length, struct fuse_file_info* fi) noexcept
+{
+  try { mo2_fallocate(req, ino, mode, offset, length, fi); }
+  MO2_TRY_REPLY(req, "fallocate", ino, EIO)
+}
+
+void wrap_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
+                          struct fuse_file_info* fi_in, fuse_ino_t ino_out,
+                          off_t off_out, struct fuse_file_info* fi_out,
+                          size_t len, int flags) noexcept
+{
+  try {
+    mo2_copy_file_range(req, ino_in, off_in, fi_in, ino_out, off_out,
+                        fi_out, len, flags);
+  }
+  MO2_TRY_REPLY(req, "copy_file_range", ino_out, EIO)
+}
+
+void wrap_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
+                struct fuse_file_info* fi) noexcept
+{
+  try { mo2_lseek(req, ino, off, whence, fi); }
+  MO2_TRY_REPLY(req, "lseek", ino, EIO)
+}
+
+#if FUSE_USE_VERSION < 35
+void wrap_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void* arg,
+                struct fuse_file_info* fi, unsigned flags, const void* in_buf,
+                size_t in_bufsz, size_t out_bufsz) noexcept
+#else
+void wrap_ioctl(fuse_req_t req, fuse_ino_t ino, unsigned int cmd, void* arg,
+                struct fuse_file_info* fi, unsigned flags, const void* in_buf,
+                size_t in_bufsz, size_t out_bufsz) noexcept
+#endif
+{
+  try { mo2_ioctl(req, ino, cmd, arg, fi, flags, in_buf, in_bufsz, out_bufsz); }
+  MO2_TRY_REPLY(req, "ioctl", ino, EIO)
+}
+
 #undef MO2_TRY_REPLY
 
 }  // namespace
@@ -356,6 +417,13 @@ void setupFuseOps(struct fuse_lowlevel_ops* ops)
   ops->releasedir  = wrap_releasedir;
   ops->flush       = wrap_flush;
   ops->fsync       = wrap_fsync;
+  ops->getlk       = wrap_getlk;
+  ops->setlk       = wrap_setlk;
+  ops->flock       = wrap_flock;
+  ops->fallocate   = wrap_fallocate;
+  ops->copy_file_range = wrap_copy_file_range;
+  ops->lseek       = wrap_lseek;
+  ops->ioctl       = wrap_ioctl;
   // access handler removed: default_permissions mount option lets the kernel
   // handle permission checks in-kernel, eliminating access() round-trips.
 }

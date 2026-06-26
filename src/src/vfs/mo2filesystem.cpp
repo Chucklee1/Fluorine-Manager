@@ -1,7 +1,9 @@
 #include "mo2filesystem.h"
 
 #include <fcntl.h>
+#include <linux/falloc.h>
 #include <linux/fs.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -1216,6 +1218,132 @@ void flushDirtyOpenFileMetadata(Mo2FsContext* ctx, uint64_t fh)
     updateFileNodeKnown(ctx, relativePath, realPath, originForPath(ctx, realPath),
                         size, mtime);
   }
+}
+
+bool ensureWritableOpenFile(Mo2FsContext* ctx, uint64_t fh, fuse_ino_t ino,
+                            int* outFd, std::string* outRelativePath)
+{
+  if (ctx == nullptr || outFd == nullptr) {
+    return false;
+  }
+
+  int fd = -1;
+  std::string relativePath;
+  std::string realPath;
+  bool writable = false;
+  bool cowPending = false;
+  bool isBacking = false;
+  {
+    std::shared_lock lock(ctx->open_files_mutex);
+    auto it = ctx->open_files.find(fh);
+    if (it == ctx->open_files.end()) {
+      errno = EBADF;
+      return false;
+    }
+    fd           = it->second.fd;
+    writable     = it->second.writable;
+    cowPending   = it->second.cow_pending;
+    isBacking    = it->second.is_backing;
+    relativePath = it->second.relative_path;
+    realPath     = it->second.real_path;
+  }
+
+  if (!writable) {
+    errno = EACCES;
+    return false;
+  }
+
+  if (cowPending) {
+    try {
+      std::string newPath;
+      if (isBacking && ctx->backing_dir_fd >= 0) {
+        newPath = ctx->overwrite->copyOnWriteFromFd(ctx->backing_dir_fd, relativePath);
+      } else {
+        newPath = ctx->overwrite->copyOnWrite(realPath, relativePath);
+      }
+
+      int newFd = open(newPath.c_str(), O_RDWR | O_CLOEXEC);
+      if (newFd < 0) {
+        return false;
+      }
+      if (fd >= 0) {
+        close(fd);
+      }
+
+      {
+        std::scoped_lock lock(ctx->open_files_mutex);
+        auto it = ctx->open_files.find(fh);
+        if (it == ctx->open_files.end()) {
+          close(newFd);
+          errno = EBADF;
+          return false;
+        }
+        it->second.fd          = newFd;
+        it->second.real_path   = newPath;
+        it->second.is_backing  = false;
+        it->second.cow_pending = false;
+      }
+      fd = newFd;
+      realPath = newPath;
+      updateFileNode(ctx, relativePath, newPath, originForPath(ctx, newPath));
+      fuse_lowlevel_notify_inval_inode(ctx->session, ino, 0, 0);
+    } catch (...) {
+      errno = EIO;
+      return false;
+    }
+  }
+
+  if (fd < 0) {
+    errno = EBADF;
+    return false;
+  }
+
+  *outFd = fd;
+  if (outRelativePath != nullptr) {
+    *outRelativePath = relativePath;
+  }
+  return true;
+}
+
+bool ensureReadableOpenFile(Mo2FsContext* ctx, uint64_t fh, int* outFd,
+                            bool* outCloseWhenDone)
+{
+  if (ctx == nullptr || outFd == nullptr || outCloseWhenDone == nullptr) {
+    return false;
+  }
+
+  int fd = -1;
+  std::string realPath;
+  bool isBacking = false;
+  {
+    std::shared_lock lock(ctx->open_files_mutex);
+    auto it = ctx->open_files.find(fh);
+    if (it == ctx->open_files.end()) {
+      errno = EBADF;
+      return false;
+    }
+    fd        = it->second.fd;
+    realPath  = it->second.real_path;
+    isBacking = it->second.is_backing;
+  }
+
+  if (fd >= 0) {
+    *outFd = fd;
+    *outCloseWhenDone = false;
+    return true;
+  }
+
+  if (isBacking && ctx->backing_dir_fd >= 0) {
+    fd = openat(ctx->backing_dir_fd, realPath.c_str(), O_RDONLY | O_CLOEXEC);
+  } else {
+    fd = open(realPath.c_str(), O_RDONLY | O_CLOEXEC);
+  }
+  if (fd < 0) {
+    return false;
+  }
+  *outFd = fd;
+  *outCloseWhenDone = true;
+  return true;
 }
 
 }  // namespace
@@ -2949,6 +3077,271 @@ void mo2_fsync(fuse_req_t req, fuse_ino_t /*ino*/, int datasync,
   }
   flushDirtyOpenFileMetadata(ctx, fi->fh);
   fuse_reply_err(req, 0);
+}
+
+void mo2_getlk(fuse_req_t req, fuse_ino_t /*ino*/, struct fuse_file_info* /*fi*/,
+               struct flock* lock)
+{
+  if (lock == nullptr) {
+    fuse_reply_err(req, EINVAL);
+    return;
+  }
+
+  lock->l_type = F_UNLCK;
+  fuse_reply_lock(req, lock);
+}
+
+void mo2_setlk(fuse_req_t req, fuse_ino_t /*ino*/, struct fuse_file_info* /*fi*/,
+               struct flock* /*lock*/, int /*sleep*/)
+{
+  // Wine uses lock probes for Windows share-mode emulation. Fluorine does not
+  // currently coordinate cross-process POSIX byte-range locks inside the VFS,
+  // so report success rather than surfacing EOPNOTSUPP to Windows callers.
+  fuse_reply_err(req, 0);
+}
+
+void mo2_flock(fuse_req_t req, fuse_ino_t /*ino*/, struct fuse_file_info* /*fi*/,
+               int /*op*/)
+{
+  fuse_reply_err(req, 0);
+}
+
+void mo2_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
+                   off_t length, struct fuse_file_info* fi)
+{
+  Mo2FsContext* ctx = getContext(req);
+  if (ctx == nullptr || fi == nullptr || offset < 0 || length < 0) {
+    fuse_reply_err(req, EINVAL);
+    return;
+  }
+
+  if ((mode & ~FALLOC_FL_KEEP_SIZE) != 0) {
+    fuse_reply_err(req, EINVAL);
+    return;
+  }
+
+  int fd = -1;
+  std::string relativePath;
+  if (!ensureWritableOpenFile(ctx, fi->fh, ino, &fd, &relativePath)) {
+    fuse_reply_err(req, errno != 0 ? errno : EIO);
+    return;
+  }
+
+  const off_t end = offset + length;
+  if (length > 0 && end < offset) {
+    fuse_reply_err(req, EFBIG);
+    return;
+  }
+
+  int rc = 0;
+  if (mode == 0) {
+    rc = posix_fallocate(fd, offset, length);
+  } else {
+    rc = fallocate(fd, mode, offset, length) == 0 ? 0 : errno;
+    if (rc == EOPNOTSUPP || rc == ENOSYS) {
+      // KEEP_SIZE is a reservation hint. If the backing filesystem cannot
+      // reserve without changing size, let Wine/.NET continue normally.
+      rc = 0;
+    }
+  }
+
+  if (rc != 0) {
+    fuse_reply_err(req, rc);
+    return;
+  }
+
+  struct stat st {};
+  if (fstat(fd, &st) == 0) {
+    std::string realPath;
+    {
+      std::shared_lock lock(ctx->open_files_mutex);
+      auto it = ctx->open_files.find(fi->fh);
+      if (it != ctx->open_files.end()) {
+        realPath = it->second.real_path;
+      }
+    }
+    if (!realPath.empty()) {
+      updateFileNodeKnown(ctx, relativePath, realPath, originForPath(ctx, realPath),
+                          static_cast<uint64_t>(st.st_size),
+                          timePointFromTimespec(st.st_mtim));
+    }
+    if (mode == 0) {
+      markOpenFileDirty(ctx, fi->fh, static_cast<uint64_t>(st.st_size));
+    }
+  }
+
+  fuse_reply_err(req, 0);
+}
+
+void mo2_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
+                         struct fuse_file_info* fi_in, fuse_ino_t ino_out,
+                         off_t off_out, struct fuse_file_info* fi_out,
+                         size_t len, int flags)
+{
+  (void)ino_in;
+  Mo2FsContext* ctx = getContext(req);
+  if (ctx == nullptr || fi_in == nullptr || fi_out == nullptr ||
+      off_in < 0 || off_out < 0 || flags != 0) {
+    fuse_reply_err(req, EINVAL);
+    return;
+  }
+
+  int inFd = -1;
+  bool closeIn = false;
+  if (!ensureReadableOpenFile(ctx, fi_in->fh, &inFd, &closeIn)) {
+    fuse_reply_err(req, errno != 0 ? errno : EIO);
+    return;
+  }
+
+  int outFd = -1;
+  std::string outRelativePath;
+  if (!ensureWritableOpenFile(ctx, fi_out->fh, ino_out, &outFd, &outRelativePath)) {
+    if (closeIn) close(inFd);
+    fuse_reply_err(req, errno != 0 ? errno : EIO);
+    return;
+  }
+
+  ssize_t copied = copy_file_range(inFd, &off_in, outFd, &off_out, len, 0);
+  if (copied < 0 && (errno == EOPNOTSUPP || errno == ENOSYS || errno == EXDEV)) {
+    const int savedErrno = errno;
+    constexpr size_t kBufSize = 1024 * 1024;
+    std::vector<char> tmp(std::min(len, kBufSize));
+    size_t total = 0;
+    bool failed = false;
+    while (total < len) {
+      const size_t chunk = std::min(tmp.size(), len - total);
+      const ssize_t r = pread(inFd, tmp.data(), chunk,
+                              off_in + static_cast<off_t>(total));
+      if (r < 0) {
+        failed = true;
+        break;
+      }
+      if (r == 0) {
+        break;
+      }
+      const ssize_t w = pwrite(outFd, tmp.data(), static_cast<size_t>(r),
+                               off_out + static_cast<off_t>(total));
+      if (w < 0) {
+        failed = true;
+        break;
+      }
+      total += static_cast<size_t>(w);
+      if (w < r) {
+        break;
+      }
+    }
+    if (failed) {
+      copied = -1;
+    } else {
+      errno = savedErrno;
+      copied = static_cast<ssize_t>(total);
+    }
+  }
+
+  if (closeIn) close(inFd);
+
+  if (copied < 0) {
+    fuse_reply_err(req, errno != 0 ? errno : EIO);
+    return;
+  }
+
+  markOpenFileDirty(ctx, fi_out->fh,
+                    static_cast<uint64_t>(off_out) + static_cast<uint64_t>(copied));
+  ctx->write_bytes.fetch_add(static_cast<uint64_t>(copied),
+                             std::memory_order_relaxed);
+  samplePathStat(ctx, "write", outRelativePath);
+  fuse_reply_write(req, static_cast<size_t>(copied));
+}
+
+void mo2_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
+               struct fuse_file_info* fi)
+{
+  Mo2FsContext* ctx = getContext(req);
+  if (ctx == nullptr) {
+    fuse_reply_err(req, EINVAL);
+    return;
+  }
+
+  uint64_t size = 0;
+  bool haveSize = false;
+  if (fi != nullptr) {
+    std::shared_lock lock(ctx->open_files_mutex);
+    auto it = ctx->open_files.find(fi->fh);
+    if (it != ctx->open_files.end()) {
+      size = it->second.virtual_size;
+      haveSize = true;
+    }
+  }
+  if (!haveSize) {
+    bool ok = false;
+    const std::string path = inodeToPath(ctx, ino, &ok);
+    if (!ok) {
+      fuse_reply_err(req, ENOENT);
+      return;
+    }
+    const auto snap = snapshotForPath(ctx, path);
+    if (!snap.found || snap.is_directory) {
+      fuse_reply_err(req, ENOENT);
+      return;
+    }
+    size = snap.size;
+  }
+
+  switch (whence) {
+  case SEEK_SET:
+    if (off < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    fuse_reply_lseek(req, off);
+    return;
+  case SEEK_CUR:
+    if (off < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    fuse_reply_lseek(req, off);
+    return;
+  case SEEK_END:
+  {
+    const off_t result = static_cast<off_t>(size) + off;
+    if (result < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    fuse_reply_lseek(req, result);
+    return;
+  }
+#ifdef SEEK_DATA
+  case SEEK_DATA:
+    if (off < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    if (static_cast<uint64_t>(off) < size) {
+      fuse_reply_lseek(req, off);
+    } else {
+      fuse_reply_err(req, ENXIO);
+    }
+    return;
+#endif
+#ifdef SEEK_HOLE
+  case SEEK_HOLE:
+    if (off < 0) {
+      fuse_reply_err(req, EINVAL);
+      return;
+    }
+    if (static_cast<uint64_t>(off) < size) {
+      fuse_reply_lseek(req, static_cast<off_t>(size));
+    } else {
+      fuse_reply_err(req, ENXIO);
+    }
+    return;
+#endif
+  default:
+    fuse_reply_err(req, EINVAL);
+    return;
+  }
 }
 
 #if FUSE_USE_VERSION < 35
