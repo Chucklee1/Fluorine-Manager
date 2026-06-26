@@ -2024,12 +2024,10 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
     if (tracePath) {
       std::fprintf(stderr,
                    "[VFS] open writable path='%s' real='%s' flags=0x%x "
-                   "truncate=%d backing=%d origin='%s' size=%llu mode=%o\n",
+                   "truncate=%d backing=%d size=%llu\n",
                    path.c_str(), realPath.c_str(), fi->flags,
                    truncateOnOpen ? 1 : 0, isBacking ? 1 : 0,
-                   snap.origin.c_str(),
-                   static_cast<unsigned long long>(snap.size),
-                   static_cast<unsigned int>(snap.cached_mode));
+                   static_cast<unsigned long long>(snap.size));
     }
     const std::string stagedPath = ctx->overwrite->stagingPath(path);
     const std::string owPath     = ctx->overwrite->overwritePath(path);
