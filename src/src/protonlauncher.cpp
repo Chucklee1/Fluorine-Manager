@@ -746,6 +746,23 @@ bool ProtonLauncher::launchWithProton(qint64& pid) const
   // what umu-launcher uses and ensures the previous session is fully cleaned up
   // before starting a new one.
   const QStringList protonArgs = QStringList() << "waitforexitandrun" << m_binary << m_arguments;
+  const QString targetAppId =
+      m_steamAppId == 0 ? QString{} : QString::number(m_steamAppId);
+  const QString inheritedSteamGameId =
+      QProcessEnvironment::systemEnvironment().value("SteamGameId").trimmed();
+  const QString launchSteamGameId =
+      !targetAppId.isEmpty() && !inheritedSteamGameId.isEmpty() &&
+              inheritedSteamGameId != targetAppId
+          ? inheritedSteamGameId
+          : targetAppId;
+
+  if (!targetAppId.isEmpty() && launchSteamGameId != targetAppId) {
+    MOBase::log::debug(
+        "preserving inherited SteamGameId '{}' for Steam/Game Mode focus "
+        "tracking while launching Proton app id '{}'",
+        launchSteamGameId, targetAppId);
+  }
+
   QStringList pressureVesselImportantPaths;
   pressureVesselImportantPaths << m_binary << m_workingDir << m_gameDirectory
                                << m_prefixPath << m_bindMountSource
@@ -799,10 +816,9 @@ bool ProtonLauncher::launchWithProton(qint64& pid) const
         }
       }
       if (m_steamAppId != 0) {
-        const QString appId = QString::number(m_steamAppId);
-        containerCmd << QStringLiteral("STEAM_COMPAT_APP_ID=%1").arg(appId)
-                     << QStringLiteral("SteamAppId=%1").arg(appId)
-                     << QStringLiteral("SteamGameId=%1").arg(appId);
+        containerCmd << QStringLiteral("STEAM_COMPAT_APP_ID=%1").arg(targetAppId)
+                     << QStringLiteral("SteamAppId=%1").arg(targetAppId)
+                     << QStringLiteral("SteamGameId=%1").arg(launchSteamGameId);
       }
       containerCmd << protonScript << protonArgs;
 
@@ -847,10 +863,9 @@ bool ProtonLauncher::launchWithProton(qint64& pid) const
   }
 
   if (m_steamAppId != 0) {
-    const QString appId = QString::number(m_steamAppId);
-    env.insert("STEAM_COMPAT_APP_ID", appId);
-    env.insert("SteamAppId", appId);
-    env.insert("SteamGameId", appId);
+    env.insert("STEAM_COMPAT_APP_ID", targetAppId);
+    env.insert("SteamAppId", targetAppId);
+    env.insert("SteamGameId", launchSteamGameId);
   }
 
   // When Steam DRM is disabled (e.g. GOG games), set UMU_ID so that
