@@ -917,7 +917,7 @@ std::vector<char> buildReaddirBlob(
     } else {
       // Use cached mode bits (populated during tree snapshot) — no stat() needed.
       mode_t mode = entry.cached_mode != 0 ? entry.cached_mode : static_cast<mode_t>(0644);
-      st.st_mode = S_IFREG | mode;
+      st.st_mode = S_IFREG | regularFileVfsMode(mode);
     }
 
     const size_t entSize =
@@ -1070,6 +1070,16 @@ void fillStatForDir(struct stat* st, fuse_ino_t ino, uid_t uid, gid_t gid)
   st->st_ctim.tv_sec = kVirtualDirTime;
 }
 
+mode_t regularFileVfsMode(mode_t sourceMode)
+{
+  mode_t mode = sourceMode != 0 ? sourceMode : static_cast<mode_t>(0644);
+  // The merged VFS is copy-on-write. Existing files from the base game or mods
+  // must still pass the kernel's default_permissions write check so mo2_open()
+  // can materialize them into staging instead of failing before userspace.
+  mode |= S_IRUSR | S_IWUSR;
+  return mode;
+}
+
 void fillStatForFile(struct stat* st, fuse_ino_t ino, uid_t uid, gid_t gid,
                      uint64_t size,
                      const std::chrono::system_clock::time_point& mtime,
@@ -1093,7 +1103,7 @@ void fillStatForFile(struct stat* st, fuse_ino_t ino, uid_t uid, gid_t gid,
       mode = real_st.st_mode & 0777;
     }
   }
-  st->st_mode = S_IFREG | mode;
+  st->st_mode = S_IFREG | regularFileVfsMode(mode);
 
   const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
       mtime.time_since_epoch());
@@ -1821,7 +1831,7 @@ void mo2_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     } else {
       mode_t mode = (*entries)[i].cached_mode != 0 ? (*entries)[i].cached_mode
                                                    : static_cast<mode_t>(0644);
-      st.st_mode = S_IFREG | mode;
+      st.st_mode = S_IFREG | regularFileVfsMode(mode);
     }
 
     const size_t ent = fuse_add_direntry(req, buf.data() + used, size - used,
