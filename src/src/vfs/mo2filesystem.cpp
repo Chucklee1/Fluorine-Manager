@@ -47,6 +47,7 @@ void invalidateLookupCache(Mo2FsContext* ctx, const std::string& dirPath);
 void invalidateAttrCache(Mo2FsContext* ctx, fuse_ino_t ino);
 bool pathTouchesMutation(const std::string& cachedPath,
                          const std::string& changedPath);
+bool shouldTracePath(const std::string& path);
 
 int fuseErrnoFromError(std::error_code ec, int fallback = EIO)
 {
@@ -483,6 +484,13 @@ bool pathTouchesMutation(const std::string& cachedPath, const std::string& chang
   return cachedPath == changedPath ||
          isStrictDescendantPath(cachedPath, changedPath) ||
          isStrictDescendantPath(changedPath, cachedPath);
+}
+
+bool shouldTracePath(const std::string& path)
+{
+  const std::string lower = normalizeForLookup(path);
+  return lower.ends_with(".hkx") ||
+         lower.find("meshes/actors/") != std::string::npos;
 }
 
 // Clear all node_cache entries whose path is |path|, any descendant under
@@ -1988,6 +1996,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
   std::string realPath = snap.real_path;
   const bool writable  = isWritableOpen(fi->flags);
   const bool truncateOnOpen = writable && ((fi->flags & O_TRUNC) != 0);
+  const bool tracePath = shouldTracePath(path);
   bool isBacking       = snap.is_backing;
   bool cowPending      = false;
   bool isTracked       = false;
@@ -2012,6 +2021,16 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
   int fd = -1;
 
   if (writable) {
+    if (tracePath) {
+      std::fprintf(stderr,
+                   "[VFS] open writable path='%s' real='%s' flags=0x%x "
+                   "truncate=%d backing=%d origin='%s' size=%llu mode=%o\n",
+                   path.c_str(), realPath.c_str(), fi->flags,
+                   truncateOnOpen ? 1 : 0, isBacking ? 1 : 0,
+                   snap.origin.c_str(),
+                   static_cast<unsigned long long>(snap.size),
+                   static_cast<unsigned int>(snap.cached_mode));
+    }
     const std::string stagedPath = ctx->overwrite->stagingPath(path);
     const std::string owPath     = ctx->overwrite->overwritePath(path);
     bool alreadyStaged = (realPath == stagedPath || realPath == owPath);
@@ -2033,6 +2052,11 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
       }
       fd = open(modFilePath.c_str(), openFlags);
       if (fd >= 0) {
+        if (tracePath) {
+          std::fprintf(stderr,
+                       "[VFS] open tracked ok path='%s' real='%s' fd=%d\n",
+                       path.c_str(), modFilePath.c_str(), fd);
+        }
         realPath  = modFilePath;
         isTracked = true;
         if (truncateOnOpen) {
@@ -2045,6 +2069,13 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
           fuse_lowlevel_notify_inval_inode(ctx->session, ino, 0, 0);
         }
       } else {
+        if (tracePath) {
+          std::fprintf(stderr,
+                       "[VFS] open tracked failed path='%s' real='%s' errno=%d "
+                       "message='%s'\n",
+                       path.c_str(), modFilePath.c_str(), errno,
+                       std::strerror(errno));
+        }
         // Mod file disappeared — fall through to normal handling
         trackedMod.clear();
       }
@@ -2058,6 +2089,11 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
       }
       fd = open(realPath.c_str(), openFlags);
       if (fd >= 0 && truncateOnOpen) {
+        if (tracePath) {
+          std::fprintf(stderr,
+                       "[VFS] open staged truncate ok path='%s' real='%s' fd=%d\n",
+                       path.c_str(), realPath.c_str(), fd);
+        }
         openSize = 0;
         openMtime = std::chrono::system_clock::now();
         updateFileNodeKnown(ctx, path, realPath, originForPath(ctx, realPath),
@@ -2067,6 +2103,12 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
     } else if (fd < 0 && truncateOnOpen) {
       try {
         std::string newPath;
+        if (tracePath) {
+          std::fprintf(stderr,
+                       "[VFS] open truncate COW begin path='%s' source='%s' "
+                       "backing=%d\n",
+                       path.c_str(), realPath.c_str(), isBacking ? 1 : 0);
+        }
         if (isBacking && ctx->backing_dir_fd >= 0) {
           newPath = ctx->overwrite->copyOnWriteFromFd(ctx->backing_dir_fd, path);
         } else {
@@ -2075,6 +2117,11 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
 
         fd = open(newPath.c_str(), O_RDWR | O_CLOEXEC | O_TRUNC);
         if (fd >= 0) {
+          if (tracePath) {
+            std::fprintf(stderr,
+                         "[VFS] open truncate COW ok path='%s' staging='%s' fd=%d\n",
+                         path.c_str(), newPath.c_str(), fd);
+          }
           realPath    = newPath;
           isBacking   = false;
           cowPending  = false;
@@ -2087,7 +2134,22 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
           // and see the staging content, not the pre-COW cached data.
           fuse_lowlevel_notify_inval_inode(ctx->session, ino, 0, 0);
         }
+      } catch (const std::exception& e) {
+        if (tracePath) {
+          std::fprintf(stderr,
+                       "[VFS] open truncate COW exception path='%s' source='%s' "
+                       "what='%s'\n",
+                       path.c_str(), realPath.c_str(), e.what());
+        }
+        fuse_reply_err(req, EIO);
+        return;
       } catch (...) {
+        if (tracePath) {
+          std::fprintf(stderr,
+                       "[VFS] open truncate COW unknown exception path='%s' "
+                       "source='%s'\n",
+                       path.c_str(), realPath.c_str());
+        }
         fuse_reply_err(req, EIO);
         return;
       }
@@ -2099,9 +2161,23 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
       } else {
         fd = open(realPath.c_str(), O_RDONLY | O_CLOEXEC);
       }
+      if (tracePath && fd < 0) {
+        std::fprintf(stderr,
+                     "[VFS] open lazy COW source failed path='%s' real='%s' "
+                     "backing=%d errno=%d message='%s'\n",
+                     path.c_str(), realPath.c_str(), isBacking ? 1 : 0,
+                     errno, std::strerror(errno));
+      }
       cowPending = true;
     }
     if (fd < 0) {
+      if (tracePath) {
+        std::fprintf(stderr,
+                     "[VFS] open final failed path='%s' real='%s' errno=%d "
+                     "message='%s'\n",
+                     path.c_str(), realPath.c_str(), errno,
+                     std::strerror(errno));
+      }
       fuse_reply_err(req, errno != 0 ? errno : EIO);
       return;
     }
@@ -2601,6 +2677,13 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
   }
 
   if ((to_set & FUSE_SET_ATTR_SIZE) != 0 && attr != nullptr) {
+    if (shouldTracePath(path)) {
+      std::fprintf(stderr,
+                   "[VFS] setattr size path='%s' size=%llu fh=%llu\n",
+                   path.c_str(),
+                   static_cast<unsigned long long>(attr->st_size),
+                   static_cast<unsigned long long>(fi != nullptr ? fi->fh : 0));
+    }
     std::string target;
     bool targetIsBacking = false;
     uint64_t fh = 0;
@@ -2687,6 +2770,13 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
       auto it = ctx->open_files.find(fh);
       if (it != ctx->open_files.end() && it->second.fd >= 0) {
         if (ftruncate(it->second.fd, static_cast<off_t>(attr->st_size)) != 0) {
+          if (shouldTracePath(path)) {
+            std::fprintf(stderr,
+                         "[VFS] setattr ftruncate failed path='%s' target='%s' "
+                         "errno=%d message='%s'\n",
+                         path.c_str(), target.c_str(), errno,
+                         std::strerror(errno));
+          }
           fuse_reply_err(req, EIO);
           return;
         }
@@ -2698,6 +2788,13 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
       std::error_code ec;
       fs::resize_file(target, static_cast<uint64_t>(attr->st_size), ec);
       if (ec) {
+        if (shouldTracePath(path)) {
+          std::fprintf(stderr,
+                       "[VFS] setattr resize failed path='%s' target='%s' "
+                       "error=%d message='%s'\n",
+                       path.c_str(), target.c_str(), ec.value(),
+                       ec.message().c_str());
+        }
         fuse_reply_err(req, EIO);
         return;
       }
@@ -3164,8 +3261,27 @@ void mo2_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
   int fd = -1;
   std::string relativePath;
   if (!ensureWritableOpenFile(ctx, fi->fh, ino, &fd, &relativePath)) {
+    std::string path;
+    bool ok = false;
+    path = inodeToPath(ctx, ino, &ok);
+    if (ok && shouldTracePath(path)) {
+      std::fprintf(stderr,
+                   "[VFS] fallocate ensure writable failed path='%s' mode=0x%x "
+                   "offset=%lld length=%lld errno=%d message='%s'\n",
+                   path.c_str(), mode, static_cast<long long>(offset),
+                   static_cast<long long>(length), errno, std::strerror(errno));
+    }
     fuse_reply_err(req, errno != 0 ? errno : EIO);
     return;
+  }
+
+  if (shouldTracePath(relativePath)) {
+    std::fprintf(stderr,
+                 "[VFS] fallocate path='%s' fd=%d mode=0x%x offset=%lld "
+                 "length=%lld\n",
+                 relativePath.c_str(), fd, mode,
+                 static_cast<long long>(offset),
+                 static_cast<long long>(length));
   }
 
   const off_t end = offset + length;
@@ -3187,6 +3303,14 @@ void mo2_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
   }
 
   if (rc != 0) {
+    if (shouldTracePath(relativePath)) {
+      std::fprintf(stderr,
+                   "[VFS] fallocate failed path='%s' fd=%d rc=%d mode=0x%x "
+                   "offset=%lld length=%lld\n",
+                   relativePath.c_str(), fd, rc, mode,
+                   static_cast<long long>(offset),
+                   static_cast<long long>(length));
+    }
     fuse_reply_err(req, rc);
     return;
   }
