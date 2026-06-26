@@ -42,6 +42,7 @@ void fillStatForFile(struct stat* st, fuse_ino_t ino, uid_t uid, gid_t gid,
                      const std::chrono::system_clock::time_point& mtime,
                      const std::string& real_path = {},
                      mode_t cached_mode = 0);
+mode_t regularFileVfsMode(mode_t sourceMode);
 void invalidateLookupCache(Mo2FsContext* ctx, const std::string& dirPath);
 void invalidateAttrCache(Mo2FsContext* ctx, fuse_ino_t ino);
 bool pathTouchesMutation(const std::string& cachedPath,
