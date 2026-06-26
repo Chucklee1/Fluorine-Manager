@@ -329,6 +329,12 @@ void wrap_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
   MO2_TRY_REPLY(req, "fsync", ino, EIO)
 }
 
+void wrap_statfs(fuse_req_t req, fuse_ino_t ino) noexcept
+{
+  try { mo2_statfs(req, ino); }
+  MO2_TRY_REPLY(req, "statfs", ino, EIO)
+}
+
 void wrap_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
                 struct flock* lock) noexcept
 {
@@ -376,6 +382,32 @@ void wrap_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
   MO2_TRY_REPLY(req, "lseek", ino, EIO)
 }
 
+void wrap_getxattr(fuse_req_t req, fuse_ino_t ino, const char* name,
+                   size_t size) noexcept
+{
+  try { mo2_getxattr(req, ino, name, size); }
+  MO2_TRY_REPLY(req, "getxattr", ino, EIO)
+}
+
+void wrap_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size) noexcept
+{
+  try { mo2_listxattr(req, ino, size); }
+  MO2_TRY_REPLY(req, "listxattr", ino, EIO)
+}
+
+void wrap_setxattr(fuse_req_t req, fuse_ino_t ino, const char* name,
+                   const char* value, size_t size, int flags) noexcept
+{
+  try { mo2_setxattr(req, ino, name, value, size, flags); }
+  MO2_TRY_REPLY(req, "setxattr", ino, EIO)
+}
+
+void wrap_removexattr(fuse_req_t req, fuse_ino_t ino, const char* name) noexcept
+{
+  try { mo2_removexattr(req, ino, name); }
+  MO2_TRY_REPLY(req, "removexattr", ino, EIO)
+}
+
 #if FUSE_USE_VERSION < 35
 void wrap_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void* arg,
                 struct fuse_file_info* fi, unsigned flags, const void* in_buf,
@@ -417,12 +449,17 @@ void setupFuseOps(struct fuse_lowlevel_ops* ops)
   ops->releasedir  = wrap_releasedir;
   ops->flush       = wrap_flush;
   ops->fsync       = wrap_fsync;
+  ops->statfs      = wrap_statfs;
   ops->getlk       = wrap_getlk;
   ops->setlk       = wrap_setlk;
   ops->flock       = wrap_flock;
   ops->fallocate   = wrap_fallocate;
   ops->copy_file_range = wrap_copy_file_range;
   ops->lseek       = wrap_lseek;
+  ops->getxattr    = wrap_getxattr;
+  ops->listxattr   = wrap_listxattr;
+  ops->setxattr    = wrap_setxattr;
+  ops->removexattr = wrap_removexattr;
   ops->ioctl       = wrap_ioctl;
   // access handler removed: default_permissions mount option lets the kernel
   // handle permission checks in-kernel, eliminating access() round-trips.

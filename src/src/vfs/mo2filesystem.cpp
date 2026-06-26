@@ -5,6 +5,7 @@
 #include <linux/fs.h>
 #include <sys/file.h>
 #include <sys/resource.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -3079,6 +3080,35 @@ void mo2_fsync(fuse_req_t req, fuse_ino_t /*ino*/, int datasync,
   fuse_reply_err(req, 0);
 }
 
+void mo2_statfs(fuse_req_t req, fuse_ino_t /*ino*/)
+{
+  Mo2FsContext* ctx = getContext(req);
+  if (ctx == nullptr) {
+    fuse_reply_err(req, EINVAL);
+    return;
+  }
+
+  struct statvfs st {};
+  if (ctx->backing_dir_fd >= 0 && fstatvfs(ctx->backing_dir_fd, &st) == 0) {
+    if (st.f_namemax == 0) {
+      st.f_namemax = 255;
+    }
+    fuse_reply_statfs(req, &st);
+    return;
+  }
+
+  st.f_bsize   = 4096;
+  st.f_frsize  = 4096;
+  st.f_blocks  = 1024ull * 1024ull;
+  st.f_bfree   = st.f_blocks / 2;
+  st.f_bavail  = st.f_bfree;
+  st.f_files   = 1024ull * 1024ull;
+  st.f_ffree   = st.f_files / 2;
+  st.f_favail  = st.f_ffree;
+  st.f_namemax = 255;
+  fuse_reply_statfs(req, &st);
+}
+
 void mo2_getlk(fuse_req_t req, fuse_ino_t /*ino*/, struct fuse_file_info* /*fi*/,
                struct flock* lock)
 {
@@ -3342,6 +3372,32 @@ void mo2_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
     fuse_reply_err(req, EINVAL);
     return;
   }
+}
+
+void mo2_getxattr(fuse_req_t req, fuse_ino_t /*ino*/, const char* /*name*/,
+                  size_t /*size*/)
+{
+  fuse_reply_err(req, ENODATA);
+}
+
+void mo2_listxattr(fuse_req_t req, fuse_ino_t /*ino*/, size_t size)
+{
+  if (size == 0) {
+    fuse_reply_xattr(req, 0);
+    return;
+  }
+  fuse_reply_buf(req, nullptr, 0);
+}
+
+void mo2_setxattr(fuse_req_t req, fuse_ino_t /*ino*/, const char* /*name*/,
+                  const char* /*value*/, size_t /*size*/, int /*flags*/)
+{
+  fuse_reply_err(req, 0);
+}
+
+void mo2_removexattr(fuse_req_t req, fuse_ino_t /*ino*/, const char* /*name*/)
+{
+  fuse_reply_err(req, 0);
 }
 
 #if FUSE_USE_VERSION < 35

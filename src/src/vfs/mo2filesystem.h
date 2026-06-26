@@ -207,6 +207,7 @@ void mo2_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup);
 void mo2_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi);
 void mo2_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
                struct fuse_file_info* fi);
+void mo2_statfs(fuse_req_t req, fuse_ino_t ino);
 void mo2_getlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
                struct flock* lock);
 void mo2_setlk(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi,
@@ -220,6 +221,11 @@ void mo2_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
                          size_t len, int flags);
 void mo2_lseek(fuse_req_t req, fuse_ino_t ino, off_t off, int whence,
                struct fuse_file_info* fi);
+void mo2_getxattr(fuse_req_t req, fuse_ino_t ino, const char* name, size_t size);
+void mo2_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size);
+void mo2_setxattr(fuse_req_t req, fuse_ino_t ino, const char* name,
+                  const char* value, size_t size, int flags);
+void mo2_removexattr(fuse_req_t req, fuse_ino_t ino, const char* name);
 #if FUSE_USE_VERSION < 35
 void mo2_ioctl(fuse_req_t req, fuse_ino_t ino, int cmd, void* arg,
                struct fuse_file_info* fi, unsigned flags, const void* in_buf,
