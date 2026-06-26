@@ -1082,9 +1082,8 @@ void fillStatForDir(struct stat* st, fuse_ino_t ino, uid_t uid, gid_t gid)
 mode_t regularFileVfsMode(mode_t sourceMode)
 {
   mode_t mode = sourceMode != 0 ? sourceMode : static_cast<mode_t>(0644);
-  // The merged VFS is copy-on-write. Existing files from the base game or mods
-  // must still pass the kernel's default_permissions write check so mo2_open()
-  // can materialize them into staging instead of failing before userspace.
+  // The merged VFS is copy-on-write, so expose source files as writable even
+  // when their physical base-game or mod files are read-only.
   mode |= S_IRUSR | S_IWUSR;
   return mode;
 }
@@ -3655,11 +3654,9 @@ void mo2_access(fuse_req_t req, fuse_ino_t ino, int mask)
       return;
     }
 
-    // W_OK: only allow for files we can write to (non-backing, non-directory)
-    if ((mask & W_OK) != 0 && (node->is_directory || node->file_info.is_backing)) {
-      fuse_reply_err(req, EACCES);
-      return;
-    }
+    // The merged filesystem is writable even when the winning source is a
+    // read-only base-game or mod file: mutations are redirected through COW.
+    // Directories must likewise permit creation of staged children.
   }
 
   // X_OK on regular files: check real file permissions

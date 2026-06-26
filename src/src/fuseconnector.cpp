@@ -329,6 +329,12 @@ void wrap_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
   MO2_TRY_REPLY(req, "fsync", ino, EIO)
 }
 
+void wrap_access(fuse_req_t req, fuse_ino_t ino, int mask) noexcept
+{
+  try { mo2_access(req, ino, mask); }
+  MO2_TRY_REPLY(req, "access", ino, EIO)
+}
+
 void wrap_statfs(fuse_req_t req, fuse_ino_t ino) noexcept
 {
   try { mo2_statfs(req, ino); }
@@ -449,6 +455,7 @@ void setupFuseOps(struct fuse_lowlevel_ops* ops)
   ops->releasedir  = wrap_releasedir;
   ops->flush       = wrap_flush;
   ops->fsync       = wrap_fsync;
+  ops->access      = wrap_access;
   ops->statfs      = wrap_statfs;
   ops->getlk       = wrap_getlk;
   ops->setlk       = wrap_setlk;
@@ -461,8 +468,6 @@ void setupFuseOps(struct fuse_lowlevel_ops* ops)
   ops->setxattr    = wrap_setxattr;
   ops->removexattr = wrap_removexattr;
   ops->ioctl       = wrap_ioctl;
-  // access handler removed: default_permissions mount option lets the kernel
-  // handle permission checks in-kernel, eliminating access() round-trips.
 }
 
 }  // namespace
@@ -662,7 +667,7 @@ bool FuseConnector::mount(
   // kernel reads don't fit.  1MB is the safe ceiling.
   std::vector<std::string> argvStorage = {
       "mo2fuse", "-o", "fsname=mo2linux", "-o", "noatime",
-      "-o", "default_permissions", "-o", "max_read=1048576"};
+      "-o", "max_read=1048576"};
   std::fprintf(stderr, "[VFS] libfuse=%s headers=%d.%d\n",
                fuse_pkgversion(), FUSE_MAJOR_VERSION, FUSE_MINOR_VERSION);
 
