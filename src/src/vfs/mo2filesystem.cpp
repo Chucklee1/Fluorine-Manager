@@ -2762,6 +2762,61 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
       }
     }
 
+    // Wine can issue a handle-based truncate after opening the FUSE file with
+    // O_RDONLY, even though the corresponding Windows handle is writable. The
+    // COW branch above upgrades that handle as a side effect, but files already
+    // in staging/overwrite or a tracked output mod skipped COW and retained a
+    // read-only (often lazy, fd-less) handle. The following write then failed
+    // with EACCES. Ensure every handle-based size change leaves a writable fd.
+    if (fi != nullptr) {
+      bool needsWritableFd = false;
+      {
+        std::shared_lock lock(ctx->open_files_mutex);
+        auto it = ctx->open_files.find(fh);
+        needsWritableFd = it != ctx->open_files.end() &&
+                          (!it->second.writable || it->second.fd < 0);
+      }
+
+      if (needsWritableFd) {
+        const int newFd = open(target.c_str(), O_RDWR | O_CLOEXEC);
+        if (newFd < 0) {
+          if (shouldTracePath(path)) {
+            std::fprintf(stderr,
+                         "[VFS] setattr writable reopen failed path='%s' "
+                         "target='%s' errno=%d message='%s'\n",
+                         path.c_str(), target.c_str(), errno,
+                         std::strerror(errno));
+          }
+          fuse_reply_err(req, errno != 0 ? errno : EIO);
+          return;
+        }
+
+        std::scoped_lock lock(ctx->open_files_mutex);
+        auto it = ctx->open_files.find(fh);
+        if (it == ctx->open_files.end()) {
+          close(newFd);
+          fuse_reply_err(req, EBADF);
+          return;
+        }
+        if (it->second.fd >= 0) {
+          close(it->second.fd);
+        }
+        it->second.fd          = newFd;
+        it->second.real_path   = target;
+        it->second.writable    = true;
+        it->second.is_backing  = false;
+        it->second.cow_pending = false;
+        it->second.is_tracked  = trackedTarget;
+
+        if (shouldTracePath(path)) {
+          std::fprintf(stderr,
+                       "[VFS] setattr upgraded writable handle path='%s' "
+                       "target='%s' fd=%d\n",
+                       path.c_str(), target.c_str(), newFd);
+        }
+      }
+    }
+
     bool resized = false;
     if (fi != nullptr) {
       std::scoped_lock lock(ctx->open_files_mutex);
