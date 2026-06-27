@@ -2821,15 +2821,8 @@ void MainWindow::openPluginsFolder()
 
 void MainWindow::openStylesheetsFolder()
 {
-  // Open the instance's stylesheets directory (where custom themes from
-  // modlists live), or the user data dir as fallback.
-  QString ssPath;
-  if (auto ci = InstanceManager::singleton().currentInstance()) {
-    ssPath =
-        ci->directory() + "/" + QString::fromStdWString(AppConfig::stylesheetsPath());
-  } else {
-    ssPath = fluorineDataDir() + "/stylesheets";
-  }
+  const QString ssPath = QCoreApplication::applicationDirPath() + "/" +
+                         QString::fromStdWString(AppConfig::stylesheetsPath());
   QDir().mkpath(ssPath);
   shell::Explore(ssPath);
 }

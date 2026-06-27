@@ -1,11 +1,9 @@
 #include "settingsdialogtheme.h"
 #include "categoriesdialog.h"
 #include "colortable.h"
-#include "instancemanager.h"
 #include "modlist.h"
 #include "shared/appconfig.h"
 #include "ui_settingsdialog.h"
-#include "fluorinepaths.h"
 
 #include <QFontDatabase>
 #include <QFontInfo>
@@ -83,33 +81,14 @@ void ThemeSettingsTab::addStyles()
 
   ui->styleBox->insertSeparator(ui->styleBox->count());
 
-  // Collect .qss files from all stylesheet search directories, deduplicating
-  // by filename so bundled themes aren't listed twice.
+  // Only expose stylesheets installed with Fluorine Manager.
   const QString ssSubdir = QString::fromStdWString(AppConfig::stylesheetsPath());
-  QStringList searchDirs;
-  searchDirs << QCoreApplication::applicationDirPath() + "/" + ssSubdir;
-  if (auto ci = InstanceManager::singleton().currentInstance()) {
-    // currentInstance() returns a bare Instance (readFromIni() not called),
-    // so baseDirectory() is empty. Use directory() which is always set.
-    const QString instanceDir = ci->directory() + "/" + ssSubdir;
-    if (!searchDirs.contains(instanceDir))
-      searchDirs << instanceDir;
-  }
-  const QString userDir = fluorineDataDir() + "/stylesheets";
-  if (!searchDirs.contains(userDir))
-    searchDirs << userDir;
-
-  QSet<QString> seen;
-  for (const auto& dir : searchDirs) {
-    QDirIterator iter(dir, QStringList("*.qss"), QDir::Files);
-    while (iter.hasNext()) {
-      iter.next();
-      const QString fileName = iter.fileName();
-      if (seen.contains(fileName))
-        continue;
-      seen.insert(fileName);
-      ui->styleBox->addItem(iter.fileInfo().completeBaseName(), fileName);
-    }
+  const QString stylesheetDir =
+      QCoreApplication::applicationDirPath() + "/" + ssSubdir;
+  QDirIterator iter(stylesheetDir, QStringList("*.qss"), QDir::Files);
+  while (iter.hasNext()) {
+    iter.next();
+    ui->styleBox->addItem(iter.fileInfo().completeBaseName(), iter.fileName());
   }
 }
 
@@ -159,15 +138,8 @@ void ThemeSettingsTab::selectFontFamily()
 
 void ThemeSettingsTab::onExploreStyles()
 {
-  // Open the instance's stylesheets directory (where custom themes from
-  // modlists live), or the user data dir as fallback.
-  QString ssPath;
-  if (auto ci = InstanceManager::singleton().currentInstance()) {
-    ssPath =
-        ci->directory() + "/" + QString::fromStdWString(AppConfig::stylesheetsPath());
-  } else {
-    ssPath = fluorineDataDir() + "/stylesheets";
-  }
+  const QString ssPath = QCoreApplication::applicationDirPath() + "/" +
+                         QString::fromStdWString(AppConfig::stylesheetsPath());
   QDir().mkpath(ssPath);
   shell::Explore(ssPath);
 }

@@ -721,42 +721,31 @@ bool MOApplication::setStyleFile(const QString& styleName)
   }
   // set new stylesheet or clear it
   if (styleName.length() != 0) {
-    // Search for the stylesheet in multiple locations:
-    //   1. applicationDirPath()/stylesheets/ — bundled themes
-    //   2. instance baseDir/stylesheets/     — instance/portable themes (modlists)
-    //   3. fluorineDataDir()/stylesheets/    — user-installed custom themes
+    // Stylesheets are application resources. Do not load copies supplied by an
+    // instance or from another user-writable search location.
     const QString ssSubdir = MOBase::ToQString(AppConfig::stylesheetsPath());
-    QStringList searchDirs;
-    searchDirs << applicationDirPath() + "/" + ssSubdir;
-    if (m_instance) {
-      // Prefer baseDirectory() (populated after readFromIni), fall back to
-      // directory() which is always set by the constructor.
-      QString base = m_instance->baseDirectory();
-      if (base.isEmpty())
-        base = m_instance->directory();
-      const QString instanceDir = base + "/" + ssSubdir;
-      if (!searchDirs.contains(instanceDir))
-        searchDirs << instanceDir;
-    }
-    const QString userDir = fluorineDataDir() + "/stylesheets";
-    if (!searchDirs.contains(userDir))
-      searchDirs << userDir;
-
+    const QString stylesheetDir = applicationDirPath() + "/" + ssSubdir;
     QString resolved;
-    for (const auto& dir : searchDirs) {
-      QString const candidate = dir + "/" + styleName;
-      if (QFile::exists(candidate)) {
-        resolved = candidate;
-        break;
+    if (QFileInfo(styleName).fileName() == styleName) {
+      const QString candidate = stylesheetDir + "/" + styleName;
+      const QString canonicalDir = QDir(stylesheetDir).canonicalPath();
+      const QString canonicalFile = QFileInfo(candidate).canonicalFilePath();
+      if (!canonicalDir.isEmpty() &&
+          canonicalFile.startsWith(canonicalDir + "/") &&
+          QFileInfo(canonicalFile).isFile()) {
+        resolved = canonicalFile;
       }
     }
 
     if (!resolved.isEmpty()) {
       m_styleWatcher.addPath(resolved);
       updateStyle(resolved);
-    } else {
-      // Could be a built-in Qt style name (e.g. "Fusion")
+    } else if (QStyleFactory::keys().contains(styleName)) {
       updateStyle(styleName);
+    } else {
+      log::warn("stylesheet '{}' is not installed in '{}'", styleName,
+                stylesheetDir);
+      return false;
     }
   } else {
     setStyle(new ProxyStyle(QStyleFactory::create(m_defaultStyle)));
