@@ -55,6 +55,8 @@ namespace mo2::python {
             .def("isNativeLinux", &IPluginGame::isNativeLinux)
             .def("usesVFS", &IPluginGame::usesVFS)
             .def("needsAutoCreateDirectories", &IPluginGame::needsAutoCreateDirectories)
+            .def("pluginFileExtensions", &IPluginGame::pluginFileExtensions)
+            .def("sortToolName", &IPluginGame::sortToolName)
             .def("gameIcon", &IPluginGame::gameIcon)
             .def("gameDirectory", &IPluginGame::gameDirectory)
             .def("dataDirectory", &IPluginGame::dataDirectory)

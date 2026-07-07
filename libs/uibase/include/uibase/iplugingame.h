@@ -179,6 +179,35 @@ public:
   /**
    * this function may be called before init()
    *
+   * @return the file extensions (lowercase, without the leading dot) that count
+   *         as load-order plugins for this game.  Defaults to the Bethesda set
+   *         (esp/esm/esl).  Games with their own plugin formats override this —
+   *         e.g. OpenMW adds omwaddon/omwgame/omwscripts — so the plugin list
+   *         can see and order them.
+   */
+  virtual QStringList pluginFileExtensions() const
+  {
+    return {"esp", "esm", "esl"};
+  }
+
+  /**
+   * this function may be called before init()
+   *
+   * @return the name() of a registered IPluginTool implementing sorting for
+   *         this game, or an empty string (the default).  When set — and
+   *         sortMechanism() is LOOT so the Sort button is shown — the Sort
+   *         button on the plugin list runs that tool instead of the built-in
+   *         flow (download the Windows LOOT.exe, run it under Proton on the
+   *         merged VFS), which cannot work for games sorted natively, e.g.
+   *         OpenMW via libloot.  The tool is also hidden from the Tools menu:
+   *         the Sort button becomes its only entry point, mirroring how every
+   *         other game exposes sorting.
+   */
+  virtual QString sortToolName() const { return {}; }
+
+  /**
+   * this function may be called before init()
+   *
    * @return an icon for this game
    */
   virtual QIcon gameIcon() const = 0;
