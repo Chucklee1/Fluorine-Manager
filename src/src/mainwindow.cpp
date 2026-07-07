@@ -1640,6 +1640,21 @@ void MainWindow::updateToolMenu()
                                    }),
                     toolPlugins.end());
 
+  // Hide the managed game's dedicated sort tool: the Sort button on the
+  // Plugins tab runs it (see on_sortButton_clicked()), so a Tools entry would
+  // only duplicate it in a less discoverable place.
+  if (const auto* game = m_OrganizerCore.managedGame()) {
+    const QString sortToolName = game->sortToolName();
+    if (!sortToolName.isEmpty()) {
+      toolPlugins.erase(
+          std::remove_if(std::begin(toolPlugins), std::end(toolPlugins),
+                         [&](auto* tool) {
+                           return tool->name() == sortToolName;
+                         }),
+          toolPlugins.end());
+    }
+  }
+
   // Group the plugins into submenus
   QMap<QString, QList<QPair<QString, IPluginTool*>>> submenuMap;
   for (auto *toolPlugin : toolPlugins) {
@@ -4021,6 +4036,37 @@ bool MainWindow::createBackup(const QString& filePath, const QDateTime& time)
 
 void MainWindow::on_sortButton_clicked()
 {
+  // Games that sort natively (e.g. OpenMW via libloot) name a registered tool
+  // plugin to run instead of the LOOT.exe-under-Proton flow below, which needs
+  // a merged VFS and a Proton prefix that such games don't have. The tool is
+  // hidden from the Tools menu (see updateToolMenu()); this button is its only
+  // entry point, same as for every other game.
+  if (const auto* game = m_OrganizerCore.managedGame()) {
+    const QString sortToolName = game->sortToolName();
+    if (!sortToolName.isEmpty()) {
+      for (IPluginTool* tool : m_PluginContainer.plugins<IPluginTool>()) {
+        if (tool->name() == sortToolName && m_PluginContainer.isEnabled(tool)) {
+          tool->setParentWidget(this);
+          try {
+            tool->display();
+          } catch (const std::exception& e) {
+            reportError(tr("Plugin \"%1\" failed: %2")
+                            .arg(tool->localizedName())
+                            .arg(e.what()));
+          } catch (...) {
+            reportError(tr("Plugin \"%1\" failed").arg(tool->localizedName()));
+          }
+          return;
+        }
+      }
+      // Never fall through to the LOOT.exe flow: it is wrong for these games.
+      QMessageBox::warning(this, tr("Sort"),
+                           tr("The sort tool \"%1\" is not available.")
+                               .arg(sortToolName));
+      return;
+    }
+  }
+
   if (!isLootInstalled()) {
     auto* progress = new QProgressDialog(
         tr("Downloading LOOT...\nThis is required for plugin sorting."),
