@@ -171,6 +171,22 @@ class OpenMWGame(BasicGame):
                 out.append(line)
         return out
 
+    def _read_loadorder_txt(self) -> list[str]:
+        """Plugin load order from <profile>/loadorder.txt (MO2 right-pane order)."""
+        try:
+            profile_dir = Path(self._organizer.profile().absolutePath())
+        except Exception:
+            return []
+        lo_file = profile_dir / "loadorder.txt"
+        if not lo_file.is_file():
+            return []
+        out: list[str] = []
+        for raw in lo_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                out.append(line)
+        return out
+
     def _export_openmw_cfg(self, app_name: str) -> bool:
         # onAboutToRun fires for every launched program; only act for OpenMW.
         if not self._is_openmw_binary(app_name):
@@ -203,8 +219,10 @@ class OpenMWGame(BasicGame):
             # source of truth. Tiers follow OpenMW convention: masters
             # (.esm/.omwgame) before plugins (.esp/.omwaddon), and .omwscripts
             # (Lua manifests, no records) last. Within a tier we keep mod-priority
-            # order (and alphabetical within a single mod). The user refines the
-            # final load order in OpenMW's own launcher.
+            # order (and alphabetical within a single mod). The tier order is the
+            # fallback; when <profile>/loadorder.txt exists it is the authoritative
+            # order and we stable-sort by it (unranked OpenMW-native plugins stay
+            # after the ranked ones, keeping their tier order).
             masters: list[str] = []         # .esm / .omwgame
             normal_plugins: list[str] = []  # .esp / .omwaddon
             omw_scripts: list[str] = []     # .omwscripts
@@ -267,6 +285,15 @@ class OpenMWGame(BasicGame):
             # re-shipping a vanilla esm (or two mods sharing a plugin name) won't
             # produce duplicate content= lines.
             all_plugins = masters + normal_plugins + omw_scripts
+            loadorder = self._read_loadorder_txt()
+            if loadorder:
+                rank = {name.lower(): i for i, name in enumerate(loadorder)}
+                # Stable sort: ranked plugins by loadorder.txt position, unranked
+                # (.omwaddon/.omwscripts/.omwgame not in MO2's list) keep their
+                # current order after all ranked ones.
+                all_plugins.sort(
+                    key=lambda p: rank.get(p.lower(), len(rank))
+                )
             plugin_lower = {p.lower() for p in all_plugins}
 
             groundcover = self._read_groundcover_txt()
