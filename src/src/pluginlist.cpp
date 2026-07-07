@@ -158,9 +158,11 @@ void PluginList::highlightPlugins(const std::vector<unsigned int>& modIndices,
       QDir dir(modDataPath);
       QStringList plugins;
       if (dir.exists()) {
-        plugins = dir.entryList(QStringList() << "*.esp"
-                                              << "*.esm"
-                                              << "*.esl");
+        QStringList nameFilters;
+        for (const QString& ext : m_GamePlugin->pluginFileExtensions()) {
+          nameFilters << ("*." + ext);
+        }
+        plugins = dir.entryList(nameFilters);
       }
       const MOShared::FilesOrigin& origin =
           directoryEntry.getOriginByName(selectedMod->internalName().toStdWString());
@@ -230,6 +232,27 @@ void PluginList::refresh(const QString& profileName,
       gamePlugins ? gamePlugins->blueprintPluginsAreSupported() : false;
   const bool loadOrderMechanismNone =
       m_GamePlugin->loadOrderMechanism() == IPluginGame::LoadOrderMechanism::None;
+  // Skip the esptk header parse for self-managed games (usesVFS()==false,
+  // e.g. OpenMW): their load order is engine-managed and sorted natively, so
+  // the parsed header metadata is never used — skip the per-plugin I/O on
+  // startup and on every mod toggle. See ESPInfo(parseHeader).
+  const bool parsePluginHeaders = m_GamePlugin->usesVFS();
+
+  // Plugin extensions (with leading dot, lowercase) are game-driven so games
+  // with their own formats (e.g. OpenMW: .omwaddon/.omwgame/.omwscripts) are
+  // recognised alongside the Bethesda .esp/.esm/.esl set.
+  QStringList pluginExtensions;
+  for (const QString& ext : m_GamePlugin->pluginFileExtensions()) {
+    pluginExtensions << ("." + ext);
+  }
+  const auto hasPluginExtension = [&](const QString& filename) {
+    for (const QString& ext : pluginExtensions) {
+      if (filename.endsWith(ext, Qt::CaseInsensitive)) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   m_CurrentProfile = profileName;
 
@@ -242,9 +265,7 @@ void PluginList::refresh(const QString& profileName,
     }
     const QString& filename = ToQString(current->getName());
 
-    if (filename.endsWith(".esp", Qt::CaseInsensitive) ||
-        filename.endsWith(".esm", Qt::CaseInsensitive) ||
-        filename.endsWith(".esl", Qt::CaseInsensitive)) {
+    if (hasPluginExtension(filename)) {
       availablePlugins.insert(std::make_pair(filename, current));
     } else if (filename.endsWith(".bsa", Qt::CaseInsensitive) ||
                filename.endsWith("ba2", Qt::CaseInsensitive)) {
@@ -291,7 +312,8 @@ void PluginList::refresh(const QString& profileName,
       m_ESPs.emplace_back(filename, forceLoaded, forceEnabled, forceDisabled,
                           originName, ToQString(current->getFullPath()), hasIni,
                           loadedArchives, lightPluginsAreSupported,
-                          mediumPluginsAreSupported, blueprintPluginsAreSupported);
+                          mediumPluginsAreSupported, blueprintPluginsAreSupported,
+                          parsePluginHeaders);
       m_ESPs.rbegin()->priority = -1;
     } catch (const std::exception& e) {
       reportError(tr("failed to update esp info for file %1 (source id: %2), error: %3")
@@ -324,7 +346,15 @@ void PluginList::refresh(const QString& profileName,
   }
 
   fixPrimaryPlugins();
-  fixPluginRelationships();
+  // Bethesda engines hard-load master-flagged plugins before regular ones, so
+  // fixPluginRelationships() re-imposes that grouping after every refresh. Games
+  // that manage their own load order (usesVFS()==false, e.g. OpenMW) have no
+  // such rule — libloot's OpenMW sorter freely interleaves .esm/.esp — and
+  // enforcing it here would silently rewrite the freshly sorted-and-persisted
+  // order on the next refresh (every "Sort with LOOT" appeared to never stick).
+  if (m_GamePlugin->usesVFS()) {
+    fixPluginRelationships();
+  }
 
   testMasters();
 
@@ -1905,12 +1935,32 @@ PluginList::ESPInfo::ESPInfo(const QString& name, bool forceLoaded, bool forceEn
                              bool forceDisabled, const QString& originName,
                              const QString& fullPath, bool hasIni,
                              std::set<QString> archives, bool lightSupported,
-                             bool mediumSupported, bool blueprintSupported)
+                             bool mediumSupported, bool blueprintSupported,
+                             bool parseHeader)
     : name(name), fullPath(fullPath), enabled(forceLoaded), forceLoaded(forceLoaded),
       forceEnabled(forceEnabled), forceDisabled(forceDisabled),  originName(originName), hasIni(hasIni),
       archives(archives.begin(), archives.end())
 
 {
+  if (!parseHeader) {
+    // Self-managed game (usesVFS()==false, e.g. OpenMW): the header metadata
+    // is unused — the engine manages the load order and the native LOOT sort
+    // reads the files itself — so skip the esptk parse and mirror the
+    // parse-failure defaults (plus the numeric fields the catch branch leaves
+    // untouched), deriving master tiering from the extension alone.
+    const auto extension = name.right(3).toLower();
+    hasMasterExtension   = (extension == "esm");
+    hasLightExtension    = (extension == "esl");
+    isMasterFlagged      = false;
+    isLightFlagged       = false;
+    isMediumFlagged      = false;
+    isBlueprintFlagged   = false;
+    hasNoRecords         = false;
+    formVersion          = 0;
+    headerVersion        = 0.0f;
+    return;
+  }
+
   QString parsePath = fullPath;
   // Linux is case-sensitive while Windows-authored paths sometimes mismatch
   // the actual filename casing. Resolve to the on-disk casing so the plugin

@@ -322,10 +322,14 @@ signals:
 private:
   struct ESPInfo
   {
+    // parseHeader=false skips the esptk header parse entirely. Used for
+    // self-managed games (usesVFS()==false, e.g. OpenMW) whose engine-managed
+    // load order never uses the parsed metadata; the resulting state mirrors
+    // the parse-failure catch branch, so downstream code is unaffected.
     ESPInfo(const QString& name, bool forceLoaded, bool forceEnabled,
             bool forceDisabled, const QString& originName, const QString& fullPath,
             bool hasIni, std::set<QString> archives, bool lightSupported,
-            bool mediumSupported, bool blueprintSupported);
+            bool mediumSupported, bool blueprintSupported, bool parseHeader = true);
 
     QString name;
     QString fullPath;
