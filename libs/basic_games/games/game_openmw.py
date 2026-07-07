@@ -61,6 +61,7 @@ from .openmw_support.openmw_cfg import (
     write_profile_selector,
     write_selection_state,
 )
+from .openmw_support.game_plugins import OpenMWGamePlugins
 
 _FLATPAK_ID = "org.openmw.OpenMW"
 
@@ -135,12 +136,41 @@ class OpenMWGame(BasicGame):
     def init(self, organizer: mobase.IOrganizer) -> bool:
         super().init(organizer)
         self._register_feature(OpenMWModDataChecker())
+        self._register_feature(OpenMWGamePlugins(organizer))
         organizer.onAboutToRun(self._export_openmw_cfg)
         return True
 
     # OpenMW is always a native Linux launch — never Proton/Wine.
     def isNativeLinux(self) -> bool:
         return True
+
+    # A persistent Plugins tab for OpenMW. PLUGINS_TXT tells the core to keep
+    # the load order in plugins.txt/loadorder.txt (written by OpenMWGamePlugins
+    # to the profile dir); _export_openmw_cfg then transcribes the active order
+    # into openmw.cfg at launch.
+    def loadOrderMechanism(self) -> mobase.LoadOrderMechanism:
+        return mobase.LoadOrderMechanism.PLUGINS_TXT
+
+    # Declaring LOOT makes Fluorine's native Sort button visible on the Plugins
+    # tab. For every other game that button downloads the Windows LOOT.exe and
+    # runs it under Proton on the merged VFS — impossible here (native Linux,
+    # no VFS); sortToolName() below reroutes it to our libloot-based tool.
+    def sortMechanism(self) -> mobase.SortMechanism:
+        return mobase.SortMechanism.LOOT
+
+    # The registered IPluginTool the Sort button runs instead of the LOOT.exe
+    # flow (openmw_support/plugins/sort_with_loot.py). The core hides it from
+    # the Tools menu; the Sort button is its only entry point.
+    def sortToolName(self) -> str:
+        return "OpenMW Sort With LOOT"
+
+    # The base masters that ship with Morrowind; force-loaded and listed first.
+    def primaryPlugins(self) -> list[str]:
+        return ["Morrowind.esm", "Tribunal.esm", "Bloodmoon.esm"]
+
+    # Extend the plugin list to OpenMW-native formats so they appear in the tab.
+    def pluginFileExtensions(self) -> list[str]:
+        return ["esp", "esm", "esl", "omwgame", "omwaddon", "omwscripts"]
 
     # OpenMW manages its own VFS via data= dirs, so Fluorine must NOT FUSE-mount
     # over Data Files for this game. Honoured by the C++ core once usesVFS() is
@@ -182,6 +212,45 @@ class OpenMWGame(BasicGame):
         base = Path(app_name).name.lower()
         # 'flatpak' here is our OpenMW launcher (we only register it for OpenMW).
         return base in {"openmw", "openmw-launcher", "flatpak"}
+
+    def _content_from_plugin_list(self, plugin_list) -> list[str]:
+        """Active plugins, in load order, from the Plugins tab.
+
+        Returns ``[]`` when the tab has no usable active plugins so the caller
+        can fall back to directory scanning. Plugins are ordered by the tab's
+        priority (the canonical drag-order the tab renders) and stub esps are
+        dropped.
+        """
+        try:
+            names = list(plugin_list.pluginNames())
+        except Exception:
+            return []
+
+        def _is_active(name: str) -> bool:
+            try:
+                return plugin_list.state(name) == mobase.PluginState.ACTIVE
+            except Exception:
+                return False
+
+        active = [
+            n
+            for n in names
+            if _is_active(n) and not is_openmw_player_stub(n)
+        ]
+
+        # Order by priority(), NOT loadOrder(): the core's setLoadOrder() (used by
+        # "Sort with LOOT") refreshes priority() immediately but leaves loadOrder()
+        # stale until a later resync, so reading loadOrder() here would export the
+        # pre-sort order. For active plugins, sorting by priority gives the same
+        # relative order the tab renders, so this is correct in every case.
+        def _order_key(name: str):
+            try:
+                return plugin_list.priority(name)
+            except Exception:
+                return 0
+
+        active.sort(key=_order_key)
+        return active
 
     def _read_groundcover_txt(self, fallback: list[str]) -> list[str]:
         """Plugins flagged as groundcover, from <profile>/groundcover.txt,
@@ -326,18 +395,16 @@ class OpenMWGame(BasicGame):
             # Data Files may contain enabled archives that are not one of the
             # canonical vanilla BSAs, such as Morrowind - Invalidation.bsa.
             _scan_archives(data_files)
-            # content= is built by scanning each active mod's directory for plugin
-            # files, NOT from the core plugin list. The core plugin list (right
-            # pane) is empty for this game: BasicGame returns the default
-            # loadOrderMechanism()==None, so pluginlist.cpp force-disables every
-            # esp/esm (loadOrder == -1) and there is no Plugins tab. So we are the
-            # source of truth. Tiers follow OpenMW convention: masters
-            # (.esm/.omwgame) before plugins (.esp/.omwaddon), and .omwscripts
-            # (Lua manifests, no records) last. Within a tier we keep mod-priority
-            # order (and alphabetical within a single mod). The tier order is the
-            # fallback; when <profile>/loadorder.txt exists it is the authoritative
-            # order and we stable-sort by it (unranked OpenMW-native plugins stay
-            # after the ranked ones, keeping their tier order).
+            # The content= load order comes from the Plugins tab (the user's
+            # persistent, LOOT-sortable order — see OpenMWGamePlugins). We still
+            # scan each active mod's directory here to build data_dirs and collect
+            # BSAs, and to keep a scan-based tiering as a FALLBACK for the very
+            # first launch (before the UI has populated the tab) or any edge where
+            # the tab is empty — so a launch never silently loses its mods. The
+            # fallback tiers follow OpenMW convention: masters (.esm/.omwgame)
+            # before plugins (.esp/.omwaddon), and .omwscripts (Lua manifests, no
+            # records) last; mod-priority order within a tier, reordered by
+            # <profile>/loadorder.txt via order_plugins_by_loadorder.
             masters: list[str] = []         # .esm / .omwgame
             normal_plugins: list[str] = []  # .esp / .omwaddon
             omw_scripts: list[str] = []     # .omwscripts
@@ -426,15 +493,22 @@ class OpenMWGame(BasicGame):
                     f"{len(requirements)} path(s)."
                 )
 
-            # content=: masters → normal plugins → Lua scripts (see _scan_mod),
-            # minus any the user routed to groundcover. build_managed_block
-            # prepends the vanilla masters and dedups case-insensitively, so a mod
-            # re-shipping a vanilla esm (or two mods sharing a plugin name) won't
-            # produce duplicate content= lines.
+            # content= load order: prefer the Plugins tab (the user's persistent,
+            # LOOT-sortable order) as the source of truth. When the tab is
+            # empty/unavailable, fall back to the scan-based tiering reordered by
+            # <profile>/loadorder.txt (order_plugins_by_loadorder keeps unranked
+            # plugins after the ranked ones, in tier order). Either way
+            # build_managed_block prepends the vanilla masters and dedups
+            # case-insensitively, so a mod re-shipping a vanilla esm (or two mods
+            # sharing a plugin name) won't produce duplicate content= lines.
             loadorder = self._read_loadorder_txt()
-            all_plugins = order_plugins_by_loadorder(
-                masters + normal_plugins + omw_scripts, loadorder
-            )
+            tab_order = self._content_from_plugin_list(organizer.pluginList())
+            if tab_order:
+                all_plugins = tab_order
+            else:
+                all_plugins = order_plugins_by_loadorder(
+                    masters + normal_plugins + omw_scripts, loadorder
+                )
             plugin_lower = {p.lower() for p in all_plugins}
 
             state_path = profile_dir / _SELECTION_STATE_FILE
@@ -514,11 +588,19 @@ class OpenMWGame(BasicGame):
                         previous_state_dirty = True
             gc_lower = {g.lower() for g in groundcover}
 
-            # loadorder.txt contains disabled plugins too, so preserve activation
-            # from the durable profile selection captured before the first export.
-            enabled_plugins = filter_selected_files(
-                all_plugins, state["enabled_plugins"]
-            )
+            # Activation source: when the Plugins tab populated all_plugins it
+            # already contains exactly the user's checked plugins, in order —
+            # the tab (persisted to plugins.txt by OpenMWGamePlugins) is the
+            # source of truth, so don't second-guess it with the durable
+            # selection. On the scan fallback, loadorder.txt contains disabled
+            # plugins too, so preserve activation from the durable profile
+            # selection captured before the first export.
+            if tab_order:
+                enabled_plugins = all_plugins
+            else:
+                enabled_plugins = filter_selected_files(
+                    all_plugins, state["enabled_plugins"]
+                )
             content = [p for p in enabled_plugins if p.lower() not in gc_lower]
             unranked = unranked_native_plugins(content, loadorder)
             if unranked:
