@@ -13,6 +13,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string_view>
@@ -30,9 +31,26 @@ namespace fs = std::filesystem;
 // Mod files are immutable during a game session, so cache aggressively.
 // The VFS tree is built once at mount time and only mutated by our own
 // create/rename/unlink handlers (which invalidate affected entries).
-constexpr double TTL_SECONDS          = 86400.0;  // 24 hours
-constexpr double NEGATIVE_TTL_SECONDS = 3600.0;   // 1 hour — Wine probes many non-existent files
-constexpr double ATTR_CACHE_SECONDS   = 86400.0;
+//
+// FLUORINE_VFS_DISABLE_CACHE=1 is a diagnostic escape hatch: it zeroes the
+// kernel-facing TTLs/attr cache below and disables keep_cache (see
+// fuseDropFeature(FUSE_CAP_AUTO_INVAL_DATA) further down, which is skipped
+// too when this is set). Use it to test whether a "stale VFS data" report is
+// actually a cache-invalidation bug in this file, before chasing one. It is
+// not meant to stay on permanently — see the June 2026 "Fix shader cache
+// write failures and INI key clobber" commit for why keep_cache=1 exists.
+bool vfsCacheDisabled()
+{
+  static const bool disabled = std::getenv("FLUORINE_VFS_DISABLE_CACHE") != nullptr;
+  return disabled;
+}
+double ttlSeconds() { return vfsCacheDisabled() ? 0.0 : 86400.0; }              // 24 hours
+double negativeTtlSeconds() { return vfsCacheDisabled() ? 0.0 : 3600.0; }       // 1 hour — Wine probes many non-existent files
+double attrCacheSeconds() { return vfsCacheDisabled() ? 0.0 : 86400.0; }
+const double TTL_SECONDS          = ttlSeconds();
+const double NEGATIVE_TTL_SECONDS = negativeTtlSeconds();
+const double ATTR_CACHE_SECONDS   = attrCacheSeconds();
+const int VFS_KEEP_CACHE          = vfsCacheDisabled() ? 0 : 1;
 constexpr size_t MAX_RETAINED_RO_FDS  = 1024;
 constexpr uint64_t SLOW_OP_LOG_NS     = 100ull * 1000ull * 1000ull;
 
@@ -1399,7 +1417,13 @@ void mo2_init(void* userdata, struct fuse_conn_info* conn)
   // reduction.  Our VFS tree is immutable during a session — we handle
   // invalidation ourselves via fuse_lowlevel_notify_inval_inode() when
   // files are created/renamed/deleted through our own handlers.
-  fuseDropFeature(conn, FUSE_CAP_AUTO_INVAL_DATA);
+  //
+  // FLUORINE_VFS_DISABLE_CACHE leaves this feature enabled instead, so the
+  // kernel re-validates via getattr on every read rather than trusting our
+  // own invalidation calls — see the TTL/keep_cache toggle above.
+  if (!vfsCacheDisabled()) {
+    fuseDropFeature(conn, FUSE_CAP_AUTO_INVAL_DATA);
+  }
 
   // Let us control page cache invalidation explicitly.
   if (fuseHasFeature(conn, FUSE_CAP_EXPLICIT_INVAL_DATA)) {
@@ -1756,8 +1780,8 @@ void mo2_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
   }
 
   fi->fh            = dh;
-  fi->keep_cache    = 1;   // Don't invalidate cached readdir on reopen
-  fi->cache_readdir = 1;   // Let kernel cache directory entries
+  fi->keep_cache    = VFS_KEEP_CACHE;   // Don't invalidate cached readdir on reopen
+  fi->cache_readdir = VFS_KEEP_CACHE;   // Let kernel cache directory entries
   fuse_reply_open(req, fi);
 }
 
@@ -2202,7 +2226,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
   }
 
   fi->fh = fh;
-  fi->keep_cache = 1;
+  fi->keep_cache = VFS_KEEP_CACHE;
 
   fuse_reply_open(req, fi);
 }
@@ -2505,7 +2529,7 @@ void mo2_create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode
   }
 
   fi->fh         = fh;
-  fi->keep_cache = 1;
+  fi->keep_cache = VFS_KEEP_CACHE;
 
   struct fuse_entry_param e;
   std::memset(&e, 0, sizeof(e));
