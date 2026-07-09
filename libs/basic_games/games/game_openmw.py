@@ -67,6 +67,31 @@ _VALID_DIRS = {
 }
 _PLUGIN_EXTS = {".esp", ".esm", ".omwaddon", ".omwgame", ".omwscripts"}
 
+# Kezyma's "OpenMW Player" drops an empty TES3 stub ESP next to each
+# OpenMW-native plugin so MO2's right pane can list and order it. The stub is
+# named "<plugin>.esp" (e.g. "Sun's Dusk.omwaddon.esp" for the real
+# "Sun's Dusk.omwaddon"). MO2's loadorder.txt therefore records STUB names, but
+# we emit the real files (_scan_mod skips the stubs), so a stub's rank must be
+# mapped onto the real name when sorting content= — otherwise every
+# .omwaddon/.omwscripts/.omwgame plugin is unranked and the content= sort
+# ignores master-before-dependent order (e.g. SDServiceRefusal.omwaddon before
+# its parent Sun's Dusk.omwaddon, which makes OpenMW abort on launch).
+_KEZYMA_STUB_SUFFIXES = (".omwaddon.esp", ".omwscripts.esp", ".omwgame.esp")
+
+
+def _destub_plugin_name(name: str) -> str:
+    """Return the real OpenMW-native plugin name for a Kezyma stub, else ``name``.
+
+    Strips the trailing ``.esp`` wrapper from names like
+    ``Sun's Dusk.omwaddon.esp`` -> ``Sun's Dusk.omwaddon``. Real .esp/.esm plugins
+    (no OpenMW-native stem) and names that are already real pass through
+    unchanged. The suffix check is case-insensitive; the returned name
+    preserves the original casing of the stem.
+    """
+    if name.lower().endswith(_KEZYMA_STUB_SUFFIXES):
+        return name[:-4]  # strip the trailing ".esp" wrapper
+    return name
+
 
 class OpenMWModDataChecker(mobase.ModDataChecker):
     def __init__(self):
@@ -172,7 +197,17 @@ class OpenMWGame(BasicGame):
         return out
 
     def _read_loadorder_txt(self) -> list[str]:
-        """Plugin load order from <profile>/loadorder.txt (MO2 right-pane order)."""
+        """Plugin load order from <profile>/loadorder.txt (MO2 right-pane order).
+
+        loadorder.txt records Kezyma stub names for OpenMW-native plugins (e.g.
+        ``Sun's Dusk.omwaddon.esp``), but we emit the real files (the stubs are
+        skipped in _scan_mod). Map each entry through _destub_plugin_name so the
+        returned names match the content= plugins we sort against — otherwise
+        every .omwaddon/.omwscripts/.omwgame plugin is unranked and the sort
+        falls back to scan order, ignoring master-before-dependent ordering
+        (e.g. SDServiceRefusal.omwaddon before its parent Sun's Dusk.omwaddon,
+        which makes OpenMW abort on launch).
+        """
         try:
             profile_dir = Path(self._organizer.profile().absolutePath())
         except Exception:
@@ -184,7 +219,7 @@ class OpenMWGame(BasicGame):
         for raw in lo_file.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw.strip()
             if line and not line.startswith("#"):
-                out.append(line)
+                out.append(_destub_plugin_name(line))
         return out
 
     def _export_openmw_cfg(self, app_name: str) -> bool:
@@ -243,7 +278,7 @@ class OpenMWGame(BasicGame):
                     # entry shows up in MO2's plugin list. The real file is scanned
                     # separately; loading the empty stub as content= is at best useless
                     # and at worst aborts OpenMW ("sub-record incomplete").
-                    if low.endswith((".omwaddon.esp", ".omwscripts.esp", ".omwgame.esp")):
+                    if low.endswith(_KEZYMA_STUB_SUFFIXES):
                         continue
                     ext = f.suffix.lower()
                     if ext in {".esm", ".omwgame"}:
