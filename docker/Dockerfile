@@ -38,6 +38,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zip unzip \
     # Static analysis
     clang-tidy \
+    # WebP support for Qt image format plugin
+    libwebp-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Build a pinned upstream libfuse so Fluorine compiles and bundles matching
@@ -80,7 +82,7 @@ ENV PATH="/opt/python-bundled/bin:${PATH}"
 
 # ── Qt 6.11 via aqtinstall (one-off via uv tool run) ──
 RUN uv tool run --from aqtinstall aqt install-qt linux desktop 6.11.1 linux_gcc_64 \
-      -m qtwebsockets qtwaylandcompositor qtnetworkauth qttasktree \
+      -m qtwebsockets qtwaylandcompositor qtnetworkauth qttasktree qtimageformats \
       --outputdir /opt/qt6 && \
     ls /opt/qt6/6.11.1/gcc_64/bin/qmake
 ENV Qt6_DIR=/opt/qt6/6.11.1/gcc_64
