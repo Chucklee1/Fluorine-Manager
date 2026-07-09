@@ -59,6 +59,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QFutureWatcher>
+#include <QStandardPaths>
 #include <QMessageBox>
 #include <QNetworkInterface>
 #include <QPointer>
@@ -1320,10 +1321,25 @@ void OrganizerCore::setPersistent(const QString& pluginName, const QString& key,
 
 QString OrganizerCore::pluginDataPath()
 {
-  // The plugins/ directory may contain symlinks into a read-only bundled
-  // directory (e.g. /app/ in Flatpak). Place plugin data in a separate
-  // writable directory so mkdir() never hits a read-only filesystem.
-  return AppConfig::basePath() + "/plugin_data";
+  // Place plugin data in a writable directory so plugin mkdir() calls never
+  // hit a read-only filesystem. Prefer the install-relative plugin_data/ dir
+  // (portable installs, or any install whose base dir is user-writable);
+  // fall back to a user-writable location when the base dir is read-only
+  // (e.g. a system-wide /opt install, or a Flatpak /app with read-only base).
+  const QString basePath  = AppConfig::basePath();
+  const QString candidate = basePath + "/plugin_data";
+
+  // Use the install-relative dir when it is already writable, or when its
+  // parent (basePath) is writable so the plugin can create it on demand.
+  if (QFileInfo(candidate).isWritable() || QFileInfo(basePath).isWritable()) {
+    return candidate;
+  }
+
+  // Base dir is not writable — redirect to a user-writable location, keeping
+  // plugin data alongside Fluorine's other runtime data
+  // (~/.local/share/fluorine/plugin_data).
+  return QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)
+         + "/fluorine/plugin_data";
 }
 
 MOBase::IModInterface* OrganizerCore::installMod(const QString& archivePath,
