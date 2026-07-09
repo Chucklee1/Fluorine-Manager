@@ -1,4 +1,6 @@
 #include "instancemanagerdialog.h"
+#include "collectiondownloaddialog.h"
+#include "nexuscollections.h"
 #include "createinstancedialog.h"
 #include "filesystemutilities.h"
 #include "instancemanager.h"
@@ -184,6 +186,9 @@ InstanceManagerDialog::InstanceManagerDialog(PluginContainer& pc, QWidget* paren
   });
   connect(ui->openExisting, &QPushButton::clicked, [&] {
     openExistingPortable();
+  });
+  connect(ui->downloadCollection, &QPushButton::clicked, [&] {
+    downloadCollection();
   });
 
   connect(ui->list->selectionModel(), &QItemSelectionModel::selectionChanged, [&] {
@@ -936,6 +941,42 @@ void InstanceManagerDialog::openExistingPortable()
       break;
     }
   }
+}
+
+void InstanceManagerDialog::downloadCollection()
+{
+  auto* dlg = new CollectionDownloadDialog(
+      &m_pc, this);
+
+  // Pre-select the game domain of the currently selected instance if any.
+  const Instance* sel = singleSelection();
+  if (sel) {
+    const QString domain = NexusCollections::domainForGameName(sel->gameName());
+    if (!domain.isEmpty())
+      dlg->setGameDomain(domain);
+  }
+
+  if (dlg->exec() == QDialog::Accepted) {
+    const QString instDir = dlg->createdInstanceDir();
+    if (!instDir.isEmpty()) {
+      updateInstances();
+      updateList();
+
+      // Select the newly installed instance.
+      const QString canonical = QDir(instDir).absolutePath();
+      for (std::size_t i = 0; i < m_instances.size(); ++i) {
+        if (QDir(m_instances[i]->directory()).absolutePath() == canonical) {
+          select(i);
+          break;
+        }
+      }
+
+      if (dlg->shouldSwitchToInstance())
+        openSelectedInstance();
+    }
+  }
+
+  dlg->deleteLater();
 }
 
 void InstanceManagerDialog::downloadSLRIfNeeded()

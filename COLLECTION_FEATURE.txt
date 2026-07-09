@@ -1,0 +1,300 @@
+NEXUS COLLECTIONS FEATURE — STATUS DOCUMENT
+============================================
+Last updated: 2026-06-27
+
+
+WHAT WAS DONE
+=============
+
+A full Nexus Collections install pipeline was integrated into the Fluorine
+instance manager.  The feature adds a "Download Collection" button to the
+instance manager toolbar.  Clicking it opens a four-page wizard:
+
+  Page 1 — Browse:   Gallery of collections from the Nexus GraphQL v2 API.
+                      Filtered to detected games by default; "Show all games"
+                      checkbox unlocks the full catalogue.  Sort by
+                      endorsements / downloads / newest.  Search box for
+                      title/author/summary.  Detail pane shows mod count,
+                      endorsements, revision.  If the collection's game was
+                      not auto-detected, a path-browser appears.
+
+  Page 2 — Configure: Instance name, downloads folder, instance directory,
+                      portable toggle, "switch to this instance when done"
+                      checkbox.  Paths are auto-derived from the collection
+                      name and can be overridden.
+
+  Page 3 — Progress:  Live install log and progress bar.  Downloads and
+                      extracts each mod archive in sequence.
+
+  Page 4 — Done:      Summary of installed / skipped / failed mods.
+                      Optional one-click switch to the new instance.
+
+
+NEW FILES (all in src/src/)
+============================
+
+collectionmanifest.h / .cpp
+    Parses Nexus collection.json into C++ structs:
+      CollectionFomodChoices, CollectionMod, CollectionModSource,
+      CollectionManifest, CollectionPlugin, CollectionModRule.
+    Supports both the current Nexus format and the older "collectionName"
+    legacy format.
+
+nexuscollections.h / .cpp
+    Async wrapper around the Nexus v2 GraphQL API and v1 REST API.
+    Auth is handled transparently via NexusInterface::instance().getAccessManager()
+    — the same OAuth session / legacy API key the user configured in
+    Settings → Nexus.  No API key is passed around.
+
+    Public API:
+      checkAuth()              — validate login; emits validateReady(name, premium)
+      fetchGallery(domain, …)  — gallery query; emits galleryReady(cards)
+      fetchManifest(slug, …)   — 3-step: GraphQL → CDN link resolve → download+extract
+      domainForGameName(name)  — game name → Nexus URL slug
+      gameNameForDomain(slug)  — Nexus URL slug → display name
+
+    Game domain mapping covers: Enderal, Enderal SE, Fallout 3, Fallout 4,
+    Fallout 4 VR, Fallout New Vegas, Morrowind, Oblivion, Skyrim, Skyrim SE,
+    Skyrim VR, Starfield, The Witcher 3, Cyberpunk 2077, Baldur's Gate 3.
+
+collectioninstaller.h / .cpp
+    Orchestrates the full install pipeline (~826 lines):
+
+    Download:
+      - Cache check (by logicalFilename in downloadsDir) — skips re-download
+      - "browse" type: logs instructions and skips (manual download required)
+      - "direct" type: plain HTTP download from embedded URL
+      - "nexus" type: two-step Nexus premium download
+          1. GET download_link.json via authenticated Nexus REST API
+          2. GET CDN URL (no auth needed) — handled by downloadFromCdnUrl()
+      Premium check is live: NexusInterface::instance().getAPIUserAccount().type()
+
+    Extract:
+      - 7z binary discovery: bundled fluorineDataDir()/bin/7zz, then 7z/7za/7zz
+      - Extracts to a temp directory per mod
+
+    FOMOD auto-executor:
+      - Finds fomod/ModuleConfig.xml inside extracted archive
+      - Applies pre-recorded choices from the collection JSON:
+          <requiredInstallFiles> are always installed
+          <installSteps> / <plugins> matched by name and index from choices
+          <conditionalFileInstalls> applied when the matching plugin is chosen
+      - Falls back to full archive root if FOMOD execution fails
+
+    Root file routing (mirrors CLF3 root_files.rs):
+      Files matching per-game rules are moved to <mod>/Root/ for VFS Root Builder:
+        - SKSE64_/NVSE_/F4SE_/OBSE_ loader DLLs and EXEs
+        - ENB binaries (d3d11.dll, d3d9.dll, enbseries*.dll, etc.)
+        - D3D hooks (dxgi.dll, d3dcompiler_46e.dll, etc.)
+        - engine_fixes.toml, crashlogger.dll
+        - enbseries/, reshade-shaders/, reshade-presets/ folders
+
+    Instance creation:
+      - Writes modlist.txt (reverse-priority order, +/- enabled prefix)
+      - Writes plugins.txt (* enabled prefix, collection order)
+      - Writes loadorder.txt (plain list, collection order)
+      - Writes ModOrganizer.ini with gameName, gamePath, mod/download/profile paths
+      - Creates overwrite/ directory
+      - Calls InstanceManager::registerPortableInstance() for portable instances
+
+collectiondownloaddialog.h / .cpp
+    Four-page QStackedWidget wizard (~586 lines).
+
+collectiondownloaddialog.ui
+    Qt Designer UI file for the wizard.
+
+
+MODIFIED FILES
+==============
+
+instancemanagerdialog.ui
+    Added "Download Collection" QPushButton between "Open existing portable"
+    and the horizontal spacer.
+
+instancemanagerdialog.h
+    Added: void downloadCollection();
+
+instancemanagerdialog.cpp
+    Wired the button.  downloadCollection() creates CollectionDownloadDialog,
+    pre-fills the game domain from the currently selected instance (if any),
+    and handles post-install instance selection.
+
+
+ARCHITECTURE NOTES
+==================
+
+Auth:
+    ALL Nexus API calls (GraphQL and REST) go through
+    NexusInterface::instance().getAccessManager()->makeOAuthPostRequest()
+    or makeOAuthGetRequest().  The access manager uses OAuth Bearer token if
+    the user logged in via OAuth, or the legacy APIKEY header as fallback.
+    No separate API key needs to be stored or passed.
+
+CDN and external downloads:
+    Non-Nexus requests (CDN .7z files, direct URL mod downloads) use a plain
+    QNetworkAccessManager owned by each class.  Auth headers are NOT sent to
+    external servers.
+
+CMake auto-include:
+    Fluorine uses file(GLOB …) in CMakeLists so all new .cpp/.h/.ui files in
+    src/src/ were picked up automatically — no CMakeLists edit was needed.
+
+GCC 15 vexing-parse workaround:
+    QNetworkRequest req(QUrl(plainIdentifier)) triggers the "most vexing parse"
+    when the inner argument is a simple parameter name.  Fixed by splitting into
+    two lines:
+        const QUrl q(param);
+        QNetworkRequest req(q);
+    Member-access expressions like QUrl(src.url) are unaffected.
+
+
+WHAT WORKS (as implemented)
+============================
+
+- OAuth and legacy API key authentication, transparent to the feature
+- Gallery browse with game filter, sort, search, detail pane
+- Auto game detection populates the game filter and game path
+- Manifest download (3-step: GraphQL → CDN link → .7z → extract)
+- Cached mod detection (skips archives already in downloadsDir)
+- Nexus Premium direct download (download_link.json → CDN URL)
+- Direct URL mod downloads (Google Drive, MediaFire, etc.)
+- FOMOD auto-executor with required files, step/group/plugin matching,
+  and conditional installs
+- Per-game root file routing for SKSE/ENB/D3D/engine_fixes
+- modlist.txt, plugins.txt, loadorder.txt generation
+- ModOrganizer.ini generation (portable and global paths)
+- Portable instance registration
+- Progress dialog with live log
+- Post-install instance selection
+
+
+KNOWN LIMITATIONS / THINGS TO TEST
+=====================================
+
+1. FREE-TIER USERS
+   Nexus mods with source type "nexus" are skipped with a log message if the
+   account is not premium.  The NXM browser flow (free-tier alternative) is
+   not implemented yet.  Collections that consist entirely of "direct" type
+   mods will work for free users.
+
+2. PREMIUM STATUS DETECTION
+   Premium status is read from NexusInterface::instance().getAPIUserAccount().
+   This is populated after the existing MO2 validation cycle.  If the user has
+   not yet validated in the current session (e.g. first launch with saved
+   OAuth token), premium might read as false until validation completes.
+   The checkAuth() call in showEvent triggers a fresh validate, but there is a
+   short window before the response arrives where the gallery might be fetched
+   first.  The gallery fetch itself does not require premium; the premium check
+   only gates the Nexus mod download step.
+
+3. FOMOD CONDITION LOGIC (SIMPLIFIED)
+   The FOMOD executor treats all condition flags as satisfied when the
+   corresponding plugin is explicitly chosen in the collection JSON.
+   Collections that use <conditionFlags> to gate conditional file installs
+   on flags that are NOT directly tied to a plugin choice may not install
+   correctly.  This covers the vast majority of collections but is not
+   perfectly spec-complete.
+
+4. GAME INI NOT SET IN ModOrganizer.ini
+   The gameName field written is the Nexus domain slug (e.g.
+   "skyrimspecialedition"), not the MO2 plugin game name (e.g. "Skyrim Special
+   Edition").  Fluorine's instance loader needs to be verified to accept the
+   domain slug, or a reverse mapping needs to be applied.
+
+5. UI REFRESH BUTTON
+   The "refreshButton" is wired in the dialog but depends on the .ui file
+   having that widget name.  Verify the name matches collectiondownloaddialog.ui.
+
+6. NO IMAGE THUMBNAILS
+   Collection tile images (tileImageUrl) are fetched from the GraphQL response
+   but not displayed.  The list shows text-only cards.
+
+7. GALLERY PAGINATION
+   fetchGallery() requests at most 50 results (count=50).  There is no "load
+   more" button.  Collections beyond the first 50 are not shown.
+
+8. mod.folderName FALLBACK
+   If the collection JSON does not include a folderName for a mod, the mod name
+   is used as the folder name.  Mod names can contain characters that are
+   invalid on Linux filesystems (/, :, etc.) — these are not sanitised.
+
+9. FOMOD FALLBACK
+   If FOMOD execution fails (XML parse error, missing files), the installer
+   falls back to the full extracted archive.  The mod will be installed but
+   FOMOD selection will not match the collection author's intent.
+
+10. 7z TIMEOUT
+    Archive extraction is capped at 10 minutes per archive via
+    QProcess::waitForFinished().  Very large archives may time out.
+    Extract7z runs synchronously on the main thread — a large collection
+    will block the UI during extraction.  For production quality this should
+    move to a worker thread.
+
+
+WHAT IS LEFT / PHASE 2
+=======================
+
+Priority 1 — High user impact:
+
+  Free-tier NXM flow
+    When a "nexus" type mod is encountered and the account is not premium,
+    instead of skipping, open an NXM URL in the browser and wait for the
+    NXM download manager to pick it up.  Requires integrating with Fluorine's
+    existing NXM handler and download manager.
+
+  Game name → MO2 plugin name mapping in ModOrganizer.ini
+    The gameName field should be the MO2 plugin name, not the Nexus domain.
+    Add a mapping table or use NexusCollections::gameNameForDomain() to
+    produce the correct value.
+
+  Filename sanitisation for mod folder names
+    Replace characters invalid on Linux (/, :, *, ?, ", <, >, |) with _ when
+    deriving folder names from mod.name.
+
+Priority 2 — Correctness:
+
+  Collection updates / diff
+    When a collection is already installed, offer to update to a newer revision
+    (download only added/changed mods, remove deleted mods).
+    Reference: Amethyst's collection_diff.py and CLF3's diff.rs.
+
+  INI tweaks
+    Collections can ship "INI Tweaks" archives containing .ini fragments.
+    These should be applied to the profile's game INI files.
+    Reference: Amethyst's collection_ini_tweaks.py.
+
+  bsdiff patches
+    Some collection mods include a .bsdiff patch rather than a full archive.
+    CLF3's collection/patches.rs handles this.  Requires a bsdiff/bspatch
+    binary or library.
+
+  FOMOD condition flags (full spec compliance)
+    Track condition flags that are set as side-effects of plugin choices and
+    use them to gate <conditionFlags>-dependent file installs.
+
+Priority 3 — Polish:
+
+  Thumbnail image loading
+    Load tileImageUrl asynchronously and display in the list widget.
+
+  Gallery pagination
+    Add a "Load more" button that calls fetchGallery() with increasing offset.
+
+  LOOT-sorted plugins.txt
+    After install, run LOOT on the new profile and write a LOOT-sorted
+    plugins.txt / loadorder.txt instead of using the collection's order.
+
+  Extract on background thread
+    Move QProcess-based 7z extraction to a QThread to avoid blocking the UI.
+
+  Progress reporting during extraction
+    7z -bsp1 can report progress to stdout; parse it and update the progress bar.
+
+  Meta files for downloaded mods
+    Write meta.ini per mod (modid=, fileid=, version=) so Fluorine's mod
+    manager can show version info and check for updates.
+
+  Error recovery / resume
+    If the install is interrupted, offer to resume from the last completed mod
+    rather than restarting from scratch.  The cache check partially covers this
+    but extracted mod directories are not detected as "done".

@@ -116,6 +116,10 @@ private:
   //
   void openExistingPortable();
 
+  // opens the collection download wizard
+  //
+  void downloadCollection();
+
   // shows a confirmation to the user before switching
   //
   bool confirmSwitch(const Instance& to);
