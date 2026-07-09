@@ -1,6 +1,7 @@
 #include "fuseconnector.h"
 
 #include "settings.h"
+#include "sleepinhibitor.h"
 #include "vfs/scancache.h"
 #include "vfs/vfstree.h"
 
@@ -475,6 +476,12 @@ void setupFuseOps(struct fuse_lowlevel_ops* ops)
 FuseConnector::FuseConnector(QObject* parent) : QObject(parent)
 {
   log::debug("FUSE connector initialized");
+
+  // Purely descriptive: gives logind an accurate reason to show instead of
+  // "systemd (1)" if a suspend/shutdown/lock is attempted while mounted. It
+  // does not try to unmount around suspend — see sleepinhibitor.h for why
+  // that would be unsafe (the mount's lifetime tracks the running game's).
+  m_sleepInhibitor = new SleepInhibitor(this);
 }
 
 FuseConnector::~FuseConnector()
@@ -712,6 +719,12 @@ bool FuseConnector::mount(
 
   m_mounted = true;
   setFuseMountPointForCrashCleanup(m_mountPoint.c_str());
+  if (m_sleepInhibitor != nullptr) {
+    const QString reason =
+        QStringLiteral("Fluorine: mod filesystem active for %1")
+            .arg(QFileInfo(QString::fromStdString(m_gameDir)).fileName());
+    m_sleepInhibitor->setActive(true, reason);
+  }
   {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - mountStart).count();
@@ -782,6 +795,9 @@ void FuseConnector::unmount()
   m_context.reset();
   m_mounted = false;
   setFuseMountPointForCrashCleanup(nullptr);
+  if (m_sleepInhibitor != nullptr) {
+    m_sleepInhibitor->setActive(false, {});
+  }
 
   // Clean up symlinks created for non-data-dir mappings.
   cleanupExternalMappings();

@@ -15,6 +15,8 @@
 #include <uibase/filemapping.h>
 #include <uibase/log.h>
 
+class SleepInhibitor;
+
 class FuseConnectorException : public std::exception
 {
 public:
@@ -106,6 +108,10 @@ private:
   std::thread m_fuseThread;
   bool m_mounted        = false;
   bool m_discardStaging = false;
+
+  // Gives logind an accurate reason for suspend/shutdown/lock prompts while
+  // mounted, instead of the generic "systemd (1)". See sleepinhibitor.h.
+  SleepInhibitor* m_sleepInhibitor = nullptr;
 
   // VFS Root Builder state
   bool m_rootBuilderEnabled = false;
