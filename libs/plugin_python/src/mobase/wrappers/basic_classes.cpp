@@ -583,7 +583,10 @@ namespace mo2::python {
                      mo2::python::show_deprecation_warning(
                          "appVersion", "IOrganizer::appVersion() is deprecated, use "
                                        "IOrganizer::version() instead.");
-                     return o.version();
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+                     return o.appVersion();
+#pragma GCC diagnostic pop
                  })
             .def("version", &IOrganizer::version)
             .def("createMod", &IOrganizer::createMod,
