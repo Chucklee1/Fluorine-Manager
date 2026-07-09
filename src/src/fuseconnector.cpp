@@ -662,6 +662,8 @@ bool FuseConnector::mount(
   m_context->backing_dir_fd        = m_backingFd;
   m_context->uid                   = ::getuid();
   m_context->gid                   = ::getgid();
+  m_context->cache_disabled        = m_disableVfsCache ||
+                                     std::getenv("FLUORINE_VFS_DISABLE_CACHE") != nullptr;
   // NOTE: Do NOT include mount_point here — low-level API passes it
   // separately to fuse_session_mount(). Including it here causes
   // "fuse: unknown option(s)" error.

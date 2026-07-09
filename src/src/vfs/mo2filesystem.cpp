@@ -32,25 +32,19 @@ namespace fs = std::filesystem;
 // The VFS tree is built once at mount time and only mutated by our own
 // create/rename/unlink handlers (which invalidate affected entries).
 //
-// FLUORINE_VFS_DISABLE_CACHE=1 is a diagnostic escape hatch: it zeroes the
-// kernel-facing TTLs/attr cache below and disables keep_cache (see
-// fuseDropFeature(FUSE_CAP_AUTO_INVAL_DATA) further down, which is skipped
-// too when this is set). Use it to test whether a "stale VFS data" report is
-// actually a cache-invalidation bug in this file, before chasing one. It is
-// not meant to stay on permanently — see the June 2026 "Fix shader cache
-// write failures and INI key clobber" commit for why keep_cache=1 exists.
-bool vfsCacheDisabled()
-{
-  static const bool disabled = std::getenv("FLUORINE_VFS_DISABLE_CACHE") != nullptr;
-  return disabled;
-}
-double ttlSeconds() { return vfsCacheDisabled() ? 0.0 : 86400.0; }              // 24 hours
-double negativeTtlSeconds() { return vfsCacheDisabled() ? 0.0 : 3600.0; }       // 1 hour — Wine probes many non-existent files
-double attrCacheSeconds() { return vfsCacheDisabled() ? 0.0 : 86400.0; }
-const double TTL_SECONDS          = ttlSeconds();
-const double NEGATIVE_TTL_SECONDS = negativeTtlSeconds();
-const double ATTR_CACHE_SECONDS   = attrCacheSeconds();
-const int VFS_KEEP_CACHE          = vfsCacheDisabled() ? 0 : 1;
+// ctx->cache_disabled (Settings > Proton/Wine tab, or the
+// FLUORINE_VFS_DISABLE_CACHE env var as a fallback) is a diagnostic escape
+// hatch: it zeroes the kernel-facing TTLs/attr cache below and disables
+// keep_cache (see fuseDropFeature(FUSE_CAP_AUTO_INVAL_DATA) further down,
+// which is skipped too when this is set). Use it to test whether a "stale
+// VFS data" report is actually a cache-invalidation bug in this file, before
+// chasing one. It is not meant to stay on permanently — see the June 2026
+// "Fix shader cache write failures and INI key clobber" commit for why
+// keep_cache=1 exists.
+double ttlSeconds(const Mo2FsContext* ctx) { return ctx->cache_disabled ? 0.0 : 86400.0; }              // 24 hours
+double negativeTtlSeconds(const Mo2FsContext* ctx) { return ctx->cache_disabled ? 0.0 : 3600.0; }       // 1 hour — Wine probes many non-existent files
+double attrCacheSeconds(const Mo2FsContext* ctx) { return ctx->cache_disabled ? 0.0 : 86400.0; }
+int vfsKeepCache(const Mo2FsContext* ctx) { return ctx->cache_disabled ? 0 : 1; }
 constexpr size_t MAX_RETAINED_RO_FDS  = 1024;
 constexpr uint64_t SLOW_OP_LOG_NS     = 100ull * 1000ull * 1000ull;
 
@@ -970,8 +964,8 @@ std::vector<char> buildReaddirPlusBlob(
     struct fuse_entry_param e;
     std::memset(&e, 0, sizeof(e));
     e.ino           = entry.ino;
-    e.attr_timeout  = TTL_SECONDS;
-    e.entry_timeout = TTL_SECONDS;
+    e.attr_timeout  = ttlSeconds(ctx);
+    e.entry_timeout = ttlSeconds(ctx);
 
     if (entry.is_dir) {
       fillStatForDir(&e.attr, entry.ino, ctx->uid, ctx->gid);
@@ -1144,8 +1138,8 @@ void replyEntryFromSnapshot(fuse_req_t req, const Mo2FsContext* ctx, fuse_ino_t 
   struct fuse_entry_param e;
   std::memset(&e, 0, sizeof(e));
   e.ino           = ino;
-  e.attr_timeout  = TTL_SECONDS;
-  e.entry_timeout = TTL_SECONDS;
+  e.attr_timeout  = ttlSeconds(ctx);
+  e.entry_timeout = ttlSeconds(ctx);
 
   if (snap.is_directory) {
     fillStatForDir(&e.attr, ino, ctx->uid, ctx->gid);
@@ -1418,10 +1412,10 @@ void mo2_init(void* userdata, struct fuse_conn_info* conn)
   // invalidation ourselves via fuse_lowlevel_notify_inval_inode() when
   // files are created/renamed/deleted through our own handlers.
   //
-  // FLUORINE_VFS_DISABLE_CACHE leaves this feature enabled instead, so the
-  // kernel re-validates via getattr on every read rather than trusting our
-  // own invalidation calls — see the TTL/keep_cache toggle above.
-  if (!vfsCacheDisabled()) {
+  // ctx->cache_disabled leaves this feature enabled instead, so the kernel
+  // re-validates via getattr on every read rather than trusting our own
+  // invalidation calls — see the TTL/keep_cache toggle above.
+  if (!ctx->cache_disabled) {
     fuseDropFeature(conn, FUSE_CAP_AUTO_INVAL_DATA);
   }
 
@@ -1589,8 +1583,8 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
         struct fuse_entry_param e;
         std::memset(&e, 0, sizeof(e));
         e.ino           = dirIno;
-        e.attr_timeout  = TTL_SECONDS;
-        e.entry_timeout = TTL_SECONDS;
+        e.attr_timeout  = ttlSeconds(ctx);
+        e.entry_timeout = ttlSeconds(ctx);
         fillStatForDir(&e.attr, dirIno, ctx->uid, ctx->gid);
         {
           std::scoped_lock cacheLock(ctx->lookup_cache_mutex);
@@ -1605,8 +1599,8 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
     struct fuse_entry_param e;
     std::memset(&e, 0, sizeof(e));
     e.ino           = 0;
-    e.attr_timeout  = NEGATIVE_TTL_SECONDS;
-    e.entry_timeout = NEGATIVE_TTL_SECONDS;
+    e.attr_timeout  = negativeTtlSeconds(ctx);
+    e.entry_timeout = negativeTtlSeconds(ctx);
 
     {
       std::scoped_lock lock(ctx->lookup_cache_mutex);
@@ -1655,8 +1649,8 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
   struct fuse_entry_param e;
   std::memset(&e, 0, sizeof(e));
   e.ino           = childIno;
-  e.attr_timeout  = TTL_SECONDS;
-  e.entry_timeout = TTL_SECONDS;
+  e.attr_timeout  = ttlSeconds(ctx);
+  e.entry_timeout = ttlSeconds(ctx);
   if (lr.snap.is_directory) {
     fillStatForDir(&e.attr, childIno, ctx->uid, ctx->gid);
   } else {
@@ -1689,7 +1683,7 @@ void mo2_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /*fi*/)
     if (it != ctx->attr_cache.end() && it->second.valid &&
         std::chrono::steady_clock::now() < it->second.expires_at) {
       ctx->attr_cache_hits.fetch_add(1, std::memory_order_relaxed);
-      fuse_reply_attr(req, &it->second.st, TTL_SECONDS);
+      fuse_reply_attr(req, &it->second.st, ttlSeconds(ctx));
       return;
     }
   }
@@ -1705,10 +1699,10 @@ void mo2_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /*fi*/)
       c.st          = st;
       c.expires_at  = std::chrono::steady_clock::now() +
                      std::chrono::milliseconds(
-                         static_cast<int>(ATTR_CACHE_SECONDS * 1000.0));
+                         static_cast<int>(attrCacheSeconds(ctx) * 1000.0));
       c.valid       = true;
     }
-    fuse_reply_attr(req, &st, TTL_SECONDS);
+    fuse_reply_attr(req, &st, ttlSeconds(ctx));
     return;
   }
 
@@ -1738,11 +1732,11 @@ void mo2_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /*fi*/)
     c.st         = st;
     c.expires_at = std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(
-                      static_cast<int>(ATTR_CACHE_SECONDS * 1000.0));
+                      static_cast<int>(attrCacheSeconds(ctx) * 1000.0));
     c.valid      = true;
   }
 
-  fuse_reply_attr(req, &st, TTL_SECONDS);
+  fuse_reply_attr(req, &st, ttlSeconds(ctx));
 }
 
 void mo2_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
@@ -1780,8 +1774,8 @@ void mo2_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
   }
 
   fi->fh            = dh;
-  fi->keep_cache    = VFS_KEEP_CACHE;   // Don't invalidate cached readdir on reopen
-  fi->cache_readdir = VFS_KEEP_CACHE;   // Let kernel cache directory entries
+  fi->keep_cache    = vfsKeepCache(ctx);   // Don't invalidate cached readdir on reopen
+  fi->cache_readdir = vfsKeepCache(ctx);   // Let kernel cache directory entries
   fuse_reply_open(req, fi);
 }
 
@@ -1962,8 +1956,8 @@ void mo2_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
     struct fuse_entry_param e;
     std::memset(&e, 0, sizeof(e));
     e.ino           = (*entries)[i].ino;
-    e.attr_timeout  = TTL_SECONDS;
-    e.entry_timeout = TTL_SECONDS;
+    e.attr_timeout  = ttlSeconds(ctx);
+    e.entry_timeout = ttlSeconds(ctx);
 
     if ((*entries)[i].is_dir) {
       fillStatForDir(&e.attr, (*entries)[i].ino, ctx->uid, ctx->gid);
@@ -2226,7 +2220,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
   }
 
   fi->fh = fh;
-  fi->keep_cache = VFS_KEEP_CACHE;
+  fi->keep_cache = vfsKeepCache(ctx);
 
   fuse_reply_open(req, fi);
 }
@@ -2529,13 +2523,13 @@ void mo2_create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode
   }
 
   fi->fh         = fh;
-  fi->keep_cache = VFS_KEEP_CACHE;
+  fi->keep_cache = vfsKeepCache(ctx);
 
   struct fuse_entry_param e;
   std::memset(&e, 0, sizeof(e));
   e.ino           = newIno;
-  e.attr_timeout  = TTL_SECONDS;
-  e.entry_timeout = TTL_SECONDS;
+  e.attr_timeout  = ttlSeconds(ctx);
+  e.entry_timeout = ttlSeconds(ctx);
   fillStatForFile(&e.attr, newIno, ctx->uid, ctx->gid, createdSize,
                   createdMtime, realPath, createdSt.st_mode & 0777);
 
@@ -2685,7 +2679,7 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
     _t.path = "/";
     struct stat st;
     fillStatForDir(&st, 1, ctx->uid, ctx->gid);
-    fuse_reply_attr(req, &st, TTL_SECONDS);
+    fuse_reply_attr(req, &st, ttlSeconds(ctx));
     return;
   }
 
@@ -2977,7 +2971,7 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
     fillStatForFile(&st, ino, ctx->uid, ctx->gid, snap.size, snap.mtime,
                     snap.real_path);
   }
-  fuse_reply_attr(req, &st, TTL_SECONDS);
+  fuse_reply_attr(req, &st, ttlSeconds(ctx));
 }
 
 void mo2_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)

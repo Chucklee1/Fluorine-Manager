@@ -1969,6 +1969,25 @@ If you disable this feature, MO will only display official DLCs this way. Please
         </widget>
        </item>
        <item>
+        <widget class="QGroupBox" name="groupBox_65">
+         <property name="title">
+          <string>VFS</string>
+         </property>
+         <layout class="QVBoxLayout" name="verticalLayout_39">
+          <item>
+           <widget class="QCheckBox" name="disableVfsCacheCheckBox">
+            <property name="text">
+             <string>Disable VFS cache (diagnostic)</string>
+            </property>
+            <property name="toolTip">
+             <string>Zeroes the mod filesystem's kernel-facing cache timeouts instead of caching aggressively. Use this to test whether a "stale file" or "won't save" report is actually a VFS caching bug before chasing one — it is not meant to stay on, and will noticeably slow down modded games with large modlists.</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </widget>
+       </item>
+       <item>
         <spacer name="verticalSpacer_16">
          <property name="orientation">
           <enum>Qt::Vertical</enum>

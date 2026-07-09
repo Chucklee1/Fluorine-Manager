@@ -177,6 +177,12 @@ struct Mo2FsContext
   // flush stale kernel page cache without needing fuse_req_session(req).
   struct fuse_session* session = nullptr;
 
+  // Diagnostic toggle (Settings > Proton/Wine tab, or FLUORINE_VFS_DISABLE_CACHE
+  // env var): zeroes the kernel-facing TTLs and disables keep_cache so a
+  // "stale VFS data" report can be tested against caching as the suspect.
+  // Not meant to stay on by default — see the June 2026 shader-cache/INI-
+  // clobber fix for why keep_cache=1 exists normally.
+  bool cache_disabled = false;
 };
 
 void mo2_init(void* userdata, struct fuse_conn_info* conn);

@@ -48,6 +48,9 @@ ProtonSettingsTab::ProtonSettingsTab(Settings& s, SettingsDialog& d)
   ui->launchWrapperEdit->setPlaceholderText("mangohud --dlsym");
   ui->launchWrapperEdit->setText(QSettings().value("fluorine/launch_wrapper").toString());
 
+  ui->disableVfsCacheCheckBox->setChecked(
+      QSettings().value("fluorine/disable_vfs_cache", false).toBool());
+
   populateProtons();
 
   QObject::connect(ui->protonVersionCombo, &QComboBox::currentIndexChanged, this,
@@ -117,6 +120,8 @@ ProtonSettingsTab::ProtonSettingsTab(Settings& s, SettingsDialog& d)
 void ProtonSettingsTab::update()
 {
   QSettings().setValue("fluorine/launch_wrapper", ui->launchWrapperEdit->text());
+  QSettings().setValue("fluorine/disable_vfs_cache",
+                       ui->disableVfsCacheCheckBox->isChecked());
 }
 
 void ProtonSettingsTab::populateProtons()

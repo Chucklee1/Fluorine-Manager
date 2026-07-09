@@ -963,6 +963,10 @@ void OrganizerCore::prepareVFS()
     m_USVFS.setRootBuilderEnabled(vfsRootBuilder, storageDir.toStdString());
   }
 
+  // Diagnostic toggle from Settings > Proton/Wine tab (see settingsdialogproton.cpp).
+  m_USVFS.setDisableVfsCache(
+      QSettings().value("fluorine/disable_vfs_cache", false).toBool());
+
   // Games that manage their own VFS (e.g. OpenMW via openmw.cfg) opt out of the
   // FUSE mount; Fluorine must not overlay Data Files for them.
   if (managedGame() == nullptr || managedGame()->usesVFS()) {
@@ -2846,6 +2850,10 @@ bool OrganizerCore::beforeRun(
         QDir(QDir::fromNativeSeparators(basePath())).filePath("rootbuilder");
     m_USVFS.setRootBuilderEnabled(vfsRootBuilder, storageDir.toStdString());
   }
+
+  // Diagnostic toggle from Settings > Proton/Wine tab (see settingsdialogproton.cpp).
+  m_USVFS.setDisableVfsCache(
+      QSettings().value("fluorine/disable_vfs_cache", false).toBool());
 
   try {
     // OpenMW and other self-managed-VFS games skip the FUSE mount (usesVFS()).

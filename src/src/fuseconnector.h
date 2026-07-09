@@ -46,6 +46,11 @@ public:
   void setTrackingFilePath(const std::string& path);
   std::shared_ptr<TrackedWrites> trackedWrites() const;
 
+  // Diagnostic: zeroes the VFS's kernel-facing cache TTLs and disables
+  // keep_cache for the next mount(). See Mo2FsContext::cache_disabled in
+  // vfs/mo2filesystem.h for what this actually toggles.
+  void setDisableVfsCache(bool disabled) { m_disableVfsCache = disabled; }
+
   void unmount();
   void discardStagingOnUnmount();
   bool isMounted() const;
@@ -108,6 +113,7 @@ private:
   std::thread m_fuseThread;
   bool m_mounted        = false;
   bool m_discardStaging = false;
+  bool m_disableVfsCache = false;
 
   // Gives logind an accurate reason for suspend/shutdown/lock prompts while
   // mounted, instead of the generic "systemd (1)". See sleepinhibitor.h.
