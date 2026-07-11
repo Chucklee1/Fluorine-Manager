@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -119,7 +120,20 @@ int run(int argc, char* argv[])
     if (nxmUrl == "nxm-handle" && argc >= 4) {
       nxmUrl = QString::fromLocal8Bit(argv[3]);
     }
-    return NxmHandlerLinux::sendToSocket(nxmUrl) ? 0 : 1;
+    if (NxmHandlerLinux::sendToSocket(nxmUrl)) {
+      return 0;
+    }
+
+    // Older registered handler scripts only invoke `nxm-handle`; they do not
+    // contain the newer shell fallback that starts Fluorine when its socket is
+    // absent. Replace this lightweight handler process with a normal Fluorine
+    // invocation so existing registrations also open the last-used instance
+    // and process the URL. /proc/self/exe avoids relying on argv[0] or PATH.
+    const QByteArray encodedUrl = nxmUrl.toLocal8Bit();
+    ::execl("/proc/self/exe", argv[0], encodedUrl.constData(),
+            static_cast<char*>(nullptr));
+    std::perror("failed to relaunch Fluorine for NXM link");
+    return 1;
   }
 
   MOShared::SetThisThreadName("main");
