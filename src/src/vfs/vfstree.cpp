@@ -9,6 +9,7 @@
 #include <istream>
 #include <mutex>
 #include <ostream>
+#include <sys/stat.h>
 
 namespace
 {
@@ -99,6 +100,7 @@ struct DirScanResult
     std::string real_path;
     uint64_t size;
     std::chrono::system_clock::time_point mtime;
+    mode_t mode = 0;
   };
 
   std::vector<FileEntry> files;
@@ -136,25 +138,28 @@ DirScanResult scanOneModDir(const fs::path& walkDir, const std::string& prefixSt
     components.insert(components.end(), prefix.begin(), prefix.end());
     components.insert(components.end(), relParts.begin(), relParts.end());
 
-    if (entry.is_directory(ec)) {
+    struct stat st {};
+    if (::lstat(entry.path().c_str(), &st) != 0) {
+      continue;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
       result.dirs.push_back(std::move(components));
       continue;
     }
 
-    if (!entry.is_regular_file(ec)) {
+    if (!S_ISREG(st.st_mode)) {
       continue;
     }
-
-    const auto size = entry.file_size(ec);
-    std::error_code mtimeEc;
-    const auto mtime = entry.last_write_time(mtimeEc);
 
     DirScanResult::FileEntry fe;
     fe.components = std::move(components);
     fe.real_path  = entry.path().string();
-    fe.size       = ec ? 0ULL : size;
-    fe.mtime      = mtimeEc ? std::chrono::system_clock::time_point{}
-                            : fsTimeToSystemClock(mtime);
+    fe.size       = static_cast<uint64_t>(st.st_size);
+    fe.mtime      = std::chrono::system_clock::time_point(
+        std::chrono::seconds(st.st_mtim.tv_sec) +
+        std::chrono::nanoseconds(st.st_mtim.tv_nsec));
+    fe.mode       = st.st_mode & 07777;
     result.files.push_back(std::move(fe));
   }
 
@@ -193,23 +198,26 @@ void addDirectoryToTree(VfsTree& tree, const fs::path& walkDir,
     components.insert(components.end(), prefix.begin(), prefix.end());
     components.insert(components.end(), relParts.begin(), relParts.end());
 
-    if (entry.is_directory(ec)) {
+    struct stat st {};
+    if (::lstat(entry.path().c_str(), &st) != 0) {
+      continue;
+    }
+
+    if (S_ISDIR(st.st_mode)) {
       tree.root.insertDirectory(components);
       ++tree.dir_count;
       continue;
     }
 
-    if (!entry.is_regular_file(ec)) {
+    if (!S_ISREG(st.st_mode)) {
       continue;
     }
-
-    const auto size  = entry.file_size(ec);
-    std::error_code mtimeEc;
-    const auto mtime = entry.last_write_time(mtimeEc);
-    tree.root.insertFile(components, entry.path().string(), ec ? 0ULL : size,
-                         mtimeEc ? std::chrono::system_clock::time_point{}
-                                 : fsTimeToSystemClock(mtime),
-                         origin, is_backing);
+    const auto mtime = std::chrono::system_clock::time_point(
+        std::chrono::seconds(st.st_mtim.tv_sec) +
+        std::chrono::nanoseconds(st.st_mtim.tv_nsec));
+    tree.root.insertFile(components, entry.path().string(),
+                         static_cast<uint64_t>(st.st_size), mtime,
+                         origin, is_backing, st.st_mode & 07777);
     ++tree.file_count;
   }
 }
@@ -261,7 +269,8 @@ std::string normalizeForLookup(const std::string& path)
 void VfsNode::insertFile(const std::vector<std::string>& components,
                          const std::string& real_path, uint64_t size,
                          std::chrono::system_clock::time_point mtime,
-                         const std::string& origin, bool is_backing)
+                         const std::string& origin, bool is_backing,
+                         mode_t cached_mode)
 {
   if (components.empty()) {
     return;
@@ -285,7 +294,9 @@ void VfsNode::insertFile(const std::vector<std::string>& components,
     if (i + 1 == components.size()) {
       auto fileNode              = std::make_unique<VfsNode>();
       fileNode->is_directory     = false;
-      fileNode->file_info        = {.real_path=real_path, .size=size, .mtime=mtime, .origin=origin, .is_backing=is_backing};
+      fileNode->file_info        = {.real_path=real_path, .size=size, .mtime=mtime,
+                                    .origin=origin, .is_backing=is_backing,
+                                    .cached_mode=cached_mode};
       current->dir_info.children[key] = std::move(fileNode);
       return;
     }
@@ -448,17 +459,21 @@ std::vector<CachedBaseFile> scanDataDir(const std::string& data_dir_path)
 
     CachedBaseFile cf;
     cf.relative_path = relStr;
-    cf.is_dir        = entry.is_directory(ec);
+    struct stat st {};
+    if (::lstat(entry.path().c_str(), &st) != 0) {
+      continue;
+    }
+    cf.is_dir = S_ISDIR(st.st_mode);
 
     if (!cf.is_dir) {
-      if (!entry.is_regular_file(ec)) {
+      if (!S_ISREG(st.st_mode)) {
         continue;
       }
-      cf.size  = entry.file_size(ec);
-      std::error_code mtimeEc;
-      const auto mtime = entry.last_write_time(mtimeEc);
-      cf.mtime = mtimeEc ? std::chrono::system_clock::time_point{}
-                          : fsTimeToSystemClock(mtime);
+      cf.size = static_cast<uint64_t>(st.st_size);
+      cf.mtime = std::chrono::system_clock::time_point(
+          std::chrono::seconds(st.st_mtim.tv_sec) +
+          std::chrono::nanoseconds(st.st_mtim.tv_nsec));
+      cf.mode = st.st_mode & 07777;
     }
 
     cache.push_back(std::move(cf));
@@ -486,7 +501,7 @@ VfsTree buildDataDirVfs(const std::vector<CachedBaseFile>& cached_files,
       ++tree.dir_count;
     } else {
       tree.root.insertFile(components, cf.relative_path, cf.size, cf.mtime,
-                           "_base_game", /*is_backing=*/true);
+                           "_base_game", /*is_backing=*/true, cf.mode);
       ++tree.file_count;
     }
   }
@@ -517,7 +532,7 @@ VfsTree buildDataDirVfs(const std::vector<CachedBaseFile>& cached_files,
       }
       for (auto& fe : result.files) {
         tree.root.insertFile(fe.components, fe.real_path, fe.size, fe.mtime,
-                             origin, false);
+                             origin, false, fe.mode);
         ++tree.file_count;
       }
     }
@@ -541,10 +556,17 @@ void injectExtraFiles(
     }
 
     std::error_code ec;
-    const auto size = fs::file_size(realPath, ec);
-    tree.root.insertFile(components, realPath, ec ? 0ULL : size,
-                         std::chrono::system_clock::now(), "_profile",
-                         /*is_backing=*/false);
+    struct stat st {};
+    const bool statOk = ::stat(realPath.c_str(), &st) == 0;
+    const auto mtime = statOk
+        ? std::chrono::system_clock::time_point(
+              std::chrono::seconds(st.st_mtim.tv_sec) +
+              std::chrono::nanoseconds(st.st_mtim.tv_nsec))
+        : std::chrono::system_clock::now();
+    tree.root.insertFile(components, realPath,
+                         statOk ? static_cast<uint64_t>(st.st_size) : 0ULL,
+                         mtime, "_profile", /*is_backing=*/false,
+                         statOk ? (st.st_mode & 07777) : 0644);
     ++tree.file_count;
   }
 }

@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-dejavu-core \
     # Library dependencies
     libboost-all-dev \
+    libgtest-dev \
     libsqlite3-dev \
     libtinyxml2-dev \
     libfontconfig1-dev \

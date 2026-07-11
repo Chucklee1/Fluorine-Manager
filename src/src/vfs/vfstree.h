@@ -28,6 +28,7 @@ struct CachedBaseFile
   uint64_t size = 0;
   std::chrono::system_clock::time_point mtime;
   bool is_dir = false;
+  mode_t mode = 0;
 };
 
 struct VfsDirInfo
@@ -45,7 +46,8 @@ struct VfsNode
   void insertFile(const std::vector<std::string>& components,
                   const std::string& real_path, uint64_t size,
                   std::chrono::system_clock::time_point mtime,
-                  const std::string& origin, bool is_backing = false);
+                  const std::string& origin, bool is_backing = false,
+                  mode_t cached_mode = 0);
 
   void insertDirectory(const std::vector<std::string>& components);
 

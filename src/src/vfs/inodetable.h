@@ -2,6 +2,7 @@
 #define VFS_INODETABLE_H
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <unordered_map>
 
@@ -10,6 +11,7 @@ class InodeTable
 public:
   InodeTable();
 
+  void reserve(std::size_t count);
   uint64_t get(const std::string& path) const;
   uint64_t getOrCreate(const std::string& path);
   std::string getPath(uint64_t ino) const;

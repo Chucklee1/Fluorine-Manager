@@ -18,7 +18,7 @@ namespace fs = std::filesystem;
 namespace
 {
 constexpr uint32_t kMagic   = 0x43564C46u;  // "FLVC"
-constexpr uint32_t kVersion = 1u;
+constexpr uint32_t kVersion = 2u;  // v2 persists complete immutable file modes
 
 template <typename T>
 bool writePod(std::ostream& out, const T& v)

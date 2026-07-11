@@ -803,6 +803,18 @@ QProcess* PrefixSetupRunner::buildWrappedProcess(
   // Start from the system environment and clean Fluorine bundling vars.
   QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
 
+  // Keep installer scratch data on the user's home filesystem.  /tmp and
+  // XDG_RUNTIME_DIR are frequently small tmpfs mounts, which can make large
+  // Microsoft installers report ERROR_DISK_FULL even when the prefix has
+  // plenty of free space.
+  const QString tmpDir = fluorineTmpDir();
+  QDir().mkpath(tmpDir);
+  QString wineTmpDir = QStringLiteral("Z:") + tmpDir;
+  wineTmpDir.replace(QLatin1Char('/'), QLatin1Char('\\'));
+  env.insert(QStringLiteral("TMPDIR"), tmpDir);
+  env.insert(QStringLiteral("TMP"), wineTmpDir);
+  env.insert(QStringLiteral("TEMP"), wineTmpDir);
+
   // Remove Fluorine vars that can confuse Wine.
   for (const char* var : {"QT_QPA_PLATFORM_PLUGIN_PATH", "MO2_PLUGINS_DIR",
        "MO2_LIBS_DIR", "MO2_PYTHON_DIR", "MO2_BASE_DIR"}) {
@@ -870,6 +882,11 @@ QProcess* PrefixSetupRunner::buildWrappedProcess(
     const QString cacheDir = fluorineCacheDir();
     if (QDir(cacheDir).exists())
       slrArgs << QStringLiteral("--filesystem=%1").arg(cacheDir);
+
+    // TMPDIR is redirected here above, so it must also be visible inside the
+    // Steam Linux Runtime container at the same absolute path.
+    if (QDir(tmpDir).exists())
+      slrArgs << QStringLiteral("--filesystem=%1").arg(tmpDir);
 
     // Expose the injected xrandr bin dir so Proton-GE's protonfixes can
     // invoke it during wineboot -u. Without this the container's PATH

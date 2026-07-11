@@ -385,7 +385,8 @@ void maybeLogCounters(Mo2FsContext* ctx)
   }
 }
 
-void invalidateDirCache(Mo2FsContext* ctx, const std::string& dirPath)
+void invalidateDirCache(Mo2FsContext* ctx, const std::string& dirPath,
+                        bool invalidateLookups = true)
 {
   if (ctx == nullptr) {
     return;
@@ -430,7 +431,9 @@ void invalidateDirCache(Mo2FsContext* ctx, const std::string& dirPath)
       }
     }
   }
-  invalidateLookupCache(ctx, dirPath);
+  if (invalidateLookups) {
+    invalidateLookupCache(ctx, dirPath);
+  }
 }
 
 // Invalidate lookup cache entries for a directory whose children changed.
@@ -546,6 +549,7 @@ struct NodeSnapshot
   uint64_t size     = 0;
   std::chrono::system_clock::time_point mtime;
   std::string real_path;
+  mode_t cached_mode = 0;
 };
 
 Mo2FsContext* getContext(fuse_req_t req)
@@ -668,6 +672,7 @@ NodeSnapshot snapshotForPath(const Mo2FsContext* ctx, const std::string& path)
     snap.size       = node->file_info.size;
     snap.mtime      = node->file_info.mtime;
     snap.is_backing = node->file_info.is_backing;
+    snap.cached_mode = node->file_info.cached_mode;
   }
 
   return snap;
@@ -683,6 +688,7 @@ void snapshotFromNode(const VfsNode* node, NodeSnapshot& snap)
     snap.size       = node->file_info.size;
     snap.mtime      = node->file_info.mtime;
     snap.is_backing = node->file_info.is_backing;
+    snap.cached_mode = node->file_info.cached_mode;
   }
 }
 
@@ -798,23 +804,9 @@ std::vector<ChildSnapshot> listChildrenSnapshot(
       snap.mtime     = child->file_info.mtime;
       snap.real_path = child->file_info.real_path;
 
-      // Use cached mode bits if available, otherwise stat() once and cache.
-      if (child->file_info.cached_mode != 0) {
-        snap.cached_mode = child->file_info.cached_mode;
-      } else if (!snap.real_path.empty()) {
-        struct stat real_st;
-        if (::stat(snap.real_path.c_str(), &real_st) == 0) {
-          snap.cached_mode = real_st.st_mode & 0777;
-          // Cache in the tree node for future readdir calls (safe under shared lock
-          // because mode_t is atomic-width and this is a benign data race — worst
-          // case we stat() one extra time from another thread).
-          const_cast<VfsNode*>(child)->file_info.cached_mode = snap.cached_mode;
-        } else {
-          snap.cached_mode = 0644;
-        }
-      } else {
-        snap.cached_mode = 0644;
-      }
+      snap.cached_mode = child->file_info.cached_mode != 0
+                             ? child->file_info.cached_mode
+                             : static_cast<mode_t>(0644);
     }
     out.push_back(std::move(snap));
   }
@@ -833,9 +825,22 @@ std::vector<Mo2FsContext::DirEntry> buildDirEntries(
   std::vector<Mo2FsContext::DirEntry> entries;
   entries.reserve(children.size() + 2);
   entries.push_back(Mo2FsContext::DirEntry{.ino=selfIno, .name=".", .is_dir=true});
-  entries.push_back(Mo2FsContext::DirEntry{.ino=1, .name="..", .is_dir=true});
 
   std::unique_lock lock(ctx->inode_mutex);
+  // Nested directories must report their actual parent inode.  Advertising
+  // root for every ".." is mostly harmless with plain readdir (the kernel
+  // already knows the dentry), but readdirplus turns it into authoritative
+  // inode metadata and can poison Wine's directory cache.
+  std::string parentPath;
+  if (!path.empty()) {
+    const size_t slash = path.rfind('/');
+    parentPath = slash == std::string::npos ? std::string{} : path.substr(0, slash);
+  }
+  const fuse_ino_t parentIno = path.empty() ? selfIno
+                                            : ctx->inodes->getOrCreate(parentPath);
+  entries.push_back(
+      Mo2FsContext::DirEntry{.ino=parentIno, .name="..", .is_dir=true});
+
   for (const auto& child : children) {
     const std::string childPath = joinPath(path, child.name);
     entries.push_back(
@@ -971,7 +976,7 @@ std::vector<char> buildReaddirPlusBlob(
       fillStatForDir(&e.attr, entry.ino, ctx->uid, ctx->gid);
     } else {
       fillStatForFile(&e.attr, entry.ino, ctx->uid, ctx->gid, entry.size,
-                      entry.mtime, entry.real_path);
+                      entry.mtime, entry.real_path, entry.cached_mode);
     }
 
     const size_t entSize =
@@ -1113,16 +1118,11 @@ void fillStatForFile(struct stat* st, fuse_ino_t ino, uid_t uid, gid_t gid,
   st->st_gid   = gid;
   st->st_size  = static_cast<off_t>(size);
 
-  // Use cached mode bits if available, otherwise stat() the real file.
-  mode_t mode = 0644;
-  if (cached_mode != 0) {
-    mode = cached_mode;
-  } else if (!real_path.empty()) {
-    struct stat real_st;
-    if (::stat(real_path.c_str(), &real_st) == 0) {
-      mode = real_st.st_mode & 0777;
-    }
-  }
+  // Runtime metadata replies are authoritative from the immutable VFS tree.
+  // Never resolve the backing path here; base-game paths are deliberately
+  // relative to backing_dir_fd and a plain stat() would be incorrect anyway.
+  (void)real_path;
+  const mode_t mode = cached_mode != 0 ? cached_mode : static_cast<mode_t>(0644);
   st->st_mode = S_IFREG | regularFileVfsMode(mode);
 
   const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
@@ -1145,7 +1145,7 @@ void replyEntryFromSnapshot(fuse_req_t req, const Mo2FsContext* ctx, fuse_ino_t 
     fillStatForDir(&e.attr, ino, ctx->uid, ctx->gid);
   } else {
     fillStatForFile(&e.attr, ino, ctx->uid, ctx->gid, snap.size, snap.mtime,
-                    snap.real_path);
+                    snap.real_path, snap.cached_mode);
   }
 
   fuse_reply_entry(req, &e);
@@ -1379,6 +1379,63 @@ bool ensureReadableOpenFile(Mo2FsContext* ctx, uint64_t fh, int* outFd,
 
 }  // namespace
 
+std::size_t mo2PrewarmLookupIndex(Mo2FsContext* ctx)
+{
+  if (ctx == nullptr || ctx->tree == nullptr || ctx->inodes == nullptr) {
+    return 0;
+  }
+
+  const std::size_t expected = ctx->tree->file_count + ctx->tree->dir_count + 1;
+  ctx->inodes->reserve(expected);
+  ctx->lookup_cache.reserve(expected);
+  ctx->node_cache.reserve(expected);
+  ctx->node_cache.emplace(1, &ctx->tree->root);
+
+  std::size_t entries = 0;
+  const auto visit = [&](const auto& self, const VfsNode& parent,
+                         const std::string& parentPath,
+                         fuse_ino_t parentIno) -> void {
+    for (const auto& [key, childPtr] : parent.dir_info.children) {
+      if (childPtr == nullptr) {
+        continue;
+      }
+      const auto displayIt = parent.dir_info.display_names.find(key);
+      const std::string& name = displayIt != parent.dir_info.display_names.end()
+                                    ? displayIt->second
+                                    : key;
+      const std::string childPath = joinPath(parentPath, name);
+      const fuse_ino_t childIno = ctx->inodes->getOrCreate(childPath);
+
+      struct fuse_entry_param entry;
+      std::memset(&entry, 0, sizeof(entry));
+      entry.ino = childIno;
+      entry.attr_timeout = ttlSeconds(ctx);
+      entry.entry_timeout = ttlSeconds(ctx);
+      if (childPtr->is_directory) {
+        fillStatForDir(&entry.attr, childIno, ctx->uid, ctx->gid);
+      } else {
+        fillStatForFile(&entry.attr, childIno, ctx->uid, ctx->gid,
+                        childPtr->file_info.size, childPtr->file_info.mtime,
+                        childPtr->file_info.real_path,
+                        childPtr->file_info.cached_mode);
+      }
+
+      ctx->lookup_cache.emplace(
+          std::make_pair(parentIno, key),
+          Mo2FsContext::LookupCacheEntry{.child_ino=childIno, .entry=entry});
+      ctx->node_cache.emplace(childIno, childPtr.get());
+      ++entries;
+
+      if (childPtr->is_directory) {
+        self(self, *childPtr, childPath, childIno);
+      }
+    }
+  };
+
+  visit(visit, ctx->tree->root, std::string{}, 1);
+  return entries;
+}
+
 void mo2_init(void* userdata, struct fuse_conn_info* conn)
 {
   auto* ctx = static_cast<Mo2FsContext*>(userdata);
@@ -1424,9 +1481,10 @@ void mo2_init(void* userdata, struct fuse_conn_info* conn)
     fuseRequestFeature(conn, FUSE_CAP_EXPLICIT_INVAL_DATA);
   }
 
-  // Plain readdir is the conservative default for large modlists. Wine and
-  // game startup often enumerate large directories but only stat/open a small
-  // subset, so forced readdirplus can send a lot of unused metadata.
+  // Keep Wine on plain readdir.  READDIRPLUS can make speculative metadata
+  // visible as authoritative directory-cache state and has caused nested
+  // plugin resources to become intermittently unresolvable under Proton.
+  // Metadata replies remain cheap because they come from the immutable tree.
   if (fuseHasFeature(conn, FUSE_CAP_READDIRPLUS)) {
     fuseDropFeature(conn, FUSE_CAP_READDIRPLUS);
     fuseDropFeature(conn, FUSE_CAP_READDIRPLUS_AUTO);
@@ -1532,14 +1590,22 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
 
   const auto cacheKey =
       std::make_pair(parent, normalizeForLookup(std::string(name)));
+  struct fuse_entry_param cachedEntry;
+  bool cacheHit = false;
   {
-    std::scoped_lock lock(ctx->lookup_cache_mutex);
+    std::shared_lock lock(ctx->lookup_cache_mutex);
     auto it = ctx->lookup_cache.find(cacheKey);
     if (it != ctx->lookup_cache.end()) {
-      ctx->lookup_cache_hits.fetch_add(1, std::memory_order_relaxed);
-      fuse_reply_entry(req, &it->second.entry);
-      return;
+      cachedEntry = it->second.entry;
+      cacheHit = true;
     }
+  }
+  if (cacheHit) {
+    ctx->lookup_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    // Never hold a cache lock across the libfuse reply path: fuse_reply_entry
+    // may block briefly on the kernel socket under startup lookup bursts.
+    fuse_reply_entry(req, &cachedEntry);
+    return;
   }
   ctx->lookup_cache_misses.fetch_add(1, std::memory_order_relaxed);
 
@@ -1574,7 +1640,11 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
           ++ctx->tree->dir_count;
           invalidateNodeCache(ctx, childPath);
         }
-        invalidateDirCache(ctx, parentPath);
+        // This lookup key was absent when we entered the miss path and is
+        // populated immediately below. Existing sibling lookup entries remain
+        // valid, so do not scan/erase the entire prewarmed parent cache. Only
+        // its directory listing changed.
+        invalidateDirCache(ctx, parentPath, false);
         fuse_ino_t dirIno;
         {
           std::unique_lock lock(ctx->inode_mutex);
@@ -1655,7 +1725,7 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
     fillStatForDir(&e.attr, childIno, ctx->uid, ctx->gid);
   } else {
     fillStatForFile(&e.attr, childIno, ctx->uid, ctx->gid, lr.snap.size, lr.snap.mtime,
-                    lr.snap.real_path);
+                    lr.snap.real_path, lr.snap.cached_mode);
   }
 
   {
@@ -1723,7 +1793,7 @@ void mo2_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* /*fi*/)
     fillStatForDir(&st, ino, ctx->uid, ctx->gid);
   } else {
     fillStatForFile(&st, ino, ctx->uid, ctx->gid, snap.size, snap.mtime,
-                    snap.real_path);
+                    snap.real_path, snap.cached_mode);
   }
 
   {
@@ -2969,7 +3039,7 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
     fillStatForDir(&st, ino, ctx->uid, ctx->gid);
   } else {
     fillStatForFile(&st, ino, ctx->uid, ctx->gid, snap.size, snap.mtime,
-                    snap.real_path);
+                    snap.real_path, snap.cached_mode);
   }
   fuse_reply_attr(req, &st, ttlSeconds(ctx));
 }

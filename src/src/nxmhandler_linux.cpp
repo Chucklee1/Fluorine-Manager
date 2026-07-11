@@ -463,8 +463,19 @@ void NxmHandlerLinux::registerHandler()
   // Determine a stable executable path for the wrapper script.
   const QString executable = QCoreApplication::applicationFilePath();
 
+  // Prefer the lightweight socket handoff when Fluorine is already running.
+  // If no listener exists, start Fluorine normally with the URL; normal
+  // startup selects the last-used instance and CommandLine begins the
+  // download once that instance is ready.
   const QString wrapper =
-      QString("#!/bin/sh\nexec \"%1\" nxm-handle \"$@\"\n").arg(executable);
+      QString("#!/bin/sh\n"
+              "url=$1\n"
+              "[ -n \"$url\" ] || exit 2\n"
+              "if \"%1\" nxm-handle \"$url\"; then\n"
+              "  exit 0\n"
+              "fi\n"
+              "exec \"%1\" \"$url\"\n")
+          .arg(executable);
 
   if (!writeTextFile(wrapperPath, wrapper)) {
     log::error("failed to write nxm wrapper script '{}'", wrapperPath);
@@ -479,7 +490,7 @@ void NxmHandlerLinux::registerHandler()
 
   // Use the absolute path — ~/.local/bin is often not in PATH when the
   // browser or desktop environment invokes the URL scheme handler.
-  const QString execLine = wrapperPath + " nxm-handle %u";
+  const QString execLine = wrapperPath + " %u";
 
   const QString desktopPath = appsDir + "/" + NxmDesktopFile;
   const QString desktop = QString("[Desktop Entry]\n"

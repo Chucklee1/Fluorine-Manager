@@ -196,9 +196,17 @@ QString downloadLoot(const std::function<void(float)>& progressCb,
   MOBase::log::info("Downloading LOOT {} ({})", tagName, assetName);
   status(QStringLiteral("Downloading LOOT %1...").arg(tagName));
 
-  QTemporaryDir staging(fluorineDataDir() + "/tools/loot-download-XXXXXX");
-  if (!staging.isValid())
+  const QString toolsDir = fluorineDataDir() + "/tools";
+  if (!QDir().mkpath(toolsDir)) {
+    MOBase::log::error("Failed to create LOOT tools directory '{}'", toolsDir);
+    return QStringLiteral("Failed to create LOOT tools directory");
+  }
+
+  QTemporaryDir staging(toolsDir + "/loot-download-XXXXXX");
+  if (!staging.isValid()) {
+    MOBase::log::error("Failed to create LOOT staging directory in '{}'", toolsDir);
     return QStringLiteral("Failed to create temporary download directory");
+  }
 
   const QString archivePath = staging.filePath(assetName);
   httpGet(downloadUrl, cancelFlag, progress, archivePath);

@@ -33,6 +33,7 @@ pkgs.mkShell {
 
     # Libraries
     boost
+    gtest
     sqlite
     tinyxml-2
     fontconfig

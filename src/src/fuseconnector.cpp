@@ -2,19 +2,22 @@
 
 #include "settings.h"
 #include "sleepinhibitor.h"
-#include "vfs/scancache.h"
+#include "vfs/vfscatalog.h"
 #include "vfs/vfstree.h"
 
 #include <QCoreApplication>
+#include <QApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
+#include <QProgressDialog>
 #include <QStandardPaths>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTextStream>
+#include <QThread>
 #include <QVariant>
 
 #include <iplugingame.h>
@@ -530,23 +533,6 @@ bool FuseConnector::mount(
 
   const auto mountStart = std::chrono::steady_clock::now();
 
-  // Scan + cache base game files BEFORE mounting (after mount they're hidden).
-  // Reuse the cache across mount/unmount cycles since base game files don't
-  // change between runs — this avoids a full recursive directory walk on
-  // every launch.
-  {
-    const auto t0 = std::chrono::steady_clock::now();
-    if (m_baseFileCache.empty() || m_dataDirPath != m_cachedDataDirPath) {
-      m_baseFileCache    = scanDataDir(m_dataDirPath);
-      m_cachedDataDirPath = m_dataDirPath;
-    }
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0).count();
-    std::fprintf(stderr, "[VFS] scanned %zu base game entries in %lldms (%s)\n",
-                 m_baseFileCache.size(), static_cast<long long>(ms),
-                 m_dataDirPath == m_cachedDataDirPath ? "cached" : "fresh");
-  }
-
   // Open fd to data dir BEFORE mounting so we can access original files
   m_backingFd = open(m_dataDirPath.c_str(), O_RDONLY | O_DIRECTORY);
   if (m_backingFd < 0) {
@@ -555,34 +541,48 @@ bool FuseConnector::mount(
             .arg(QString::fromStdString(m_dataDirPath)));
   }
 
-  // Build tree using cached base files + mods + overwrite.
-  // Try the persistent scan cache first — on a hit we skip the parallel
-  // mod walk entirely, which is the dominant cost on heavy modlists.
+  // Reconcile the persistent local catalog before mounting. Unchanged files
+  // need only a stat fingerprint; BLAKE3 is recalculated only for drifted
+  // files. The returned tree is a complete immutable in-memory generation.
   const auto treeStart = std::chrono::steady_clock::now();
-  ScanCacheKey cacheKey;
-  cacheKey.data_dir      = m_dataDirPath;
-  cacheKey.overwrite_dir = m_overwriteDir;
-  cacheKey.mods          = mods;  // priority order matches buildDataDirVfs
-  ScanCache scanCache(ScanCache::cacheFilePath(cacheKey));
-
-  std::shared_ptr<VfsTree> tree;
-  bool cacheHit = false;
-  if (auto cached = scanCache.tryLoad(cacheKey)) {
-    tree     = std::move(cached);
-    cacheHit = true;
-    std::fprintf(stderr,
-                 "[VFS] [scancache] hit (%zu files, %zu dirs)\n",
-                 tree->file_count, tree->dir_count);
-  } else {
-    tree = std::make_shared<VfsTree>(
-        buildDataDirVfs(m_baseFileCache, m_dataDirPath, mods, m_overwriteDir));
-    if (!scanCache.save(cacheKey, *tree)) {
-      std::fprintf(stderr, "[VFS] [scancache] save failed (non-fatal)\n");
-    } else {
-      std::fprintf(stderr, "[VFS] [scancache] miss; persisted (%zu files, %zu dirs)\n",
-                   tree->file_count, tree->dir_count);
-    }
+  VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
+  uint64_t lastProgress = 0;
+  std::unique_ptr<QProgressDialog> catalogProgress;
+  if (qApp != nullptr && QThread::currentThread() == qApp->thread()) {
+    catalogProgress = std::make_unique<QProgressDialog>(
+        QObject::tr("Preparing the VFS catalog…"), QObject::tr("Cancel"),
+        0, 0, QApplication::activeWindow());
+    catalogProgress->setWindowTitle(QObject::tr("Indexing game files"));
+    catalogProgress->setMinimumDuration(750);
+    catalogProgress->setAutoClose(false);
   }
+  auto tree = std::make_shared<VfsTree>(catalog.reconcileAndBuild(
+      m_dataDirPath, mods, m_overwriteDir, true,
+      [&lastProgress, &catalogProgress](const VfsCatalogProgress& p) {
+        if (catalogProgress) {
+          catalogProgress->setLabelText(QObject::tr(
+              "Verified %1 files; hashed %2 changed files (%3 MiB)…")
+              .arg(p.files_scanned)
+              .arg(p.files_hashed)
+              .arg(p.bytes_hashed / (1024 * 1024)));
+          QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+          if (catalogProgress->wasCanceled()) {
+            throw std::runtime_error("VFS catalog indexing cancelled");
+          }
+        }
+        if (p.files_scanned == lastProgress && p.files_scanned != 0) return;
+        if ((p.files_scanned % 16384) != 0 && p.files_scanned != 0) return;
+        lastProgress = p.files_scanned;
+        std::fprintf(stderr,
+                     "[VFS] [catalog] scanned=%llu hashed=%llu bytes=%llu root='%s'\n",
+                     static_cast<unsigned long long>(p.files_scanned),
+                     static_cast<unsigned long long>(p.files_hashed),
+                     static_cast<unsigned long long>(p.bytes_hashed),
+                     p.current_root.c_str());
+      }));
+  if (catalogProgress) catalogProgress->close();
+  m_baseFileCache = catalog.loadBaseSnapshot(m_dataDirPath);
+  m_cachedDataDirPath = m_dataDirPath;
 
   // Inject file-level data-dir mappings (e.g. plugins.txt, loadorder.txt).
   // Always re-applied after load — these are session-scoped, not cached.
@@ -600,7 +600,7 @@ bool FuseConnector::mount(
     std::fprintf(stderr, "[VFS] built tree (%zu files, %zu dirs) in %lldms (%s)\n",
                  tree->file_count, tree->dir_count,
                  static_cast<long long>(ms),
-                 cacheHit ? "cache" : "fresh");
+                 "catalog");
   }
 
   // Load tracked writes (files user moved from Overwrite to a mod)
@@ -664,6 +664,13 @@ bool FuseConnector::mount(
   m_context->gid                   = ::getgid();
   m_context->cache_disabled        = m_disableVfsCache ||
                                      std::getenv("FLUORINE_VFS_DISABLE_CACHE") != nullptr;
+  const auto indexStart = std::chrono::steady_clock::now();
+  const std::size_t prewarmed = mo2PrewarmLookupIndex(m_context.get());
+  const auto indexMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - indexStart).count();
+  std::fprintf(stderr,
+               "[VFS] prewarmed %zu resolved lookup entries in %lldms\n",
+               prewarmed, static_cast<long long>(indexMs));
   // NOTE: Do NOT include mount_point here — low-level API passes it
   // separately to fuse_session_mount(). Including it here causes
   // "fuse: unknown option(s)" error.
@@ -859,20 +866,9 @@ void FuseConnector::rebuild(
     return;
   }
 
-  // Use cached base files - can't re-scan the data dir since it's behind our mount
-  auto newTree = std::make_shared<VfsTree>(
-      buildDataDirVfs(m_baseFileCache, m_dataDirPath, mods, m_overwriteDir));
-
-  // Refresh persistent scan cache so the next cold mount gets a hit.
-  // Save before injection/stamping for the same reason as mount(): those
-  // are session-scoped and re-applied on every load.
-  {
-    ScanCacheKey rebuildKey;
-    rebuildKey.data_dir      = m_dataDirPath;
-    rebuildKey.overwrite_dir = m_overwriteDir;
-    rebuildKey.mods          = mods;
-    ScanCache(ScanCache::cacheFilePath(rebuildKey)).save(rebuildKey, *newTree);
-  }
+  VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
+  auto newTree = std::make_shared<VfsTree>(catalog.reconcileAndBuild(
+      m_dataDirPath, mods, m_overwriteDir, false));
 
   // Inject file-level data-dir mappings (e.g. plugins.txt, loadorder.txt)
   injectExtraFiles(*newTree, m_extraVfsFiles);
@@ -1305,8 +1301,9 @@ void FuseConnector::flushStagingLive()
   fs::create_directories(m_stagingDir, ec);
 
   // Rebuild the VFS tree to pick up new overwrite files
-  auto newTree = std::make_shared<VfsTree>(
-      buildDataDirVfs(m_baseFileCache, m_dataDirPath, m_lastMods, m_overwriteDir));
+  VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
+  auto newTree = std::make_shared<VfsTree>(catalog.reconcileAndBuild(
+      m_dataDirPath, m_lastMods, m_overwriteDir, false));
 
   {
     std::unique_lock const lock(m_context->tree_mutex);

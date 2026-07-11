@@ -12,6 +12,23 @@ find_package(spdlog CONFIG REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 find_package(Threads REQUIRED)
+find_package(SQLite3 REQUIRED)
+
+# Pinned official BLAKE3 C implementation. FetchContent keeps release builds
+# reproducible without requiring a distro-specific development package.
+include(FetchContent)
+set(BUILD_TESTING_SAVED ${BUILD_TESTING})
+set(BUILD_SHARED_LIBS_SAVED ${BUILD_SHARED_LIBS})
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(blake3_upstream
+    URL https://github.com/BLAKE3-team/BLAKE3/archive/8aa5145039b972ba30e98e788752d37d14568824.tar.gz
+    URL_HASH SHA256=4a4c27185216b9dd3219ce12045ec22cd7b264b51feae7eab9cdec9cf6e9de54
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    SOURCE_SUBDIR c)
+FetchContent_MakeAvailable(blake3_upstream)
+set(BUILD_TESTING ${BUILD_TESTING_SAVED} CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED} CACHE BOOL "" FORCE)
 
 qt_standard_project_setup()
 
@@ -118,6 +135,8 @@ target_link_libraries(organizer PRIVATE
     spdlog::spdlog_header_only
     # FUSE3 (low-level API)
     PkgConfig::FUSE3
+    SQLite::SQLite3
+    BLAKE3::blake3
     # Linux system libs
     dl)
 

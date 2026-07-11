@@ -106,7 +106,10 @@ struct Mo2FsContext
     }
   };
   std::unordered_map<std::pair<fuse_ino_t, std::string>, LookupCacheEntry, PairHash> lookup_cache;
-  mutable std::mutex lookup_cache_mutex;
+  // Reads dominate after the catalog prewarms this table.  A shared mutex
+  // prevents independent Wine lookup requests from serializing globally;
+  // mutations still take exclusive ownership while invalidating entries.
+  mutable std::shared_mutex lookup_cache_mutex;
 
   std::atomic<uint64_t> next_dh{1};
   std::atomic<uint64_t> fd_lru_tick{1};
@@ -184,6 +187,10 @@ struct Mo2FsContext
   // clobber fix for why keep_cache=1 exists normally.
   bool cache_disabled = false;
 };
+
+// Eagerly materialize the persistent catalog's resolved tree as runtime inode
+// and lookup entries. Must be called before the FUSE session starts.
+std::size_t mo2PrewarmLookupIndex(Mo2FsContext* ctx);
 
 void mo2_init(void* userdata, struct fuse_conn_info* conn);
 void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name);

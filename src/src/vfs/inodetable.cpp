@@ -32,6 +32,12 @@ InodeTable::InodeTable()
   m_inodeToPath.emplace(1, "");
 }
 
+void InodeTable::reserve(std::size_t count)
+{
+  m_pathToInode.reserve(count);
+  m_inodeToPath.reserve(count);
+}
+
 uint64_t InodeTable::get(const std::string& path) const
 {
   const std::string key = normalizeForLookup(path);

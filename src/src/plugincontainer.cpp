@@ -1347,6 +1347,43 @@ void PluginContainer::loadPlugins()
     cleanStaleNvPlugin(m_PluginPath);
   }
 
+  // FOMOD Plus was bundled in earlier Fluorine releases but has since been
+  // retired. Portable/in-place updates do not remove files that disappeared
+  // from a newer archive, and old per-instance plugin copies can survive too.
+  // Remove only the three known executable artifacts before plugin discovery;
+  // preserve fomod.db and settings because those are user data.
+  const QSet<QString> retiredFomodPlusArtifacts = {
+      "libfomod_plus_installer.so",
+      "libfomod_plus_scanner.so",
+      "libfomod_plus_patch_wizard.so",
+      "libfomod_plus_installer.dylib",
+      "libfomod_plus_scanner.dylib",
+      "libfomod_plus_patch_wizard.dylib",
+      "fomod_plus_installer.dll",
+      "fomod_plus_scanner.dll",
+      "fomod_plus_patch_wizard.dll",
+  };
+  auto cleanRetiredFomodPlus = [&retiredFomodPlusArtifacts](const QString& dir) {
+    QDirIterator iter(dir, QDir::Files | QDir::System | QDir::NoDotAndDotDot);
+    while (iter.hasNext()) {
+      iter.next();
+      if (!retiredFomodPlusArtifacts.contains(iter.fileName().toLower())) {
+        continue;
+      }
+      if (QFile::remove(iter.filePath())) {
+        log::info("removed retired FOMOD Plus plugin '{}'",
+                  QDir::toNativeSeparators(iter.filePath()));
+      } else {
+        log::warn("failed to remove retired FOMOD Plus plugin '{}'",
+                  QDir::toNativeSeparators(iter.filePath()));
+      }
+    }
+  };
+  cleanRetiredFomodPlus(m_BundledPluginPath);
+  if (m_PluginPath != m_BundledPluginPath) {
+    cleanRetiredFomodPlus(m_PluginPath);
+  }
+
   // Build merged plugin map: instance extras first (low priority),
   // then bundled plugins overwrite (high priority).
   QMap<QString, QString> pluginMap;  // filename -> full path

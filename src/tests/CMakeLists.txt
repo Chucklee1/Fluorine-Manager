@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 find_package(Qt6 REQUIRED COMPONENTS Core)
 find_package(GTest REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 # ---------------------------------------------------------------------------
 # meta.ini case-normalization helper tests
@@ -92,7 +93,36 @@ target_link_libraries(test_vfs_file_ops PRIVATE
 )
 add_test(NAME test_vfs_file_ops COMMAND test_vfs_file_ops)
 
+# ---------------------------------------------------------------------------
+# Persistent VFS catalog / BLAKE3 verification tests
+# ---------------------------------------------------------------------------
+add_executable(test_vfs_catalog EXCLUDE_FROM_ALL
+    test_vfs_catalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/vfscatalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/vfstree.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/fluorinepaths.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/fluorineconfig.cpp
+)
+set_target_properties(test_vfs_catalog PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_vfs_catalog PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+    ${CMAKE_SOURCE_DIR}/libs/uibase/include
+)
+target_link_libraries(test_vfs_catalog PRIVATE
+    Qt6::Core
+    SQLite::SQLite3
+    BLAKE3::blake3
+    mo2::uibase
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_vfs_catalog COMMAND test_vfs_catalog)
+
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
     DEPENDS test_metainiutils test_external_dir_mapping test_overwrite_duplicates
-            test_vfs_file_ops)
+            test_vfs_file_ops test_vfs_catalog)
