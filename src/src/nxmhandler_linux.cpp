@@ -460,8 +460,16 @@ void NxmHandlerLinux::registerHandler()
 
   const QString wrapperPath = localBin + "/mo2-nxm-handler";
 
-  // Determine a stable executable path for the wrapper script.
-  const QString executable = QCoreApplication::applicationFilePath();
+  // Always prefer the packaged launcher over the bare core executable. The
+  // launcher configures the bundled Qt platform/plugin and library paths;
+  // desktop portals start handlers with a clean environment, so invoking
+  // ModOrganizer-core directly makes cold NXM launches fail before main().
+  const QString appDir = QCoreApplication::applicationDirPath();
+  const QFileInfo launcherInfo(QDir(appDir).filePath("fluorine-manager"));
+  const QString executable =
+      launcherInfo.exists() && launcherInfo.isExecutable()
+          ? launcherInfo.absoluteFilePath()
+          : QCoreApplication::applicationFilePath();
 
   // Prefer the lightweight socket handoff when Fluorine is already running.
   // If no listener exists, start Fluorine normally with the URL; normal
