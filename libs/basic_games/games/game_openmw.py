@@ -13,6 +13,10 @@ Unlike the Windows Morrowind plugin this:
     order instead of dropping them, and routes groundcover plugins to
     groundcover= lines (listed in <profile>/groundcover.txt) so they don't tank
     performance as content= entries.
+  - uses OpenMW's native config-directory chaining for MO2 profiles with local
+    settings, making the profile OpenMW's writable user-config directory without
+    copying or classifying settings/storage files, and synchronizes the
+    launcher's separate content list with the generated native paths.
 """
 
 from __future__ import annotations
@@ -26,7 +30,12 @@ from PyQt6.QtCore import QDir, QFileInfo, qInfo, qWarning
 import mobase
 
 from ..basic_game import BasicGame
-from .openmw_support.openmw_cfg import write_openmw_cfg
+from .openmw_support.openmw_cfg import (
+    write_local_saves,
+    write_openmw_cfg,
+    write_openmw_launcher_cfg,
+    write_profile_selector,
+)
 
 _FLATPAK_ID = "org.openmw.OpenMW"
 
@@ -254,16 +263,25 @@ class OpenMWGame(BasicGame):
             return True
         try:
             organizer = self._organizer
+            profile = organizer.profile()
+            profile_dir = Path(profile.absolutePath())
+            local_settings = profile.localSettingsEnabled()
+            local_saves = profile.localSavesEnabled()
             game_dir = Path(self.gameDirectory().absolutePath())
             data_files = game_dir / "Data Files"
 
-            cfg = _detect_openmw_cfg(prefer_flatpak="flatpak" in Path(app_name).name.lower())
-            if cfg is None:
+            root_cfg = _detect_openmw_cfg(
+                prefer_flatpak="flatpak" in Path(app_name).name.lower()
+            )
+            if root_cfg is None:
                 qWarning(
                     "OpenMW: no openmw.cfg found. Run openmw-launcher once to "
                     "create it, then mods will be applied on the next launch."
                 )
                 return True
+            profile_cfg = profile_dir / "openmw.cfg"
+            chained_profile = local_settings and profile_cfg != root_cfg
+            cfg = profile_cfg if chained_profile else root_cfg
 
             modlist = organizer.modList()
 
@@ -381,12 +399,60 @@ class OpenMWGame(BasicGame):
                 content_plugins=content,
                 groundcover_plugins=active_groundcover,
                 fallback_archives=bsa_archives,
+                replace_managed=chained_profile,
+                strip_config=chained_profile,
                 log_fn=lambda m: qInfo("OpenMW:" + m),
             )
+
+            log_fn = lambda m: qInfo("OpenMW:" + m)
+            write_openmw_launcher_cfg(
+                cfg.parent / "launcher.cfg",
+                data_dirs=data_dirs,
+                content_plugins=content,
+                fallback_archives=bsa_archives,
+                log_fn=log_fn,
+            )
+            if chained_profile:
+                # The profile is the highest-priority OpenMW config directory.
+                # OpenMW consequently reads and writes settings.cfg, Lua storage,
+                # key bindings, shaders.yaml, launcher.cfg, and future config
+                # artifacts there without Fluorine needing a filename list.
+                write_local_saves(
+                    profile_cfg,
+                    profile_dir if local_saves else None,
+                    log_fn=log_fn,
+                )
+                # Clear a stale root-level local-saves override before selecting
+                # the profile. Only Fluorine's marked block is removed.
+                write_local_saves(root_cfg, None, log_fn=log_fn)
+                write_profile_selector(
+                    root_cfg,
+                    profile_dir,
+                    strip_managed=True,
+                    log_fn=log_fn,
+                )
+            else:
+                # Without a separate profile config, keep the generated config
+                # in OpenMW's normal user directory. Local saves remain
+                # independent of that choice.
+                write_local_saves(
+                    root_cfg,
+                    profile_dir if local_saves else None,
+                    log_fn=log_fn,
+                )
+                # Remove a stale local-saves marker left in this profile if the
+                # profile previously used local settings.
+                if profile_cfg != root_cfg:
+                    write_local_saves(profile_cfg, None, log_fn=log_fn)
+                write_profile_selector(root_cfg, None, log_fn=log_fn)
             qInfo(
                 f"OpenMW: wrote {len(data_dirs)} data dir(s) and "
                 f"{len(content)} content plugin(s) to {cfg}."
             )
-        except Exception as e:  # never block a launch on export failure
+        except Exception as e:
             qWarning(f"OpenMW: openmw.cfg export failed: {e}")
+            # The profile selector, openmw.cfg, and launcher.cfg form one
+            # configuration. Launching after a partial update can select stale
+            # paths or the wrong profile; let the user retry instead.
+            return False
         return True
