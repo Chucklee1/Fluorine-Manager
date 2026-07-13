@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 import shutil
 import tempfile
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Iterable, Iterator, TextIO
+from typing import Iterable, Iterator, TextIO, TypedDict
 
 # Morrowind masters, in canonical load order.
 #
@@ -60,6 +61,18 @@ _LOCAL_SAVES_BEGIN = "# BEGIN FLUORINE OPENMW LOCAL SAVES"
 _LOCAL_SAVES_END = "# END FLUORINE OPENMW LOCAL SAVES"
 _LOCAL_SAVES_ORIGINAL = "# FLUORINE ORIGINAL USER-DATA "
 
+_SELECTION_KEYS = ("content", "groundcover", "fallback-archive")
+_SELECTION_STATE_VERSION = 1
+
+
+class OpenMWSelectionState(TypedDict):
+    version: int
+    known_plugins: list[str]
+    enabled_plugins: list[str]
+    groundcover: list[str]
+    known_archives: list[str]
+    archives: list[str]
+
 
 def escape_data_path(path: str) -> str:
     """Quote/escape a path for a ``data=`` line.
@@ -88,6 +101,180 @@ def _read_lines(cfg_path: Path) -> list[str]:
     if not cfg_path.is_file():
         return []
     return cfg_path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
+def read_openmw_selection(cfg_path: Path) -> dict[str, list[str]]:
+    """Read the ordered plugin and archive selections from an OpenMW config."""
+    result = {key: [] for key in _SELECTION_KEYS}
+    seen = {key: set() for key in _SELECTION_KEYS}
+    for raw in _read_lines(cfg_path):
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key not in result or not value:
+            continue
+        folded = value.casefold()
+        if folded not in seen[key]:
+            seen[key].add(folded)
+            result[key].append(value)
+    return result
+
+
+def filter_selected_files(
+    available: Iterable[str], selected: Iterable[str]
+) -> list[str]:
+    """Keep available files selected by name, preserving available-file order."""
+    selected_keys = {name.casefold() for name in selected}
+    return [name for name in available if name.casefold() in selected_keys]
+
+
+def order_selected_files(
+    available: Iterable[str], selected: Iterable[str]
+) -> list[str]:
+    """Return selected available files in selection order and provider casing."""
+    available_by_name: dict[str, str] = {}
+    for name in available:
+        available_by_name[name.casefold()] = name
+
+    result: list[str] = []
+    emitted: set[str] = set()
+    for name in selected:
+        folded = name.casefold()
+        if folded in available_by_name and folded not in emitted:
+            emitted.add(folded)
+            result.append(available_by_name[folded])
+    return result
+
+
+def _unique_names(*groups: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for name in group:
+            folded = name.casefold()
+            if name and folded not in seen:
+                seen.add(folded)
+                result.append(name)
+    return result
+
+
+def collapse_file_providers(available: Iterable[str]) -> list[str]:
+    """Deduplicate logical names while retaining highest-priority provider casing."""
+    result: list[str] = []
+    positions: dict[str, int] = {}
+    for name in available:
+        folded = name.casefold()
+        if folded in positions:
+            result[positions[folded]] = name
+        else:
+            positions[folded] = len(result)
+            result.append(name)
+    return result
+
+
+def create_selection_state(
+    configured: dict[str, list[str]],
+    loadorder: Iterable[str],
+    available_plugins: Iterable[str],
+    available_archives: Iterable[str],
+    supplemental_archives: Iterable[str] = (),
+) -> OpenMWSelectionState:
+    """Capture durable activation state before replacing a legacy profile config."""
+    available_plugins = list(available_plugins)
+    available_archives = list(available_archives)
+    configured_plugins = _unique_names(
+        configured["content"], configured["groundcover"]
+    )
+    enabled_plugins = configured_plugins or _unique_names(available_plugins)
+
+    configured_archives = _unique_names(
+        configured["fallback-archive"], supplemental_archives
+    )
+    if not configured["fallback-archive"]:
+        configured_archives = _unique_names(configured_archives, available_archives)
+
+    return {
+        "version": _SELECTION_STATE_VERSION,
+        "known_plugins": _unique_names(loadorder, available_plugins, enabled_plugins),
+        "enabled_plugins": enabled_plugins,
+        "groundcover": _unique_names(configured["groundcover"]),
+        "known_archives": _unique_names(available_archives, configured_archives),
+        "archives": configured_archives,
+    }
+
+
+def update_selection_state(
+    state: OpenMWSelectionState,
+    available_plugins: Iterable[str],
+    available_archives: Iterable[str],
+    groundcover: Iterable[str],
+) -> bool:
+    """Enable newly discovered files and persist explicit groundcover changes."""
+    original = json.dumps(state, sort_keys=True)
+    known_plugin_keys = {name.casefold() for name in state["known_plugins"]}
+    enabled_plugin_keys = {name.casefold() for name in state["enabled_plugins"]}
+    for name in available_plugins:
+        folded = name.casefold()
+        if folded not in known_plugin_keys:
+            known_plugin_keys.add(folded)
+            state["known_plugins"].append(name)
+            enabled_plugin_keys.add(folded)
+            state["enabled_plugins"].append(name)
+
+    groundcover = _unique_names(groundcover)
+    for name in groundcover:
+        folded = name.casefold()
+        if folded not in known_plugin_keys:
+            known_plugin_keys.add(folded)
+            state["known_plugins"].append(name)
+        if folded not in enabled_plugin_keys:
+            enabled_plugin_keys.add(folded)
+            state["enabled_plugins"].append(name)
+    state["groundcover"] = groundcover
+
+    known_archive_keys = {name.casefold() for name in state["known_archives"]}
+    archive_keys = {name.casefold() for name in state["archives"]}
+    for name in available_archives:
+        folded = name.casefold()
+        if folded not in known_archive_keys:
+            known_archive_keys.add(folded)
+            state["known_archives"].append(name)
+            archive_keys.add(folded)
+            state["archives"].append(name)
+    return original != json.dumps(state, sort_keys=True)
+
+
+def read_selection_state(state_path: Path) -> OpenMWSelectionState | None:
+    if not state_path.is_file():
+        return None
+    data = json.loads(state_path.read_text(encoding="utf-8"))
+    keys = (
+        "known_plugins",
+        "enabled_plugins",
+        "groundcover",
+        "known_archives",
+        "archives",
+    )
+    if not isinstance(data, dict) or data.get("version") != _SELECTION_STATE_VERSION:
+        raise ValueError(f"Unsupported OpenMW selection state: {state_path}")
+    if any(
+        not isinstance(data.get(key), list)
+        or any(not isinstance(value, str) for value in data[key])
+        for key in keys
+    ):
+        raise ValueError(f"Invalid OpenMW selection state: {state_path}")
+    return data
+
+
+def write_selection_state(
+    state_path: Path, state: OpenMWSelectionState
+) -> None:
+    with _atomic_text_writer(state_path) as stream:
+        json.dump(state, stream, ensure_ascii=True, indent=2)
+        stream.write("\n")
 
 
 def _trim_trailing_blanks(lines: list[str]) -> list[str]:
