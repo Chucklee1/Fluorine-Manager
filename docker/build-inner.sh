@@ -612,10 +612,26 @@ if [ -f "${ICON_SRC}" ] && [ ! -f "${ICON_DST}" ]; then
     mkdir -p "$(dirname "${ICON_DST}")"
     cp -f "${ICON_SRC}" "${ICON_DST}"
 fi
-if [ -f "${DESKTOP_SRC}" ] && [ ! -f "${DESKTOP_DST}" ]; then
+if [ -f "${DESKTOP_SRC}" ]; then
     mkdir -p "$(dirname "${DESKTOP_DST}")"
-    sed "s|^Exec=fluorine-manager|Exec=${BIN_DST}/fluorine-manager|" "${DESKTOP_SRC}" > "${DESKTOP_DST}"
-    chmod +x "${DESKTOP_DST}"
+    # This file belongs to Fluorine, so refresh it on every launch. Older
+    # releases advertised the main desktop entry as an NXM handler but did not
+    # include %u; leaving that file in place causes portals to drop the URL and
+    # launch a second argument-less process.
+    BIN_DST_SED="$(printf '%s' "${BIN_DST}" | sed 's/[&|\\]/\\&/g')"
+    DESKTOP_TMP="${DESKTOP_DST}.tmp.$$"
+    if sed \
+        -e "s|^Exec=fluorine-manager %u$|Exec=\"${BIN_DST_SED}/fluorine-manager\" %u|" \
+        -e "s|^Exec=fluorine-manager |Exec=\"${BIN_DST_SED}/fluorine-manager\" |" \
+        "${DESKTOP_SRC}" > "${DESKTOP_TMP}"; then
+        chmod +x "${DESKTOP_TMP}"
+        mv -f "${DESKTOP_TMP}" "${DESKTOP_DST}"
+        command -v update-desktop-database >/dev/null 2>&1 && \
+            update-desktop-database "$(dirname "${DESKTOP_DST}")" \
+                >/dev/null 2>&1 || true
+    else
+        rm -f "${DESKTOP_TMP}"
+    fi
 fi
 
 # Run from the synced location.

@@ -99,22 +99,38 @@ MOMultiProcess::MOMultiProcess(bool allowMultiple, QObject* parent)
   if (m_OwnsSM) {
     connect(&m_Server, SIGNAL(newConnection()), this, SLOT(receiveMessage()),
             Qt::QueuedConnection);
-    // Clear any stale unix socket file from a prior crashed primary,
-    // otherwise listen() fails with AddressInUseError on Linux.
-    QLocalServer::removeServer(s_Key);
     // has to be called before listen
     m_Server.setSocketOptions(QLocalServer::WorldAccessOption);
     if (!m_Server.listen(s_Key)) {
-      MOBase::log::warn("QLocalServer listen failed: {}",
-                           m_Server.errorString().toStdString());
-      // Another process may have started a listener between our probe and
-      // listen() (race during concurrent startup). Re-probe and demote
-      // ourselves to ephemeral if a real primary is now alive.
+      // Never remove the endpoint until we have proved it is stale. An
+      // unconditional remove can unlink a live listener created by another
+      // process during concurrent startup.
       if (primaryAlive()) {
         MOBase::log::info(
             "another primary started concurrently, running as ephemeral");
         m_OwnsSM    = false;
         m_Ephemeral = true;
+      } else {
+        MOBase::log::debug("removing stale local-server endpoint after listen "
+                           "failed: {}",
+                           m_Server.errorString().toStdString());
+        QLocalServer::removeServer(s_Key);
+
+        if (!m_Server.listen(s_Key)) {
+          // A competitor may have claimed the name between removeServer() and
+          // our retry. Demote if it is alive; otherwise fail explicitly rather
+          // than running a primary that cannot receive forwarded links.
+          if (primaryAlive()) {
+            MOBase::log::info(
+                "another primary claimed the listener, running as ephemeral");
+            m_OwnsSM    = false;
+            m_Ephemeral = true;
+          } else {
+            throw MOBase::MyException(
+                tr("failed to create single-instance listener: %1")
+                    .arg(m_Server.errorString()));
+          }
+        }
       }
     }
   }

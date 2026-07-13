@@ -23,6 +23,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include "env.h"
 #include <QApplication>
 #include <QFileSystemWatcher>
+#include <QStringList>
 
 class Settings;
 class MOMultiProcess;
@@ -87,8 +88,11 @@ private:
   std::unique_ptr<NexusInterface> m_nexus;
   std::unique_ptr<PluginContainer> m_plugins;
   std::unique_ptr<OrganizerCore> m_core;
+  bool m_coreReady = false;
+  QStringList m_pendingExternalLinks;
 
   void externalMessage(const QString& message);
+  void processPendingExternalLinks();
   static std::unique_ptr<Instance> getCurrentInstance(bool forceSelect);
   static std::optional<int> setupInstanceLoop(Instance& currentInstance, PluginContainer& pc);
   static void purgeOldFiles();

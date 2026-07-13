@@ -304,6 +304,7 @@ void MOApplication::firstTimeSetup(MOMultiProcess& multiProcess)
 int MOApplication::setup(MOMultiProcess& multiProcess, bool forceSelect)
 {
   TimeThis tt("MOApplication setup()");
+  m_coreReady = false;
 
   // makes plugin data path available to plugins, see
   // IOrganizer::getPluginDataPath()
@@ -468,6 +469,12 @@ int MOApplication::setup(MOMultiProcess& multiProcess, bool forceSelect)
   m_core->updateExecutablesList();
   m_core->updateModInfoFromDisc();
   m_core->setCurrentProfile(m_instance->profileName());
+  m_coreReady = true;
+
+  // The single-instance listener is active before setup() finishes. Preserve
+  // NXM links received during that window and start them as soon as the core
+  // is ready instead of rejecting or losing them.
+  processPendingExternalLinks();
 
   return 0;
 }
@@ -571,10 +578,9 @@ void MOApplication::externalMessage(const QString& message)
       }
     }
   } else if (isNxmLink(message)) {
-    if (m_core == nullptr) {
-      // This can happen if MO2 is started with the --pick option and no instance has
-      // been selected yet.
-      reportError(tr("You need to select an instance before trying to download mods."));
+    if (!m_coreReady) {
+      log::info("queueing external download link until instance setup completes");
+      m_pendingExternalLinks.append(message);
     } else {
       MessageDialog::showMessage(tr("Download started"), qApp->activeWindow(), false);
       m_core->downloadRequestedNXM(message);
@@ -616,6 +622,20 @@ void MOApplication::externalMessage(const QString& message)
     }
 
     cl.runPostOrganizer(*m_core);
+  }
+}
+
+void MOApplication::processPendingExternalLinks()
+{
+  if (!m_coreReady || m_core == nullptr || m_pendingExternalLinks.isEmpty()) {
+    return;
+  }
+
+  QStringList links;
+  links.swap(m_pendingExternalLinks);
+  log::info("processing {} download link(s) queued during startup", links.size());
+  for (const QString& link : links) {
+    m_core->downloadRequestedNXM(link);
   }
 }
 
@@ -687,6 +707,7 @@ void MOApplication::purgeOldFiles()
 
 void MOApplication::resetForRestart()
 {
+  m_coreReady = false;
   LogModel::instance().clear();
   ResetExitFlag();
 
