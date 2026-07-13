@@ -45,21 +45,14 @@ private:
 
   struct
   {
-    float version;
-    int32_t numRecords;
-    uint32_t nextObjectId;
+    float version{};
+    int32_t numRecords{};
+    uint32_t nextObjectId{};
   } m_Header;
 
-  struct
-  {
-    float version;
-    uint32_t unknown;
-    char author[32];
-    char description[256];
-    uint32_t numRecords;
-  } m_TES3Header;
-
   Record m_MainRecord;
+  bool m_IsTES3{false};
+  bool m_TES3Master{false};
 
   std::string m_Author;
   std::string m_Description;

@@ -14,6 +14,24 @@ add_test(
 )
 
 # ---------------------------------------------------------------------------
+# TES3 metadata and OpenMW Player stub parsing tests
+# ---------------------------------------------------------------------------
+add_executable(test_esptk_tes3 EXCLUDE_FROM_ALL
+    test_esptk_tes3.cpp
+)
+set_target_properties(test_esptk_tes3 PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_link_libraries(test_esptk_tes3 PRIVATE
+    mo2::esptk
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_esptk_tes3 COMMAND test_esptk_tes3)
+
+# ---------------------------------------------------------------------------
 # meta.ini case-normalization helper tests
 # ---------------------------------------------------------------------------
 add_executable(test_metainiutils EXCLUDE_FROM_ALL
@@ -133,5 +151,5 @@ add_test(NAME test_vfs_catalog COMMAND test_vfs_catalog)
 
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
-    DEPENDS test_metainiutils test_external_dir_mapping test_overwrite_duplicates
-            test_vfs_file_ops test_vfs_catalog)
+    DEPENDS test_esptk_tes3 test_metainiutils test_external_dir_mapping
+            test_overwrite_duplicates test_vfs_file_ops test_vfs_catalog)
