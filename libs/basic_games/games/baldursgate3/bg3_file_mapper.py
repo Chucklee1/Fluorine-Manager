@@ -138,18 +138,6 @@ class BG3FileMapper(mobase.IPluginFileMapper):
     def create_mapping(self, file: Path, dest: Path):
         bg3_utils.create_dir_if_needed(dest)
 
-        # On Linux, FUSE cannot handle file mappings outside the game's data
-        # directory.  Create real symlinks so the game (via Proton) can find
-        # mod files in the documents/prefix directory.
-        if _IS_LINUX and not file.is_dir():
-            try:
-                if dest.is_symlink() or dest.exists():
-                    dest.unlink()
-                dest.symlink_to(file)
-                self._linux_symlinks.append(dest)
-            except OSError as e:
-                qWarning(f"BG3: failed to symlink {dest} -> {file}: {e}")
-
         self.current_mappings.append(
             mobase.Mapping(
                 source=str(file),

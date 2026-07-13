@@ -39,6 +39,7 @@ public:  // IPluginGame interface
   virtual QString gameNexusName() const override;
   virtual QStringList iniFiles() const override;
   virtual bool prepareIni(const QString& exec) override;
+  virtual bool needsAutoCreateDirectories() const override;
   virtual QStringList DLCPlugins() const override;
   virtual QStringList CCPlugins() const override;
   virtual QString blueprintPrefix() const override;

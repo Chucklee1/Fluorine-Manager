@@ -1627,8 +1627,11 @@ void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name)
     // call mo2_create. Insert a phantom virtual directory — no physical creation.
     // createFile() calls create_directories on the parent path, so the real dir
     // will materialize on disk only when a file is actually written inside it.
+    // Gated behind auto_create_dirs: most games (e.g. BG3) must not have
+    // phantom directories injected because they shadow real entries resolved
+    // through normal VFS traversal.
     const std::string_view nameView(name);
-    if (nameView.find('.') == std::string_view::npos) {
+    if (ctx->auto_create_dirs && nameView.find('.') == std::string_view::npos) {
       bool parentOk = false;
       const std::string parentPath = inodeToPath(ctx, parent, &parentOk);
       if (parentOk) {

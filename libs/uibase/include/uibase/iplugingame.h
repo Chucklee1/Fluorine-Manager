@@ -167,6 +167,18 @@ public:
   /**
    * this function may be called before init()
    *
+   * @return true if the FUSE VFS should auto-create intermediate directories
+   *         when a lookup misses (needed by Starfield, which skips mkdir for
+   *         parent directories and goes straight to CreateFile).  Most games
+   *         should leave this as false — creating phantom directories can
+   *         shadow real game files that are resolved through normal VFS
+   *         traversal.
+   */
+  virtual bool needsAutoCreateDirectories() const { return false; }
+
+  /**
+   * this function may be called before init()
+   *
    * @return an icon for this game
    */
   virtual QIcon gameIcon() const = 0;
