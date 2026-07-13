@@ -2834,6 +2834,44 @@ bool OrganizerCore::beforeRun(
     return false;
   }
 
+  // Pandora Behaviour Engine+ workaround: normalize paths in
+  // PreviousOutput.txt to lowercase to avoid case-sensitivity issues
+  // on Linux filesystems (issue #110).  Pandora records output paths
+  // with the casing from Skyrim's HKX binary data (e.g. "Characters
+  // Female"), but the VFS normalizes to lowercase on write, causing
+  // the second run's LoadMetaData() to fail to find files to delete.
+  if (binary.fileName().contains("pandora", Qt::CaseInsensitive)) {
+    const QString pandoraPrevOutput =
+        QDir(overwritePath()).filePath("Pandora_Engine/PreviousOutput.txt");
+    QFileInfo info(pandoraPrevOutput);
+    if (info.exists() && info.isFile()) {
+      QFile file(pandoraPrevOutput);
+      if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QStringList lines;
+        QTextStream in(&file);
+        while (!in.atEnd()) {
+          lines.append(in.readLine());
+        }
+        file.close();
+
+        for (QString& line : lines) {
+          int idx = line.indexOf("\\meshes\\", 0, Qt::CaseInsensitive);
+          if (idx >= 0) {
+            line = line.left(idx) + line.mid(idx).toLower();
+          }
+        }
+
+        if (file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+          QTextStream out(&file);
+          for (const QString& line : lines) {
+            out << line << Qt::endl;
+          }
+          file.close();
+        }
+      }
+    }
+  }
+
   // Check the game's registry key in the Wine prefix and fix if needed.
   if (!checkGameRegistryKey()) {
     return false;  // user cancelled
