@@ -3,6 +3,15 @@ cmake_minimum_required(VERSION 3.16)
 find_package(Qt6 REQUIRED COMPONENTS Core)
 find_package(GTest REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+# ---------------------------------------------------------------------------
+# OpenMW native config generation tests
+# ---------------------------------------------------------------------------
+add_test(
+    NAME test_openmw_cfg
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_openmw_cfg.py
+)
 
 # ---------------------------------------------------------------------------
 # meta.ini case-normalization helper tests

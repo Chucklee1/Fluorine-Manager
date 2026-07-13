@@ -50,6 +50,9 @@ VANILLA_BSAS: list[str] = [
 
 # Keys this module fully owns (lowercase, exact match).
 _MANAGED_KEYS = frozenset({"data", "content", "groundcover", "fallback-archive"})
+# The global OpenMW config contributes its required resources/vfs-mw data dir.
+# Keep inherited data entries while replacing the other generated lists.
+_REPLACED_MANAGED_KEYS = _MANAGED_KEYS - {"data"}
 
 _PROFILE_BEGIN = "# BEGIN FLUORINE OPENMW PROFILE"
 _PROFILE_END = "# END FLUORINE OPENMW PROFILE"
@@ -479,7 +482,7 @@ def build_managed_block(
 
     block: list[str] = [""]  # blank separator from the preserved section
     if replace_managed:
-        block += [f"replace={key}" for key in sorted(_MANAGED_KEYS)]
+        block += [f"replace={key}" for key in sorted(_REPLACED_MANAGED_KEYS)]
     block += [f"data={escape_data_path(str(d))}" for d in data_dirs]
     block += [f"content={c}" for c in content]
     block += [f"groundcover={g}" for g in groundcover_plugins]
