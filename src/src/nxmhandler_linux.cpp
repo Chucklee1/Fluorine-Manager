@@ -243,23 +243,6 @@ void runDesktopCommand(const QString& program, const QStringList& arguments)
   }
 }
 
-void setDefaultAssociation(const QString& mimeType, const QString& desktopFile)
-{
-  runDesktopCommand(QStringLiteral("xdg-mime"),
-                    QStringList{QStringLiteral("default"), desktopFile, mimeType});
-
-  // Some GLib/GNOME stacks cache associations independently of direct
-  // mimeapps.list edits. gio is optional, so absence is only logged at debug.
-  runDesktopCommand(QStringLiteral("gio"),
-                    QStringList{QStringLiteral("mime"), mimeType, desktopFile});
-}
-
-void refreshDesktopAssociationCaches(const QString& appsDir)
-{
-  runDesktopCommand(QStringLiteral("update-desktop-database"), QStringList{appsDir});
-  runDesktopCommand(QStringLiteral("xdg-desktop-menu"),
-                    QStringList{QStringLiteral("forceupdate")});
-}
 
 // xdg-desktop-portal remembers chooser picks in its permission store. An
 // earlier build registered both com.fluorine.manager.desktop and
@@ -517,11 +500,7 @@ void NxmHandlerLinux::registerHandler()
 
   for (const auto& scheme : UrlSchemes) {
     updateMimeAppsList(configDir + "/mimeapps.list", scheme, NxmDesktopFile);
-    updateMimeAppsList(appsDir + "/mimeapps.list", scheme, NxmDesktopFile);
-    setDefaultAssociation(scheme, NxmDesktopFile);
   }
-
-  refreshDesktopAssociationCaches(appsDir);
 
   for (const auto& scheme : UrlSchemes) {
     clearStalePortalChoice(scheme);
@@ -546,13 +525,10 @@ void NxmHandlerLinux::unregisterHandler()
 
   for (const auto& scheme : UrlSchemes) {
     removeMimeAppsAssociation(configDir + "/mimeapps.list", scheme, NxmDesktopFile);
-    removeMimeAppsAssociation(appsDir + "/mimeapps.list", scheme, NxmDesktopFile);
   }
 
   QFile::remove(appsDir + "/" + NxmDesktopFile);
   QFile::remove(appsDir + "/" + LegacyNxmDesktopFile);
-
-  refreshDesktopAssociationCaches(appsDir);
 
   for (const auto& scheme : UrlSchemes) {
     clearStalePortalChoice(scheme);
