@@ -2,6 +2,7 @@
 #include "iuserinterface.h"
 #include "organizercore.h"
 #include "organizerproxy.h"
+#include "plugincompatibility.h"
 #include "report.h"
 #include "shared/appconfig.h"
 #include <QAction>
@@ -27,6 +28,22 @@ namespace bf = boost::fusion;
 
 static void printPluginDiagToStderr(const QString&)
 {
+}
+
+static std::optional<PluginCompatibility::Block>
+compatibilityBlock(const PluginContainer& container, IPlugin* plugin)
+{
+  if (plugin == nullptr || container.managedGame() == nullptr) {
+    return std::nullopt;
+  }
+
+  return PluginCompatibility::blockedRuleForPlugin(
+      container.managedGame()->gameName(), plugin, [](IPlugin* current) {
+        return current->name();
+      }, [&container](IPlugin* current) {
+        return container.requirements(current).master();
+      },
+      PluginCompatibility::environmentOverrides());
 }
 
 // Welcome to the wonderful world of MO2 plugin management!
@@ -683,6 +700,10 @@ IPluginGame* PluginContainer::managedGame() const
 
 bool PluginContainer::isEnabled(IPlugin* plugin) const
 {
+  if (::compatibilityBlock(*this, plugin)) {
+    return false;
+  }
+
   // Check if it's a game plugin:
   if (implementInterface<IPluginGame>(plugin)) {
     return plugin == m_Organizer->managedGame();
@@ -812,6 +833,9 @@ void PluginContainer::startPluginsImpl(const std::vector<QObject*>& plugins) con
   // setUserInterface()
   if (m_UserInterface) {
     for (auto* plugin : plugins) {
+      if (::compatibilityBlock(*this, qobject_cast<IPlugin*>(plugin))) {
+        continue;
+      }
       if (auto* proxy = qobject_cast<IPluginProxy*>(plugin)) {
         proxy->setParentWidget(m_UserInterface->mainWindow());
       }
@@ -831,6 +855,15 @@ void PluginContainer::startPluginsImpl(const std::vector<QObject*>& plugins) con
   if (m_Organizer) {
     for (auto* object : plugins) {
       auto* plugin = qobject_cast<IPlugin*>(object);
+      if (const auto block = ::compatibilityBlock(*this, plugin)) {
+        if (plugin->name() == QStringLiteral("OpenMWPlayer")) {
+          log::warn(
+              "compatibility rule '{}' disabled plugin '{}' for this session: {} "
+              "Set FLUORINE_ALLOW_INCOMPATIBLE_PLUGINS={} to override.",
+              block->id, plugin->name(), block->reason, block->id);
+        }
+        continue;
+      }
       auto* oproxy = organizerProxy(plugin);
       oproxy->connectSignals();
       oproxy->m_ProfileChanged(nullptr, m_Organizer->currentProfile().get());
