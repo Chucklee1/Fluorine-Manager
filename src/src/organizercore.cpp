@@ -2857,33 +2857,51 @@ bool OrganizerCore::beforeRun(
   // Female"), but the VFS normalizes to lowercase on write, causing
   // the second run's LoadMetaData() to fail to find files to delete.
   if (binary.fileName().contains("pandora", Qt::CaseInsensitive)) {
-    const QString pandoraPrevOutput =
-        QDir(overwritePath()).filePath("Pandora_Engine/PreviousOutput.txt");
-    QFileInfo info(pandoraPrevOutput);
-    if (info.exists() && info.isFile()) {
-      QFile file(pandoraPrevOutput);
-      if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QStringList lines;
-        QTextStream in(&file);
-        while (!in.atEnd()) {
-          lines.append(in.readLine());
-        }
-        file.close();
+    QStringList candidates = {
+        QDir(overwritePath()).filePath("Pandora_Engine/PreviousOutput.txt"),
+    };
+    if (!customOverwrite.isEmpty()) {
+      candidates.append(
+          QDir(modsPath()).filePath(customOverwrite + "/Pandora_Engine/PreviousOutput.txt"));
+    }
 
-        for (QString& line : lines) {
-          int idx = line.indexOf("\\meshes\\", 0, Qt::CaseInsensitive);
-          if (idx >= 0) {
-            line = line.left(idx) + line.mid(idx).toLower();
-          }
-        }
+    log::debug("Pandora fix: checking {} candidate(s) for PreviousOutput.txt",
+               candidates.size());
 
-        if (file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-          QTextStream out(&file);
-          for (const QString& line : lines) {
-            out << line << Qt::endl;
+    for (const QString& pandoraPrevOutput : candidates) {
+      QFileInfo info(pandoraPrevOutput);
+      if (info.exists() && info.isFile()) {
+        log::debug("Pandora fix: found PreviousOutput.txt at {}", pandoraPrevOutput);
+        QFile file(pandoraPrevOutput);
+        if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+          QStringList lines;
+          QTextStream in(&file);
+          while (!in.atEnd()) {
+            lines.append(in.readLine());
           }
           file.close();
+          log::debug("Pandora fix: read {} lines", lines.size());
+
+          for (QString& line : lines) {
+            int idx = line.indexOf("\\meshes\\", 0, Qt::CaseInsensitive);
+            if (idx >= 0) {
+              line = line.left(idx) + line.mid(idx).toLower();
+            }
+          }
+
+          if (file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+            QTextStream out(&file);
+            for (const QString& line : lines) {
+              out << line << Qt::endl;
+            }
+            file.close();
+            log::debug("Pandora fix: wrote {} lines back", lines.size());
+          }
         }
+        break;
+      } else {
+        log::debug("Pandora fix: {} does not exist or is not a file",
+                   pandoraPrevOutput);
       }
     }
   }
