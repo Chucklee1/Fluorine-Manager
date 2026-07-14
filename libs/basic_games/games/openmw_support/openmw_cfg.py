@@ -323,10 +323,22 @@ def _without_marked_block(lines: Iterable[str], begin: str, end: str) -> list[st
     return _split_marked_blocks(lines, begin, end)[0]
 
 
+def _fsync_directory(path: Path) -> None:
+    with suppress(OSError):
+        directory = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
 @contextmanager
 def _atomic_text_writer(cfg_path: Path) -> Iterator[TextIO]:
     """Yield a same-directory temporary stream and atomically replace cfg_path."""
-    target = cfg_path.resolve() if cfg_path.is_symlink() else cfg_path
+    target = cfg_path.absolute().resolve(strict=False)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
@@ -348,18 +360,118 @@ def _atomic_text_writer(cfg_path: Path) -> Iterator[TextIO]:
                             os.getxattr(target, attribute),
                         )
         os.replace(temp_path, target)
-        with suppress(OSError):
-            directory = os.open(
-                target.parent,
-                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-            )
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+        _fsync_directory(target.parent)
     except BaseException:
         temp_path.unlink(missing_ok=True)
         raise
+
+
+class _FileSnapshot:
+    def __init__(self, target: Path, existed: bool, backup: Path | None):
+        self.target = target
+        self.existed = existed
+        self.backup = backup
+
+
+def _transaction_target(path: Path) -> Path:
+    return path.absolute().resolve(strict=False)
+
+
+def validate_file_roles(roles: dict[str, Path]) -> None:
+    """Reject different export roles that resolve to the same destination."""
+    destinations: dict[Path, str] = {}
+    for role, path in roles.items():
+        target = _transaction_target(path)
+        if target in destinations:
+            raise ValueError(
+                f"OpenMW export roles '{destinations[target]}' and '{role}' "
+                f"resolve to the same file: {target}"
+            )
+        destinations[target] = role
+
+
+def _create_file_snapshots(paths: Iterable[Path]) -> list[_FileSnapshot]:
+    snapshots: list[_FileSnapshot] = []
+    seen: set[Path] = set()
+    try:
+        for logical_path in paths:
+            target = _transaction_target(logical_path)
+            if target in seen:
+                continue
+            seen.add(target)
+            if not target.parent.is_dir():
+                raise ValueError(
+                    f"Transaction target parent does not exist: {target.parent}"
+                )
+            if not target.exists():
+                snapshots.append(_FileSnapshot(target, False, None))
+                continue
+            if not target.is_file():
+                raise ValueError(f"Transaction target is not a file: {target}")
+
+            fd, temporary = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".rollback", dir=target.parent
+            )
+            os.close(fd)
+            backup = Path(temporary)
+            try:
+                backup.unlink()
+                try:
+                    os.link(target, backup)
+                except OSError:
+                    shutil.copy2(target, backup)
+            except BaseException:
+                backup.unlink(missing_ok=True)
+                raise
+            snapshots.append(_FileSnapshot(target, True, backup))
+        return snapshots
+    except BaseException:
+        for snapshot in snapshots:
+            if snapshot.backup is not None:
+                snapshot.backup.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def rollback_file_changes(paths: Iterable[Path]) -> Iterator[None]:
+    """Restore every listed file if a later atomic export write fails."""
+    snapshots = _create_file_snapshots(paths)
+    try:
+        yield
+    except BaseException as original:
+        rollback_errors: list[str] = []
+        for snapshot in reversed(snapshots):
+            try:
+                if snapshot.existed:
+                    if snapshot.backup is None:
+                        raise RuntimeError("missing rollback snapshot")
+                    os.replace(snapshot.backup, snapshot.target)
+                    snapshot.backup = None
+                else:
+                    snapshot.target.unlink(missing_ok=True)
+                _fsync_directory(snapshot.target.parent)
+            except BaseException as error:
+                rollback_errors.append(f"{snapshot.target}: {error}")
+        if rollback_errors:
+            raise RuntimeError(
+                "OpenMW export failed and rollback was incomplete: "
+                + "; ".join(rollback_errors)
+            ) from original
+        raise
+    else:
+        cleanup_errors: list[str] = []
+        for snapshot in snapshots:
+            if snapshot.backup is not None:
+                try:
+                    snapshot.backup.unlink()
+                except OSError as error:
+                    cleanup_errors.append(f"{snapshot.backup}: {error}")
+                _fsync_directory(snapshot.target.parent)
+        if cleanup_errors:
+            raise RuntimeError(
+                "OpenMW export committed but rollback snapshot cleanup failed: "
+                + "; ".join(cleanup_errors)
+            )
 
 
 def _write_lines(cfg_path: Path, lines: Iterable[str]) -> None:

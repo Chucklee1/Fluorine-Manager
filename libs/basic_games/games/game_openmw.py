@@ -37,7 +37,9 @@ from .openmw_support.openmw_cfg import (
     order_selected_files,
     read_openmw_selection,
     read_selection_state,
+    rollback_file_changes,
     update_selection_state,
+    validate_file_roles,
     write_local_saves,
     write_openmw_cfg,
     write_openmw_launcher_cfg,
@@ -286,7 +288,9 @@ class OpenMWGame(BasicGame):
                 )
                 return True
             profile_cfg = profile_dir / "openmw.cfg"
-            chained_profile = local_settings and profile_cfg != root_cfg
+            profile_target = profile_cfg.resolve(strict=False)
+            root_target = root_cfg.resolve(strict=False)
+            chained_profile = local_settings and profile_target != root_target
             cfg = profile_cfg if chained_profile else root_cfg
             selection_cfg = (
                 profile_cfg
@@ -405,6 +409,7 @@ class OpenMWGame(BasicGame):
 
             state_path = profile_dir / _SELECTION_STATE_FILE
             state = read_selection_state(state_path)
+            state_dirty = False
             if state is None:
                 state = create_selection_state(
                     configured,
@@ -413,13 +418,13 @@ class OpenMWGame(BasicGame):
                     bsa_archives,
                     self._read_archives_txt(),
                 )
-                write_selection_state(state_path, state)
+                state_dirty = True
 
             groundcover = self._read_groundcover_txt(state["groundcover"])
             if update_selection_state(
                 state, all_plugins, bsa_archives, groundcover
             ):
-                write_selection_state(state_path, state)
+                state_dirty = True
             gc_lower = {g.lower() for g in groundcover}
 
             # loadorder.txt contains disabled plugins too, so preserve activation
@@ -452,58 +457,70 @@ class OpenMWGame(BasicGame):
                         "so it loads as groundcover= (better performance)."
                     )
 
-            write_openmw_cfg(
-                cfg,
-                data_dirs=data_dirs,
-                content_plugins=content,
-                groundcover_plugins=active_groundcover,
-                fallback_archives=selected_archives,
-                replace_managed=chained_profile,
-                strip_config=chained_profile,
-                log_fn=lambda m: qInfo("OpenMW:" + m),
-            )
-
             log_fn = lambda m: qInfo("OpenMW:" + m)
-            write_openmw_launcher_cfg(
-                cfg.parent / "launcher.cfg",
-                data_dirs=data_dirs,
-                content_plugins=content,
-                fallback_archives=selected_archives,
-                log_fn=log_fn,
-            )
-            if chained_profile:
-                # The profile is the highest-priority OpenMW config directory.
-                # OpenMW consequently reads and writes settings.cfg, Lua storage,
-                # key bindings, shaders.yaml, launcher.cfg, and future config
-                # artifacts there without Fluorine needing a filename list.
-                write_local_saves(
-                    profile_cfg,
-                    profile_dir if local_saves else None,
+            launcher_cfg = cfg.parent / "launcher.cfg"
+            file_roles = {
+                "selection state": state_path,
+                "launcher config": launcher_cfg,
+                "root config": root_cfg,
+            }
+            if profile_target != root_target:
+                file_roles["profile config"] = profile_cfg
+            validate_file_roles(file_roles)
+
+            with rollback_file_changes(file_roles.values()):
+                if state_dirty:
+                    write_selection_state(state_path, state)
+                write_openmw_cfg(
+                    cfg,
+                    data_dirs=data_dirs,
+                    content_plugins=content,
+                    groundcover_plugins=active_groundcover,
+                    fallback_archives=selected_archives,
+                    replace_managed=chained_profile,
+                    strip_config=chained_profile,
                     log_fn=log_fn,
                 )
-                # Clear a stale root-level local-saves override before selecting
-                # the profile. Only Fluorine's marked block is removed.
-                write_local_saves(root_cfg, None, log_fn=log_fn)
-                write_profile_selector(
-                    root_cfg,
-                    profile_dir,
-                    strip_managed=True,
+                write_openmw_launcher_cfg(
+                    launcher_cfg,
+                    data_dirs=data_dirs,
+                    content_plugins=content,
+                    fallback_archives=selected_archives,
                     log_fn=log_fn,
                 )
-            else:
-                # Without a separate profile config, keep the generated config
-                # in OpenMW's normal user directory. Local saves remain
-                # independent of that choice.
-                write_local_saves(
-                    root_cfg,
-                    profile_dir if local_saves else None,
-                    log_fn=log_fn,
-                )
-                # Remove a stale local-saves marker left in this profile if the
-                # profile previously used local settings.
-                if profile_cfg != root_cfg:
-                    write_local_saves(profile_cfg, None, log_fn=log_fn)
-                write_profile_selector(root_cfg, None, log_fn=log_fn)
+                if chained_profile:
+                    # The profile is the highest-priority OpenMW config directory.
+                    # OpenMW consequently reads and writes settings.cfg, Lua storage,
+                    # key bindings, shaders.yaml, launcher.cfg, and future config
+                    # artifacts there without Fluorine needing a filename list.
+                    write_local_saves(
+                        profile_cfg,
+                        profile_dir if local_saves else None,
+                        log_fn=log_fn,
+                    )
+                    # Clear a stale root-level local-saves override before selecting
+                    # the profile. Only Fluorine's marked block is removed.
+                    write_local_saves(root_cfg, None, log_fn=log_fn)
+                    write_profile_selector(
+                        root_cfg,
+                        profile_dir,
+                        strip_managed=True,
+                        log_fn=log_fn,
+                    )
+                else:
+                    # Without a separate profile config, keep the generated config
+                    # in OpenMW's normal user directory. Local saves remain
+                    # independent of that choice.
+                    write_local_saves(
+                        root_cfg,
+                        profile_dir if local_saves else None,
+                        log_fn=log_fn,
+                    )
+                    # Remove a stale local-saves marker left in this profile if the
+                    # profile previously used local settings.
+                    if profile_target != root_target:
+                        write_local_saves(profile_cfg, None, log_fn=log_fn)
+                    write_profile_selector(root_cfg, None, log_fn=log_fn)
             qInfo(
                 f"OpenMW: wrote {len(data_dirs)} data dir(s) and "
                 f"{len(content)} content plugin(s) to {cfg}."

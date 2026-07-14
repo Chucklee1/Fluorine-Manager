@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = (
@@ -189,6 +191,143 @@ class OpenMWConfigTests(unittest.TestCase):
 
             self.assertEqual(openmw_cfg.read_selection_state(state_path), state)
             self.assertTrue(state_path.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_transaction_rolls_back_existing_and_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cfg_path = directory / "openmw.cfg"
+            launcher_path = directory / "launcher.cfg"
+            state_path = directory / "fluorine-openmw-selection.json"
+            cfg_path.write_text("original config\n", encoding="utf-8")
+            launcher_path.write_text("original launcher\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                with openmw_cfg.rollback_file_changes(
+                    [cfg_path, launcher_path, state_path, cfg_path]
+                ):
+                    openmw_cfg._write_lines(cfg_path, ["new config"])
+                    openmw_cfg._write_lines(launcher_path, ["new launcher"])
+                    openmw_cfg._write_lines(state_path, ["new state"])
+                    raise RuntimeError("injected failure")
+
+            self.assertEqual(
+                cfg_path.read_text(encoding="utf-8"), "original config\n"
+            )
+            self.assertEqual(
+                launcher_path.read_text(encoding="utf-8"), "original launcher\n"
+            )
+            self.assertFalse(state_path.exists())
+            self.assertEqual(list(directory.glob(".*.rollback")), [])
+
+    def test_transaction_commits_and_removes_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cfg_path = directory / "openmw.cfg"
+            cfg_path.write_text("original\n", encoding="utf-8")
+
+            with openmw_cfg.rollback_file_changes([cfg_path]):
+                backups = list(directory.glob(".*.rollback"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(os.stat(backups[0]).st_ino, os.stat(cfg_path).st_ino)
+                openmw_cfg._write_lines(cfg_path, ["committed"])
+
+            self.assertEqual(cfg_path.read_text(encoding="utf-8"), "committed\n")
+            self.assertEqual(list(directory.glob(".*.rollback")), [])
+
+    def test_transaction_restores_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            target_path = directory / "target.cfg"
+            link_path = directory / "openmw.cfg"
+            target_path.write_text("original\n", encoding="utf-8")
+            try:
+                link_path.symlink_to(target_path)
+            except OSError as error:
+                self.skipTest(f"Symlinks unavailable: {error}")
+
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                with openmw_cfg.rollback_file_changes([link_path]):
+                    openmw_cfg._write_lines(link_path, ["changed"])
+                    raise RuntimeError("injected failure")
+
+            self.assertTrue(link_path.is_symlink())
+            self.assertEqual(target_path.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(list(directory.glob(".*.rollback")), [])
+
+    def test_late_marker_failure_restores_earlier_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cfg_path = directory / "profile.cfg"
+            root_path = directory / "root.cfg"
+            cfg_path.write_text("original profile\n", encoding="utf-8")
+            root_path.write_text(
+                "# BEGIN FLUORINE OPENMW LOCAL SAVES\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "without a matching"):
+                with openmw_cfg.rollback_file_changes([cfg_path, root_path]):
+                    openmw_cfg._write_lines(cfg_path, ["changed profile"])
+                    openmw_cfg.write_local_saves(root_path, None)
+
+            self.assertEqual(
+                cfg_path.read_text(encoding="utf-8"), "original profile\n"
+            )
+            self.assertEqual(
+                root_path.read_text(encoding="utf-8"),
+                "# BEGIN FLUORINE OPENMW LOCAL SAVES\n",
+            )
+
+    def test_rejects_export_roles_aliased_through_parent_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            real_profile = directory / "real-profile"
+            alias_profile = directory / "alias-profile"
+            real_profile.mkdir()
+            try:
+                alias_profile.symlink_to(real_profile, target_is_directory=True)
+            except OSError as error:
+                self.skipTest(f"Symlinks unavailable: {error}")
+
+            with self.assertRaisesRegex(ValueError, "resolve to the same file"):
+                openmw_cfg.validate_file_roles(
+                    {
+                        "root config": real_profile / "openmw.cfg",
+                        "profile config": alias_profile / "openmw.cfg",
+                    }
+                )
+
+    def test_rejects_absent_transaction_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            missing_path = Path(temporary) / "missing" / "openmw.cfg"
+
+            with self.assertRaisesRegex(ValueError, "parent does not exist"):
+                with openmw_cfg.rollback_file_changes([missing_path]):
+                    self.fail("Transaction should not start")
+
+            self.assertFalse(missing_path.parent.exists())
+
+    def test_removes_partial_copy_when_snapshot_creation_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cfg_path = directory / "openmw.cfg"
+            cfg_path.write_text("original\n", encoding="utf-8")
+
+            def fail_after_partial_copy(_source, destination):
+                Path(destination).write_text("partial", encoding="utf-8")
+                raise OSError("injected copy failure")
+
+            with mock.patch.object(
+                openmw_cfg.os, "link", side_effect=OSError("no hard links")
+            ), mock.patch.object(
+                openmw_cfg.shutil, "copy2", side_effect=fail_after_partial_copy
+            ):
+                with self.assertRaisesRegex(OSError, "injected copy failure"):
+                    with openmw_cfg.rollback_file_changes([cfg_path]):
+                        self.fail("Transaction should not start")
+
+            self.assertEqual(cfg_path.read_text(encoding="utf-8"), "original\n")
+            self.assertEqual(list(directory.glob(".*.rollback")), [])
 
     def test_profile_block_preserves_inherited_data(self) -> None:
         block = openmw_cfg.build_managed_block(
