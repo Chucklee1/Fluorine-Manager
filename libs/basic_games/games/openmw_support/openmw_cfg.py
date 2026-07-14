@@ -62,7 +62,7 @@ _LOCAL_SAVES_END = "# END FLUORINE OPENMW LOCAL SAVES"
 _LOCAL_SAVES_ORIGINAL = "# FLUORINE ORIGINAL USER-DATA "
 
 _SELECTION_KEYS = ("content", "groundcover", "fallback-archive")
-_SELECTION_STATE_VERSION = 1
+_SELECTION_STATE_VERSION = 2
 
 
 class OpenMWSelectionState(TypedDict):
@@ -72,6 +72,9 @@ class OpenMWSelectionState(TypedDict):
     groundcover: list[str]
     known_archives: list[str]
     archives: list[str]
+    profile_config_entries: list[str]
+    profile_config_entries_known: bool
+    profile_config_terminal: bool
 
 
 def escape_data_path(path: str) -> str:
@@ -203,6 +206,9 @@ def create_selection_state(
         "groundcover": _unique_names(configured["groundcover"]),
         "known_archives": _unique_names(available_archives, configured_archives),
         "archives": configured_archives,
+        "profile_config_entries": [],
+        "profile_config_entries_known": True,
+        "profile_config_terminal": False,
     }
 
 
@@ -258,7 +264,10 @@ def read_selection_state(state_path: Path) -> OpenMWSelectionState | None:
         "known_archives",
         "archives",
     )
-    if not isinstance(data, dict) or data.get("version") != _SELECTION_STATE_VERSION:
+    if not isinstance(data, dict) or data.get("version") not in (
+        1,
+        _SELECTION_STATE_VERSION,
+    ):
         raise ValueError(f"Unsupported OpenMW selection state: {state_path}")
     if any(
         not isinstance(data.get(key), list)
@@ -266,7 +275,27 @@ def read_selection_state(state_path: Path) -> OpenMWSelectionState | None:
         for key in keys
     ):
         raise ValueError(f"Invalid OpenMW selection state: {state_path}")
+    if data["version"] == _SELECTION_STATE_VERSION and (
+        not isinstance(data.get("profile_config_entries"), list)
+        or any(
+            not isinstance(value, str)
+            for value in data["profile_config_entries"]
+        )
+        or not isinstance(data.get("profile_config_entries_known"), bool)
+        or not isinstance(data.get("profile_config_terminal"), bool)
+    ):
+        raise ValueError(f"Invalid OpenMW selection state: {state_path}")
     return data
+
+
+def upgrade_selection_state(state: OpenMWSelectionState) -> bool:
+    if state["version"] == _SELECTION_STATE_VERSION:
+        return False
+    state["version"] = _SELECTION_STATE_VERSION
+    state["profile_config_entries"] = []
+    state["profile_config_entries_known"] = False
+    state["profile_config_terminal"] = False
+    return True
 
 
 def write_selection_state(
@@ -321,6 +350,107 @@ def _split_marked_blocks(
 
 def _without_marked_block(lines: Iterable[str], begin: str, end: str) -> list[str]:
     return _split_marked_blocks(lines, begin, end)[0]
+
+
+def _option_value(line: str, option: str) -> str | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, value = stripped.split("=", 1)
+    return value.strip() if key.strip().lower() == option else None
+
+
+def capture_profile_config_entries(cfg_path: Path) -> list[str]:
+    """Capture raw nested config options before making a profile terminal."""
+    return [
+        line for line in _read_lines(cfg_path) if _option_value(line, "config") is not None
+    ]
+
+
+def suspend_profile_config_entries(
+    state: OpenMWSelectionState, cfg_path: Path
+) -> bool:
+    """Save visible nested selectors and mark the profile as terminal."""
+    original = json.dumps(state, sort_keys=True)
+    visible = capture_profile_config_entries(cfg_path)
+    if state["profile_config_terminal"]:
+        saved_counts: dict[str, int] = {}
+        for line in state["profile_config_entries"]:
+            saved_counts[line] = saved_counts.get(line, 0) + 1
+        visible_counts: dict[str, int] = {}
+        for line in visible:
+            visible_counts[line] = visible_counts.get(line, 0) + 1
+            if visible_counts[line] > saved_counts.get(line, 0):
+                state["profile_config_entries"].append(line)
+    else:
+        state["profile_config_entries"] = visible
+    state["profile_config_terminal"] = True
+    return original != json.dumps(state, sort_keys=True)
+
+
+def restore_profile_config_entries(
+    cfg_path: Path, entries: Iterable[str]
+) -> bool:
+    """Restore suspended nested selectors without duplicating visible occurrences."""
+    lines = _read_lines(cfg_path)
+    existing_counts: dict[str, int] = {}
+    for line in capture_profile_config_entries(cfg_path):
+        existing_counts[line] = existing_counts.get(line, 0) + 1
+
+    seen: dict[str, int] = {}
+    missing: list[str] = []
+    for line in entries:
+        seen[line] = seen.get(line, 0) + 1
+        if seen[line] > existing_counts.get(line, 0):
+            missing.append(line)
+    if not missing:
+        return False
+    if lines and lines[-1].strip():
+        lines.append("")
+    lines.extend(missing)
+    _write_lines(cfg_path, lines)
+    return True
+
+
+def _parse_openmw_path(value: str) -> str:
+    if not value.startswith('"'):
+        return value.strip()
+    result: list[str] = []
+    escaped = False
+    for character in value[1:]:
+        if escaped:
+            result.append(character)
+            escaped = False
+        elif character == "&":
+            escaped = True
+        elif character == '"':
+            break
+        else:
+            result.append(character)
+    if escaped:
+        result.append("&")
+    return "".join(result)
+
+
+def read_profile_selector(cfg_path: Path) -> Path | None:
+    """Read the profile path from Fluorine's owned root selector block."""
+    _, blocks = _split_marked_blocks(
+        _read_lines(cfg_path), _PROFILE_BEGIN, _PROFILE_END
+    )
+    destinations: list[Path] = []
+    for block in blocks:
+        for line in block:
+            value = _option_value(line, "config")
+            if value is None:
+                continue
+            path = Path(_parse_openmw_path(value)).expanduser()
+            if not path.is_absolute():
+                path = cfg_path.parent / path
+            destinations.append(path.resolve(strict=False))
+    unique = list(dict.fromkeys(destinations))
+    if len(unique) > 1:
+        raise ValueError("Conflicting Fluorine OpenMW profile selectors")
+    return unique[0] if unique else None
 
 
 def _fsync_directory(path: Path) -> None:

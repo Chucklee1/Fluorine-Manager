@@ -36,9 +36,13 @@ from .openmw_support.openmw_cfg import (
     filter_selected_files,
     order_selected_files,
     read_openmw_selection,
+    read_profile_selector,
     read_selection_state,
+    restore_profile_config_entries,
     rollback_file_changes,
+    suspend_profile_config_entries,
     update_selection_state,
+    upgrade_selection_state,
     validate_file_roles,
     write_local_saves,
     write_openmw_cfg,
@@ -292,6 +296,28 @@ class OpenMWGame(BasicGame):
             root_target = root_cfg.resolve(strict=False)
             chained_profile = local_settings and profile_target != root_target
             cfg = profile_cfg if chained_profile else root_cfg
+            previous_profile_dir = read_profile_selector(root_cfg)
+            if previous_profile_dir is not None:
+                known_profiles: dict[Path, str] = {}
+                for profile_name in organizer.profileNames():
+                    known_profile = organizer.getProfile(profile_name)
+                    if known_profile is None:
+                        continue
+                    known_path = Path(
+                        known_profile.absolutePath()
+                    ).resolve(strict=False)
+                    if known_path in known_profiles:
+                        raise ValueError(
+                            "OpenMW profiles resolve to the same directory: "
+                            f"{known_profiles[known_path]} and {profile_name}"
+                        )
+                    known_profiles[known_path] = str(profile_name)
+                if previous_profile_dir not in known_profiles:
+                    qWarning(
+                        "OpenMW: ignoring previous Fluorine profile selector "
+                        f"that is not a known profile: {previous_profile_dir}"
+                    )
+                    previous_profile_dir = None
             selection_cfg = (
                 profile_cfg
                 if chained_profile and profile_cfg.is_file()
@@ -410,6 +436,7 @@ class OpenMWGame(BasicGame):
             state_path = profile_dir / _SELECTION_STATE_FILE
             state = read_selection_state(state_path)
             state_dirty = False
+            state_upgraded = False
             if state is None:
                 state = create_selection_state(
                     configured,
@@ -419,12 +446,68 @@ class OpenMWGame(BasicGame):
                     self._read_archives_txt(),
                 )
                 state_dirty = True
+            else:
+                state_upgraded = upgrade_selection_state(state)
+                state_dirty = state_upgraded
+            if (
+                state_upgraded
+                and previous_profile_dir == profile_dir.resolve(strict=False)
+            ):
+                state["profile_config_terminal"] = True
+                qWarning(
+                    "OpenMW: migrated a previously terminal profile without a "
+                    "nested config backup; selectors removed by an older "
+                    "Fluorine version cannot be recovered automatically."
+                )
 
             groundcover = self._read_groundcover_txt(state["groundcover"])
             if update_selection_state(
                 state, all_plugins, bsa_archives, groundcover
             ):
                 state_dirty = True
+            if chained_profile and suspend_profile_config_entries(
+                state, profile_cfg
+            ):
+                state_dirty = True
+
+            restore_current_profile = (
+                not chained_profile and state["profile_config_terminal"]
+            )
+            if restore_current_profile:
+                state["profile_config_terminal"] = False
+                state_dirty = True
+
+            previous_state_path: Path | None = None
+            previous_cfg: Path | None = None
+            previous_state = None
+            previous_state_dirty = False
+            restore_previous_profile = False
+            if (
+                previous_profile_dir is not None
+                and previous_profile_dir != profile_dir.resolve(strict=False)
+            ):
+                candidate_state_path = (
+                    previous_profile_dir / _SELECTION_STATE_FILE
+                )
+                candidate_state = read_selection_state(candidate_state_path)
+                if candidate_state is not None:
+                    previous_state_path = candidate_state_path
+                    previous_cfg = previous_profile_dir / "openmw.cfg"
+                    previous_state = candidate_state
+                    previous_state_dirty = upgrade_selection_state(previous_state)
+                    if previous_state_dirty:
+                        previous_state["profile_config_terminal"] = True
+                        qWarning(
+                            "OpenMW: previous profile was terminal before nested "
+                            "config backups were available; removed selectors "
+                            "cannot be recovered automatically."
+                        )
+                    restore_previous_profile = previous_state[
+                        "profile_config_terminal"
+                    ]
+                    if restore_previous_profile:
+                        previous_state["profile_config_terminal"] = False
+                        previous_state_dirty = True
             gc_lower = {g.lower() for g in groundcover}
 
             # loadorder.txt contains disabled plugins too, so preserve activation
@@ -466,10 +549,16 @@ class OpenMWGame(BasicGame):
             }
             if profile_target != root_target:
                 file_roles["profile config"] = profile_cfg
+            if previous_cfg is not None and (
+                restore_previous_profile or previous_state_dirty
+            ):
+                file_roles["previous profile config"] = previous_cfg
+            if previous_state_path is not None and previous_state_dirty:
+                file_roles["previous profile state"] = previous_state_path
             validate_file_roles(file_roles)
 
             with rollback_file_changes(file_roles.values()):
-                if state_dirty:
+                if state_dirty and chained_profile:
                     write_selection_state(state_path, state)
                 write_openmw_cfg(
                     cfg,
@@ -521,6 +610,28 @@ class OpenMWGame(BasicGame):
                     if profile_target != root_target:
                         write_local_saves(profile_cfg, None, log_fn=log_fn)
                     write_profile_selector(root_cfg, None, log_fn=log_fn)
+                    if restore_current_profile:
+                        restore_profile_config_entries(
+                            profile_cfg, state["profile_config_entries"]
+                        )
+                    if state_dirty:
+                        write_selection_state(state_path, state)
+
+                if (
+                    restore_previous_profile
+                    and previous_cfg is not None
+                    and previous_state is not None
+                ):
+                    restore_profile_config_entries(
+                        previous_cfg,
+                        previous_state["profile_config_entries"],
+                    )
+                if (
+                    previous_state_dirty
+                    and previous_state_path is not None
+                    and previous_state is not None
+                ):
+                    write_selection_state(previous_state_path, previous_state)
             qInfo(
                 f"OpenMW: wrote {len(data_dirs)} data dir(s) and "
                 f"{len(content)} content plugin(s) to {cfg}."

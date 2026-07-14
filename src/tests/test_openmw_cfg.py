@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import tempfile
 import unittest
@@ -191,6 +192,170 @@ class OpenMWConfigTests(unittest.TestCase):
 
             self.assertEqual(openmw_cfg.read_selection_state(state_path), state)
             self.assertTrue(state_path.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_migrates_version_one_selection_state(self) -> None:
+        state_v1 = {
+            "version": 1,
+            "known_plugins": ["Known.esp"],
+            "enabled_plugins": ["Known.esp"],
+            "groundcover": [],
+            "known_archives": ["Known.bsa"],
+            "archives": ["Known.bsa"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "fluorine-openmw-selection.json"
+            state_path.write_text(json.dumps(state_v1), encoding="utf-8")
+            state = openmw_cfg.read_selection_state(state_path)
+            self.assertIsNotNone(state)
+
+            self.assertTrue(openmw_cfg.upgrade_selection_state(state))
+            self.assertEqual(state["version"], 2)
+            self.assertEqual(state["profile_config_entries"], [])
+            self.assertFalse(state["profile_config_entries_known"])
+            self.assertFalse(state["profile_config_terminal"])
+            self.assertFalse(openmw_cfg.upgrade_selection_state(state))
+
+    def test_suspends_and_restores_exact_profile_config_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg_path = Path(temporary) / "openmw.cfg"
+            entries = [
+                '  Config = "../Nested &"Config"  ',
+                "config=?local?/nested",
+                "config=?local?/nested",
+            ]
+            cfg_path.write_text(
+                "setting=value\n" + "\n".join(entries) + "\ncontent=Old.esp\n",
+                encoding="utf-8",
+            )
+            state = openmw_cfg.create_selection_state(
+                {
+                    "content": ["Old.esp"],
+                    "groundcover": [],
+                    "fallback-archive": [],
+                },
+                loadorder=["Old.esp"],
+                available_plugins=["Old.esp"],
+                available_archives=[],
+            )
+
+            self.assertTrue(
+                openmw_cfg.suspend_profile_config_entries(state, cfg_path)
+            )
+            self.assertEqual(state["profile_config_entries"], entries)
+            self.assertTrue(state["profile_config_entries_known"])
+            self.assertTrue(state["profile_config_terminal"])
+
+            openmw_cfg.write_openmw_cfg(
+                cfg_path,
+                data_dirs=["/data"],
+                content_plugins=["Old.esp"],
+                strip_config=True,
+                vanilla_masters=(),
+                vanilla_bsas=(),
+            )
+            self.assertEqual(
+                openmw_cfg.capture_profile_config_entries(cfg_path), []
+            )
+            self.assertFalse(
+                openmw_cfg.suspend_profile_config_entries(state, cfg_path)
+            )
+
+            self.assertTrue(
+                openmw_cfg.restore_profile_config_entries(
+                    cfg_path, state["profile_config_entries"]
+                )
+            )
+            self.assertEqual(
+                openmw_cfg.capture_profile_config_entries(cfg_path), entries
+            )
+            self.assertFalse(
+                openmw_cfg.restore_profile_config_entries(
+                    cfg_path, state["profile_config_entries"]
+                )
+            )
+
+    def test_restores_entries_captured_with_unknown_legacy_backup(self) -> None:
+        state = openmw_cfg.create_selection_state(
+            {"content": [], "groundcover": [], "fallback-archive": []},
+            loadorder=[],
+            available_plugins=[],
+            available_archives=[],
+        )
+        state["profile_config_entries_known"] = False
+        state["profile_config_terminal"] = True
+        with tempfile.TemporaryDirectory() as temporary:
+            cfg_path = Path(temporary) / "openmw.cfg"
+            cfg_path.write_text("config=../re-added\n", encoding="utf-8")
+
+            self.assertTrue(
+                openmw_cfg.suspend_profile_config_entries(state, cfg_path)
+            )
+            self.assertFalse(state["profile_config_entries_known"])
+            self.assertEqual(
+                state["profile_config_entries"], ["config=../re-added"]
+            )
+            openmw_cfg.write_openmw_cfg(
+                cfg_path,
+                data_dirs=["/data"],
+                content_plugins=[],
+                strip_config=True,
+                vanilla_masters=(),
+                vanilla_bsas=(),
+            )
+
+            self.assertTrue(
+                openmw_cfg.restore_profile_config_entries(
+                    cfg_path, state["profile_config_entries"]
+                )
+            )
+            self.assertEqual(
+                openmw_cfg.capture_profile_config_entries(cfg_path),
+                ["config=../re-added"],
+            )
+
+    def test_profile_selector_path_round_trips_escaped_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cfg_path = directory / "openmw.cfg"
+            profile_path = directory / 'Profile & "Quoted"'
+
+            openmw_cfg.write_profile_selector(cfg_path, profile_path)
+
+            self.assertEqual(
+                openmw_cfg.read_profile_selector(cfg_path),
+                profile_path.resolve(strict=False),
+            )
+
+    def test_config_restoration_rolls_back_with_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            cfg_path = directory / "openmw.cfg"
+            state_path = directory / "fluorine-openmw-selection.json"
+            cfg_path.write_text("terminal=true\n", encoding="utf-8")
+            state = openmw_cfg.create_selection_state(
+                {"content": [], "groundcover": [], "fallback-archive": []},
+                loadorder=[],
+                available_plugins=[],
+                available_archives=[],
+            )
+            state["profile_config_entries"] = ["config=../nested"]
+            state["profile_config_terminal"] = True
+            openmw_cfg.write_selection_state(state_path, state)
+            original_state = state_path.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                with openmw_cfg.rollback_file_changes([cfg_path, state_path]):
+                    openmw_cfg.restore_profile_config_entries(
+                        cfg_path, state["profile_config_entries"]
+                    )
+                    state["profile_config_terminal"] = False
+                    openmw_cfg.write_selection_state(state_path, state)
+                    raise RuntimeError("injected failure")
+
+            self.assertEqual(
+                cfg_path.read_text(encoding="utf-8"), "terminal=true\n"
+            )
+            self.assertEqual(state_path.read_text(encoding="utf-8"), original_state)
 
     def test_transaction_rolls_back_existing_and_new_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
