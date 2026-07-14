@@ -12,6 +12,10 @@ add_test(
     NAME test_openmw_cfg
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_openmw_cfg.py
 )
+add_test(
+    NAME test_flatpak_access
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_flatpak_access.py
+)
 
 # ---------------------------------------------------------------------------
 # TES3 metadata and OpenMW Player stub parsing tests

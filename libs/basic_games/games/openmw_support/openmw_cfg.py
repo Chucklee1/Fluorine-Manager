@@ -63,6 +63,10 @@ _LOCAL_SAVES_ORIGINAL = "# FLUORINE ORIGINAL USER-DATA "
 
 _SELECTION_KEYS = ("content", "groundcover", "fallback-archive")
 _SELECTION_STATE_VERSION = 2
+_OPENMW_NATIVE_SUFFIXES = (".omwaddon", ".omwgame", ".omwscripts")
+_OPENMW_PLAYER_STUB_SUFFIXES = tuple(
+    suffix + ".esp" for suffix in _OPENMW_NATIVE_SUFFIXES
+)
 
 
 class OpenMWSelectionState(TypedDict):
@@ -75,6 +79,13 @@ class OpenMWSelectionState(TypedDict):
     profile_config_entries: list[str]
     profile_config_entries_known: bool
     profile_config_terminal: bool
+
+
+def find_openmw_cfg(
+    native_cfg: Path, flatpak_cfg: Path, flatpak_launch: bool
+) -> Path | None:
+    candidate = flatpak_cfg if flatpak_launch else native_cfg
+    return candidate if candidate.is_file() else None
 
 
 def escape_data_path(path: str) -> str:
@@ -176,6 +187,72 @@ def collapse_file_providers(available: Iterable[str]) -> list[str]:
             positions[folded] = len(result)
             result.append(name)
     return result
+
+
+def is_openmw_player_stub(name: str) -> bool:
+    return name.casefold().endswith(_OPENMW_PLAYER_STUB_SUFFIXES)
+
+
+def destub_plugin_name(name: str) -> str:
+    return name[:-4] if is_openmw_player_stub(name) else name
+
+
+def normalize_plugin_loadorder(names: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in names:
+        name = destub_plugin_name(raw)
+        folded = name.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            result.append(name)
+    return result
+
+
+def order_plugins_by_loadorder(
+    available: Iterable[str], loadorder: Iterable[str]
+) -> list[str]:
+    available = collapse_file_providers(available)
+    normalized = normalize_plugin_loadorder(loadorder)
+    if not normalized:
+        return available
+    rank = {name.casefold(): index for index, name in enumerate(normalized)}
+    return sorted(
+        available,
+        key=lambda name: (
+            (0, rank[name.casefold()])
+            if name.casefold() in rank
+            else (1, 0)
+        ),
+    )
+
+
+def unranked_native_plugins(
+    content_plugins: Iterable[str], loadorder: Iterable[str]
+) -> list[str]:
+    normalized = normalize_plugin_loadorder(loadorder)
+    if not normalized:
+        return []
+    ranked = {name.casefold() for name in normalized}
+    result: list[str] = []
+    seen: set[str] = set()
+    for name in content_plugins:
+        folded = name.casefold()
+        if (
+            folded.endswith(_OPENMW_NATIVE_SUFFIXES)
+            and folded not in ranked
+            and folded not in seen
+        ):
+            seen.add(folded)
+            result.append(name)
+    return result
+
+
+def format_name_sample(names: Iterable[str], limit: int = 10) -> str:
+    names = list(names)
+    shown = ", ".join(repr(name) for name in names[:limit])
+    omitted = len(names) - limit
+    return f"{shown} (+{omitted} more)" if omitted > 0 else shown
 
 
 def create_selection_state(

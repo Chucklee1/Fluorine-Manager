@@ -25,6 +25,91 @@ SPEC.loader.exec_module(openmw_cfg)
 
 
 class OpenMWConfigTests(unittest.TestCase):
+    def test_selects_only_the_launch_type_config_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            native = directory / "native" / "openmw.cfg"
+            flatpak = directory / "flatpak" / "openmw.cfg"
+            flatpak.parent.mkdir()
+            flatpak.write_text("flatpak\n", encoding="utf-8")
+
+            self.assertIsNone(openmw_cfg.find_openmw_cfg(native, flatpak, False))
+            self.assertEqual(
+                openmw_cfg.find_openmw_cfg(native, flatpak, True), flatpak
+            )
+
+            native.parent.mkdir()
+            native.write_text("native\n", encoding="utf-8")
+            self.assertEqual(
+                openmw_cfg.find_openmw_cfg(native, flatpak, False), native
+            )
+
+    def test_normalizes_openmw_player_stub_loadorder(self) -> None:
+        self.assertEqual(
+            openmw_cfg.normalize_plugin_loadorder(
+                [
+                    "Addon.omwaddon.esp",
+                    "addon.OMWADDON.ESP",
+                    "Game.omwgame.ESP",
+                    "Scripts.OMWSCRIPTS.esp",
+                    "Ordinary.esp",
+                ]
+            ),
+            [
+                "Addon.omwaddon",
+                "Game.omwgame",
+                "Scripts.OMWSCRIPTS",
+                "Ordinary.esp",
+            ],
+        )
+        self.assertTrue(openmw_cfg.is_openmw_player_stub("Addon.OMWADDON.esp"))
+        self.assertFalse(openmw_cfg.is_openmw_player_stub("Ordinary.esp"))
+
+    def test_loadorder_keeps_ranked_plugins_before_unranked_plugins(self) -> None:
+        self.assertEqual(
+            openmw_cfg.order_plugins_by_loadorder(
+                ["Unranked.omwaddon", "Ranked.omwaddon"],
+                ["Duplicate.esp", "duplicate.ESP", "Ranked.omwaddon.esp"],
+            ),
+            ["Ranked.omwaddon", "Unranked.omwaddon"],
+        )
+
+    def test_loadorder_collapses_duplicate_providers(self) -> None:
+        self.assertEqual(
+            openmw_cfg.order_plugins_by_loadorder(
+                ["Addon.omwaddon", "ADDON.OMWADDON"],
+                ["Addon.omwaddon.esp"],
+            ),
+            ["ADDON.OMWADDON"],
+        )
+
+    def test_reports_only_unranked_native_content(self) -> None:
+        self.assertEqual(
+            openmw_cfg.unranked_native_plugins(
+                [
+                    "Ranked.omwaddon",
+                    "Unranked.omwscripts",
+                    "Ordinary.esp",
+                    "Master.esm",
+                    "UNRANKED.OMWSCRIPTS",
+                ],
+                ["Ranked.omwaddon.esp"],
+            ),
+            ["Unranked.omwscripts"],
+        )
+        self.assertEqual(
+            openmw_cfg.unranked_native_plugins(
+                ["Unranked.omwscripts"], []
+            ),
+            [],
+        )
+
+    def test_formats_bounded_unranked_name_sample(self) -> None:
+        self.assertEqual(
+            openmw_cfg.format_name_sample(["One", "Two", "Three"], limit=2),
+            "'One', 'Two' (+1 more)",
+        )
+
     def test_reads_curated_selection_and_deduplicates_names(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             cfg_path = Path(temporary) / "openmw.cfg"

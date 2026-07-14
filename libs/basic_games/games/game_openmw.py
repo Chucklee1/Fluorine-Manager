@@ -30,10 +30,20 @@ from PyQt6.QtCore import QDir, QFileInfo, qInfo, qWarning
 import mobase
 
 from ..basic_game import BasicGame
+from .openmw_support.flatpak_access import (
+    PathRequirement,
+    format_access_failures,
+    merge_requirements,
+    probe_flatpak_access,
+)
 from .openmw_support.openmw_cfg import (
-    collapse_file_providers,
     create_selection_state,
+    find_openmw_cfg,
+    format_name_sample,
     filter_selected_files,
+    is_openmw_player_stub,
+    normalize_plugin_loadorder,
+    order_plugins_by_loadorder,
     order_selected_files,
     read_openmw_selection,
     read_profile_selector,
@@ -42,6 +52,7 @@ from .openmw_support.openmw_cfg import (
     rollback_file_changes,
     suspend_profile_config_entries,
     update_selection_state,
+    unranked_native_plugins,
     upgrade_selection_state,
     validate_file_roles,
     write_local_saves,
@@ -71,15 +82,7 @@ def _flatpak_installed() -> bool:
 
 def _detect_openmw_cfg(prefer_flatpak: bool) -> Path | None:
     """Return the openmw.cfg to manage, or None if none exists yet."""
-    candidates = (
-        [_FLATPAK_CFG, _native_cfg()]
-        if prefer_flatpak
-        else [_native_cfg(), _FLATPAK_CFG]
-    )
-    for cfg in candidates:
-        if cfg.is_file():
-            return cfg
-    return None
+    return find_openmw_cfg(_native_cfg(), _FLATPAK_CFG, prefer_flatpak)
 
 
 # Directories/extensions that mark a folder as valid OpenMW/Morrowind mod data.
@@ -90,31 +93,7 @@ _VALID_DIRS = {
 }
 _PLUGIN_EXTS = {".esp", ".esm", ".omwaddon", ".omwgame", ".omwscripts"}
 
-# Kezyma's "OpenMW Player" drops an empty TES3 stub ESP next to each
-# OpenMW-native plugin so MO2's right pane can list and order it. The stub is
-# named "<plugin>.esp" (e.g. "Sun's Dusk.omwaddon.esp" for the real
-# "Sun's Dusk.omwaddon"). MO2's loadorder.txt therefore records STUB names, but
-# we emit the real files (_scan_mod skips the stubs), so a stub's rank must be
-# mapped onto the real name when sorting content= — otherwise every
-# .omwaddon/.omwscripts/.omwgame plugin is unranked and the content= sort
-# ignores master-before-dependent order (e.g. SDServiceRefusal.omwaddon before
-# its parent Sun's Dusk.omwaddon, which makes OpenMW abort on launch).
-_KEZYMA_STUB_SUFFIXES = (".omwaddon.esp", ".omwscripts.esp", ".omwgame.esp")
 _SELECTION_STATE_FILE = "fluorine-openmw-selection.json"
-
-
-def _destub_plugin_name(name: str) -> str:
-    """Return the real OpenMW-native plugin name for a Kezyma stub, else ``name``.
-
-    Strips the trailing ``.esp`` wrapper from names like
-    ``Sun's Dusk.omwaddon.esp`` -> ``Sun's Dusk.omwaddon``. Real .esp/.esm plugins
-    (no OpenMW-native stem) and names that are already real pass through
-    unchanged. The suffix check is case-insensitive; the returned name
-    preserves the original casing of the stem.
-    """
-    if name.lower().endswith(_KEZYMA_STUB_SUFFIXES):
-        return name[:-4]  # strip the trailing ".esp" wrapper
-    return name
 
 
 class OpenMWModDataChecker(mobase.ModDataChecker):
@@ -248,8 +227,8 @@ class OpenMWGame(BasicGame):
         for raw in lo_file.read_text(encoding="utf-8", errors="replace").splitlines():
             line = raw.strip()
             if line and not line.startswith("#"):
-                out.append(_destub_plugin_name(line))
-        return out
+                out.append(line)
+        return normalize_plugin_loadorder(out)
 
     def _read_archives_txt(self) -> list[str]:
         """Read additional enabled archives from the active MO2 profile."""
@@ -372,14 +351,13 @@ class OpenMWGame(BasicGame):
                 for f in entries:
                     if not f.is_file():
                         continue
-                    low = f.name.lower()
                     # Skip Kezyma "OpenMW Player" stub esps: empty TES3 esps named
                     # <name>.omwaddon.esp / <name>.omwscripts.esp that some MO2<->OpenMW
                     # tools drop next to the real .omwaddon/.omwscripts purely so the
                     # entry shows up in MO2's plugin list. The real file is scanned
                     # separately; loading the empty stub as content= is at best useless
                     # and at worst aborts OpenMW ("sub-record incomplete").
-                    if low.endswith(_KEZYMA_STUB_SUFFIXES):
+                    if is_openmw_player_stub(f.name):
                         continue
                     ext = f.suffix.lower()
                     if ext in {".esm", ".omwgame"}:
@@ -415,22 +393,48 @@ class OpenMWGame(BasicGame):
             except Exception:
                 pass
 
+            if Path(app_name).name.casefold() == "flatpak":
+                flatpak = (
+                    app_name
+                    if Path(app_name).is_file()
+                    else shutil.which("flatpak")
+                )
+                if not flatpak:
+                    raise RuntimeError("Flatpak executable is unavailable")
+                requirements = [
+                    PathRequirement(path, False) for path in data_dirs
+                ]
+                requirements.append(
+                    PathRequirement(root_cfg.parent, not chained_profile)
+                )
+                if chained_profile or local_saves:
+                    requirements.append(PathRequirement(profile_dir, True))
+                requirements = merge_requirements(requirements)
+                failures = probe_flatpak_access(
+                    flatpak, _FLATPAK_ID, requirements
+                )
+                if failures:
+                    qWarning(
+                        "OpenMW: Flatpak sandbox access preflight failed:\n"
+                        f"{format_access_failures(failures)}\n"
+                        "Grant narrowly scoped access with 'flatpak override "
+                        f"--user --filesystem=PATH {_FLATPAK_ID}'."
+                    )
+                    return False
+                qInfo(
+                    "OpenMW: Flatpak sandbox access preflight passed for "
+                    f"{len(requirements)} path(s)."
+                )
+
             # content=: masters → normal plugins → Lua scripts (see _scan_mod),
             # minus any the user routed to groundcover. build_managed_block
             # prepends the vanilla masters and dedups case-insensitively, so a mod
             # re-shipping a vanilla esm (or two mods sharing a plugin name) won't
             # produce duplicate content= lines.
-            all_plugins = masters + normal_plugins + omw_scripts
             loadorder = self._read_loadorder_txt()
-            if loadorder:
-                rank = {name.lower(): i for i, name in enumerate(loadorder)}
-                # Stable sort: ranked plugins by loadorder.txt position, unranked
-                # (.omwaddon/.omwscripts/.omwgame not in MO2's list) keep their
-                # current order after all ranked ones.
-                all_plugins.sort(
-                    key=lambda p: rank.get(p.lower(), len(rank))
-                )
-            all_plugins = collapse_file_providers(all_plugins)
+            all_plugins = order_plugins_by_loadorder(
+                masters + normal_plugins + omw_scripts, loadorder
+            )
             plugin_lower = {p.lower() for p in all_plugins}
 
             state_path = profile_dir / _SELECTION_STATE_FILE
@@ -516,6 +520,13 @@ class OpenMWGame(BasicGame):
                 all_plugins, state["enabled_plugins"]
             )
             content = [p for p in enabled_plugins if p.lower() not in gc_lower]
+            unranked = unranked_native_plugins(content, loadorder)
+            if unranked:
+                qWarning(
+                    f"OpenMW: {len(unranked)} enabled native content file(s) "
+                    "have no loadorder.txt rank and will use fallback order: "
+                    f"{format_name_sample(unranked)}"
+                )
             # Only emit groundcover= for plugins that are actually present/active.
             enabled_lower = {p.lower() for p in enabled_plugins}
             active_groundcover = [
