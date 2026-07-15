@@ -6,7 +6,7 @@ project(ModOrganizer2 VERSION 2.5.3 LANGUAGES C CXX)
 # ---------------------------------------------------------------------------
 set(FLUORINE_VERSION_MAJOR 0)
 set(FLUORINE_VERSION_MINOR 3)
-set(FLUORINE_VERSION_PATCH 0)
+set(FLUORINE_VERSION_PATCH 1)
 set(FLUORINE_BUILD_CHANNEL "stable" CACHE STRING
     "Build channel: 'stable' for tagged releases, 'beta' for rolling CI builds")
 set(FLUORINE_BUILD_TIMESTAMP "" CACHE STRING

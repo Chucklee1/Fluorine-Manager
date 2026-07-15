@@ -5,6 +5,8 @@
 #include "nxmaccessmanager.h"
 #include "settings.h"
 
+#include <fluorine_build_info.h>
+
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -175,7 +177,7 @@ void NexusCollections::checkAuth()
   QNetworkRequest req(QUrl(QLatin1String(REST_V1_URL) + "/users/validate.json"));
   req.setRawHeader("APIKEY", tokens.apiKey.toUtf8());
   req.setRawHeader("Application-Name", "MO2");
-  req.setRawHeader("Application-Version", "0.3.0");
+  req.setRawHeader("Application-Version", FLUORINE_VERSION_STRING);
   req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
 
   auto* legacyReply = m_nam.get(req);
