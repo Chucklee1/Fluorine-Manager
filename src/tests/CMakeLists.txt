@@ -3,6 +3,59 @@ cmake_minimum_required(VERSION 3.16)
 find_package(Qt6 REQUIRED COMPONENTS Core)
 find_package(GTest REQUIRED)
 find_package(SQLite3 REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+# ---------------------------------------------------------------------------
+# OpenMW native config generation tests
+# ---------------------------------------------------------------------------
+add_test(
+    NAME test_openmw_cfg
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_openmw_cfg.py
+)
+add_test(
+    NAME test_flatpak_access
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_flatpak_access.py
+)
+
+# ---------------------------------------------------------------------------
+# TES3 metadata and OpenMW Player stub parsing tests
+# ---------------------------------------------------------------------------
+add_executable(test_esptk_tes3 EXCLUDE_FROM_ALL
+    test_esptk_tes3.cpp
+)
+set_target_properties(test_esptk_tes3 PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_link_libraries(test_esptk_tes3 PRIVATE
+    mo2::esptk
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_esptk_tes3 COMMAND test_esptk_tes3)
+
+# ---------------------------------------------------------------------------
+# Session-only plugin compatibility policy tests
+# ---------------------------------------------------------------------------
+add_executable(test_plugincompatibility EXCLUDE_FROM_ALL
+    test_plugincompatibility.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/plugincompatibility.cpp
+)
+set_target_properties(test_plugincompatibility PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_plugincompatibility PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_plugincompatibility PRIVATE
+    Qt6::Core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_plugincompatibility COMMAND test_plugincompatibility)
 
 # ---------------------------------------------------------------------------
 # meta.ini case-normalization helper tests
@@ -125,5 +178,6 @@ add_test(NAME test_vfs_catalog COMMAND test_vfs_catalog)
 
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
-    DEPENDS test_metainiutils test_external_dir_mapping test_overwrite_duplicates
-            test_vfs_file_ops test_vfs_catalog)
+    DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
+            test_external_dir_mapping test_overwrite_duplicates test_vfs_file_ops
+            test_vfs_catalog)

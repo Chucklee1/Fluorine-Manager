@@ -1,10 +1,38 @@
 #include "espfile.h"
 #include "espexceptions.h"
 #include "subrecord.h"
-#include "tes3subrecord.h"
-#include <bitset>
+#include <algorithm>
+#include <array>
 #include <cstring>
 #include <sstream>
+#include <vector>
+
+namespace
+{
+
+uint32_t decodeLittleEndian32(const unsigned char* bytes)
+{
+  return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+         (static_cast<uint32_t>(bytes[2]) << 16) |
+         (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+void readExact(std::istream& stream, void* destination, std::streamsize size,
+               const char* message)
+{
+  if (!stream.read(static_cast<char*>(destination), size)) {
+    throw ESP::InvalidRecordException(message);
+  }
+}
+
+std::string boundedString(const unsigned char* bytes, size_t size)
+{
+  const auto* end = std::find(bytes, bytes + size, 0);
+  return std::string(reinterpret_cast<const char*>(bytes),
+                     static_cast<size_t>(end - bytes));
+}
+
+}  // namespace
 
 ESP::File::File(const std::string& fileName)
 {
@@ -69,36 +97,82 @@ void ESP::File::init()
     throw ESP::InvalidFileException("file incomplete");
   }
   if (memcmp(type, "TES3", 4) == 0) {
-    ESP::TES3Record rec;
-    rec.readFrom(m_File);
+    m_IsTES3 = true;
 
-    while (!m_File.eof() && !m_File.fail()) {
-      ESP::TES3SubRecord subRec;
-      bool success   = subRec.readFrom(m_File);
-      int headerSize = sizeof(m_TES3Header);
-      if (success) {
-        if (subRec.type() != TES3SubRecord::TYPE_UNKNOWN) {
-          switch (subRec.type()) {
-          case TES3SubRecord::TYPE_HEDR:
-            if (subRec.data().size() != sizeof(m_TES3Header)) {
-              printf("invalid header size\n");
-              m_Header.version    = 0.0f;
-              m_Header.numRecords = 1;  // prevent this esp appear like a dummy
-            } else {
-              memcpy(&m_TES3Header, &subRec.data()[0], sizeof(m_TES3Header));
-            }
-            m_Header.version    = m_TES3Header.version;
-            m_Header.numRecords = m_TES3Header.numRecords;
-            m_Author            = reinterpret_cast<const char*>(m_TES3Header.author);
-            m_Description = reinterpret_cast<const char*>(m_TES3Header.description);
-            break;
-          case TES3SubRecord::TYPE_MAST:
-            if (subRec.data().size() > 0)
-              m_Masters.insert(reinterpret_cast<const char*>(&subRec.data()[0]));
-            break;
-          }
+    ESP::TES3Record rec;
+    if (!rec.readFrom(m_File)) {
+      throw ESP::InvalidRecordException("TES3 record header incomplete");
+    }
+
+    const auto payloadStart = m_File.tellg();
+    m_File.seekg(0, std::ios::end);
+    const auto fileEnd = m_File.tellg();
+    if (payloadStart < 0 || fileEnd < payloadStart ||
+        static_cast<uint64_t>(fileEnd - payloadStart) < rec.dataSize()) {
+      throw ESP::InvalidRecordException("TES3 record data incomplete");
+    }
+    m_File.seekg(payloadStart);
+
+    uint32_t remaining = rec.dataSize();
+    bool hasHeader     = false;
+    while (remaining > 0) {
+      if (remaining < 8) {
+        throw ESP::InvalidRecordException("TES3 sub-record header incomplete");
+      }
+
+      std::array<char, 4> subrecordType{};
+      std::array<unsigned char, 4> sizeBytes{};
+      readExact(m_File, subrecordType.data(), subrecordType.size(),
+                "TES3 sub-record type incomplete");
+      readExact(m_File, sizeBytes.data(), sizeBytes.size(),
+                "TES3 sub-record size incomplete");
+      remaining -= 8;
+
+      const uint32_t dataSize = decodeLittleEndian32(sizeBytes.data());
+      if (dataSize > remaining) {
+        throw ESP::InvalidRecordException("TES3 sub-record data exceeds record size");
+      }
+
+      if (memcmp(subrecordType.data(), "HEDR", 4) == 0) {
+        constexpr size_t headerSize = 300;
+        if (dataSize != headerSize) {
+          throw ESP::InvalidRecordException("invalid TES3 HEDR size");
+        }
+
+        std::array<unsigned char, headerSize> header{};
+        readExact(m_File, header.data(), header.size(), "TES3 HEDR incomplete");
+
+        const uint32_t versionBits = decodeLittleEndian32(header.data());
+        static_assert(sizeof(m_Header.version) == sizeof(versionBits));
+        memcpy(&m_Header.version, &versionBits, sizeof(versionBits));
+        m_TES3Master  = (decodeLittleEndian32(header.data() + 4) & 1U) != 0;
+        m_Author      = boundedString(header.data() + 8, 32);
+        m_Description = boundedString(header.data() + 40, 256);
+        m_Header.numRecords =
+            static_cast<int32_t>(decodeLittleEndian32(header.data() + 296));
+        hasHeader = true;
+      } else if (memcmp(subrecordType.data(), "MAST", 4) == 0) {
+        constexpr uint32_t maxMasterNameSize = 4096;
+        if (dataSize > maxMasterNameSize) {
+          throw ESP::InvalidRecordException("TES3 MAST is unreasonably large");
+        }
+        std::vector<unsigned char> master(dataSize);
+        if (dataSize > 0) {
+          readExact(m_File, master.data(), master.size(), "TES3 MAST incomplete");
+          m_Masters.insert(boundedString(master.data(), master.size()));
+        }
+      } else {
+        m_File.seekg(static_cast<std::streamoff>(dataSize), std::ios::cur);
+        if (!m_File) {
+          throw ESP::InvalidRecordException("TES3 sub-record data incomplete");
         }
       }
+
+      remaining -= dataSize;
+    }
+
+    if (!hasHeader) {
+      throw ESP::InvalidRecordException("TES3 record has no HEDR sub-record");
     }
   } else if (memcmp(type, "TES4", 4) == 0) {
     m_File.seekg(0);
@@ -129,6 +203,9 @@ void ESP::File::init()
             break;
           case SubRecord::TYPE_SNAM:
             onSNAM(rec);
+            break;
+          case SubRecord::TYPE_UNKNOWN:
+          case SubRecord::TYPE_ONAM:
             break;
           }
         }
@@ -177,6 +254,9 @@ ESP::Record ESP::File::readRecord()
 
 bool ESP::File::isMaster() const
 {
+  if (m_IsTES3) {
+    return m_TES3Master;
+  }
   return m_MainRecord.flagSet(Record::FLAG_MASTER);
 }
 

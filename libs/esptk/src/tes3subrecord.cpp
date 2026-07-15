@@ -1,9 +1,21 @@
 #include "tes3subrecord.h"
 #include "espexceptions.h"
-#include "esptypes.h"
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+
+namespace
+{
+
+uint32_t decodeLittleEndian32(const unsigned char* bytes)
+{
+  return static_cast<uint32_t>(bytes[0]) | (static_cast<uint32_t>(bytes[1]) << 8) |
+         (static_cast<uint32_t>(bytes[2]) << 16) |
+         (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+}  // namespace
 
 ESP::TES3SubRecord::TES3SubRecord() : m_Type(TYPE_UNKNOWN), m_Data() {}
 
@@ -26,18 +38,20 @@ bool ESP::TES3SubRecord::readFrom(std::istream& stream, uint32_t sizeOverride)
   }
   typeString[4] = '\0';  // not sure if this is required, shouldn't be
   auto iter     = s_TypeMap.find(std::string(typeString));
-  uint32_t dataSize;
-  if (iter != s_TypeMap.end()) {
-    m_Type   = iter->second;
-    dataSize = readType<uint32_t>(stream);
-  } else {
-    m_Type   = TYPE_UNKNOWN;
-    dataSize = readType<uint32_t>(stream);
-    stream.seekg(8, std::istream::cur);
+  m_Type        = iter != s_TypeMap.end() ? iter->second : TYPE_UNKNOWN;
+
+  std::array<unsigned char, 4> sizeBytes{};
+  if (!stream.read(reinterpret_cast<char*>(sizeBytes.data()), sizeBytes.size())) {
+    throw ESP::InvalidRecordException("sub-record size incomplete");
   }
+  uint32_t dataSize = decodeLittleEndian32(sizeBytes.data());
 
   if (sizeOverride != 0UL) {
     dataSize = sizeOverride;
+  }
+  constexpr uint32_t maxSubrecordSize = 64U * 1024U * 1024U;
+  if (dataSize > maxSubrecordSize) {
+    throw ESP::InvalidRecordException("sub-record is unreasonably large");
   }
   m_Data.resize(dataSize);
 

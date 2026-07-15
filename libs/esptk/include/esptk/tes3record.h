@@ -18,13 +18,13 @@ public:
 
   bool readFrom(std::istream& stream);
 
+  uint32_t dataSize() const { return m_DataSize; }
+  uint32_t flags() const { return m_Flags; }
+
 private:
-  struct Header
-  {
-    char type[4];
-    float version;
-    long unknown;
-  } m_Header;
+  uint32_t m_DataSize;
+  uint32_t m_Unknown;
+  uint32_t m_Flags;
 };
 
 }  // namespace ESP
