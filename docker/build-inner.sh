@@ -813,7 +813,6 @@ DESKTOP_EOF
         # Update desktop database if available
         command -v update-desktop-database >/dev/null 2>&1 && \
             update-desktop-database "${DESKTOP_DIR}" 2>/dev/null || true
-
         echo ""
         echo "Installation complete!"
         echo "  Binary:   ${INSTALL_DIR}/fluorine-manager"
