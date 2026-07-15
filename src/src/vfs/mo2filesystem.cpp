@@ -61,6 +61,31 @@ bool pathTouchesMutation(const std::string& cachedPath,
                          const std::string& changedPath);
 bool shouldTracePath(const std::string& path);
 
+void markCatalogDirty(Mo2FsContext* ctx, const std::string& relativePath,
+                      const std::string& realPath = {})
+{
+  if (ctx == nullptr || relativePath.empty()) return;
+  std::string provider = ctx->default_catalog_root;
+  if (!realPath.empty()) {
+    const fs::path real = fs::path(realPath).lexically_normal();
+    size_t bestLength = 0;
+    for (const auto& [root, origin] : ctx->catalog_providers) {
+      (void)origin;
+      const fs::path normalizedRoot = fs::path(root).lexically_normal();
+      const fs::path candidate = real.lexically_relative(normalizedRoot);
+      if (!candidate.empty() && !candidate.is_absolute() &&
+          *candidate.begin() != ".." && root.size() > bestLength) {
+        provider = root;
+        bestLength = root.size();
+      }
+    }
+  }
+  if (provider.empty()) return;
+  std::scoped_lock lock(ctx->dirty_paths_mutex);
+  ctx->dirty_provider_paths[provider].insert(
+      fs::path(relativePath).lexically_normal().generic_string());
+}
+
 int fuseErrnoFromError(std::error_code ec, int fallback = EIO)
 {
   if (!ec) {
@@ -1205,24 +1230,44 @@ void updateFileNode(Mo2FsContext* ctx, const std::string& relative,
   updateFileNodeKnown(ctx, relative, realPath, origin, ec ? 0 : size, mtime);
 }
 
-void markOpenFileDirty(Mo2FsContext* ctx, uint64_t fh, uint64_t endOffset)
+bool markOpenFileDirty(Mo2FsContext* ctx, uint64_t fh, uint64_t endOffset)
 {
   if (ctx == nullptr) {
-    return;
+    return false;
   }
 
   std::scoped_lock lock(ctx->open_files_mutex);
   auto it = ctx->open_files.find(fh);
   if (it == ctx->open_files.end()) {
-    return;
+    return false;
   }
 
   it->second.metadata_dirty = true;
+  it->second.content_dirty = true;
   it->second.virtual_size = std::max<uint64_t>(it->second.virtual_size, endOffset);
   it->second.virtual_mtime = std::chrono::system_clock::now();
+  const bool invalidateRange = it->second.range_invalidation_pending;
+  it->second.range_invalidation_pending = false;
+  return invalidateRange;
 }
 
-void flushDirtyOpenFileMetadata(Mo2FsContext* ctx, uint64_t fh)
+void invalidateKernelContent(Mo2FsContext* ctx, fuse_ino_t ino,
+                             off_t offset, off_t length)
+{
+  if (ctx == nullptr || ctx->session == nullptr || ino == 0) return;
+  const int result = fuse_lowlevel_notify_inval_inode(
+      ctx->session, ino, offset, length);
+  if (result != 0 && result != -ENOENT) {
+    std::fprintf(stderr,
+                 "[VFS] content invalidation failed ino=%llu off=%lld len=%lld rc=%d\n",
+                 static_cast<unsigned long long>(ino),
+                 static_cast<long long>(offset),
+                 static_cast<long long>(length), result);
+  }
+  invalidateAttrCache(ctx, ino);
+}
+
+void flushDirtyOpenFileMetadata(Mo2FsContext* ctx, uint64_t fh, fuse_ino_t ino)
 {
   if (ctx == nullptr) {
     return;
@@ -1232,22 +1277,34 @@ void flushDirtyOpenFileMetadata(Mo2FsContext* ctx, uint64_t fh)
   std::string realPath;
   uint64_t size = 0;
   std::chrono::system_clock::time_point mtime;
+  bool metadataDirty = false;
+  bool contentDirty = false;
   {
     std::scoped_lock lock(ctx->open_files_mutex);
     auto it = ctx->open_files.find(fh);
-    if (it == ctx->open_files.end() || !it->second.metadata_dirty) {
+    if (it == ctx->open_files.end()) {
       return;
     }
+    metadataDirty = it->second.metadata_dirty;
+    contentDirty = it->second.content_dirty;
+    if (!metadataDirty && !contentDirty) return;
     relativePath = it->second.relative_path;
     realPath     = it->second.real_path;
     size         = it->second.virtual_size;
     mtime        = it->second.virtual_mtime;
     it->second.metadata_dirty = false;
+    it->second.content_dirty = false;
   }
 
-  if (!relativePath.empty() && !realPath.empty()) {
+  if (metadataDirty && !relativePath.empty() && !realPath.empty()) {
     updateFileNodeKnown(ctx, relativePath, realPath, originForPath(ctx, realPath),
                         size, mtime);
+  }
+  if (contentDirty) {
+    // A whole-inode invalidation after the completed handle operation closes
+    // the stale-tail/size hole left by range invalidation. This is once per
+    // flush/release, not once per shader-cache write chunk.
+    invalidateKernelContent(ctx, ino, 0, 0);
   }
 }
 
@@ -1313,6 +1370,7 @@ bool ensureWritableOpenFile(Mo2FsContext* ctx, uint64_t fh, fuse_ino_t ino,
         it->second.real_path   = newPath;
         it->second.is_backing  = false;
         it->second.cow_pending = false;
+        it->second.range_invalidation_pending = true;
       }
       fd = newFd;
       realPath = newPath;
@@ -2090,6 +2148,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
   bool isBacking       = snap.is_backing;
   bool cowPending      = false;
   bool isTracked       = false;
+  bool invalidateWrites = false;
   uint64_t openSize    = snap.size;
   auto openMtime       = snap.mtime;
 
@@ -2147,6 +2206,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
         }
         realPath  = modFilePath;
         isTracked = true;
+        invalidateWrites = true;
         if (truncateOnOpen) {
           openSize = 0;
           openMtime = std::chrono::system_clock::now();
@@ -2176,6 +2236,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
         openFlags |= O_TRUNC;
       }
       fd = open(realPath.c_str(), openFlags);
+      if (fd >= 0) invalidateWrites = true;
       if (fd >= 0 && truncateOnOpen) {
         if (tracePath) {
           std::fprintf(stderr,
@@ -2213,6 +2274,7 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
           realPath    = newPath;
           isBacking   = false;
           cowPending  = false;
+          invalidateWrites = true;
           openSize    = 0;
           openMtime   = std::chrono::system_clock::now();
           updateFileNodeKnown(ctx, path, newPath, originForPath(ctx, newPath),
@@ -2287,6 +2349,8 @@ void mo2_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
     of.cow_pending   = cowPending;
     of.is_tracked    = isTracked;
     of.relative_path = path;
+    of.range_invalidation_pending = invalidateWrites;
+    of.content_dirty = truncateOnOpen && fd >= 0;
     of.virtual_size  = openSize;
     of.virtual_mtime = openMtime;
     ctx->open_files[fh] = std::move(of);
@@ -2326,6 +2390,13 @@ void mo2_read(fuse_req_t req, fuse_ino_t /*ino*/, size_t size, off_t off,
     isBacking = it->second.is_backing;
     writable = it->second.writable;
     _t.path = it->second.relative_path;
+  }
+  if (writable) {
+    std::scoped_lock lock(ctx->open_files_mutex);
+    auto it = ctx->open_files.find(fi->fh);
+    if (it != ctx->open_files.end()) {
+      it->second.range_invalidation_pending = true;
+    }
   }
   ctx->read_bytes.fetch_add(static_cast<uint64_t>(size), std::memory_order_relaxed);
 
@@ -2448,6 +2519,7 @@ void mo2_write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
           it->second.real_path   = newPath;
           it->second.is_backing  = false;
           it->second.cow_pending = false;
+          it->second.range_invalidation_pending = true;
         }
       }
       realPath = newPath;
@@ -2478,8 +2550,13 @@ void mo2_write(fuse_req_t req, fuse_ino_t ino, const char* buf, size_t size,
   ctx->write_bytes.fetch_add(static_cast<uint64_t>(written),
                              std::memory_order_relaxed);
   samplePathStat(ctx, "write", relativePath);
-  markOpenFileDirty(ctx, fi->fh,
-                    static_cast<uint64_t>(off) + static_cast<uint64_t>(written));
+  const bool invalidateRange = markOpenFileDirty(
+      ctx, fi->fh,
+      static_cast<uint64_t>(off) + static_cast<uint64_t>(written));
+  if (invalidateRange && written > 0) {
+    invalidateKernelContent(ctx, ino, off, static_cast<off_t>(written));
+  }
+  markCatalogDirty(ctx, relativePath, realPath);
   fuse_reply_write(req, static_cast<size_t>(written));
 }
 
@@ -2607,6 +2684,7 @@ void mo2_create(fuse_req_t req, fuse_ino_t parent, const char* name, mode_t mode
                   createdMtime, realPath, createdSt.st_mode & 0777);
 
   samplePathStat(ctx, "create", relative);
+  markCatalogDirty(ctx, relative, realPath);
   fuse_reply_create(req, &e, fi);
 }
 
@@ -2728,10 +2806,22 @@ void mo2_rename(fuse_req_t req, fuse_ino_t parent, const char* name,
   if (newIno != 0 && newIno != oldIno) {
     invalidateAttrCache(ctx, newIno);
   }
+  // rename-over-existing is the normal atomic INI replacement strategy. The
+  // destination inode may have 24-hour keep_cache pages from before the
+  // replacement, so invalidate both identities before returning success.
+  if (oldIno != 0) {
+    invalidateKernelContent(ctx, oldIno, 0, 0);
+  }
+  if (newIno != 0 && newIno != oldIno) {
+    invalidateKernelContent(ctx, newIno, 0, 0);
+  }
   invalidateDirCache(ctx, parentPath);
   if (newParentPath != parentPath) {
     invalidateDirCache(ctx, newParentPath);
   }
+
+  markCatalogDirty(ctx, oldRelative);
+  markCatalogDirty(ctx, newRelative);
 
   fuse_reply_err(req, 0);
 }
@@ -2953,6 +3043,10 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
         it->second.metadata_dirty = false;
       }
     }
+    if (fi != nullptr) {
+      markOpenFileDirty(ctx, fh, static_cast<uint64_t>(attr->st_size));
+    }
+    invalidateKernelContent(ctx, ino, 0, 0);
   }
   samplePathStat(ctx, "setattr", path);
 
@@ -3037,6 +3131,8 @@ void mo2_setattr(fuse_req_t req, fuse_ino_t ino, struct stat* attr, int to_set,
     return;
   }
 
+  if (to_set != 0) markCatalogDirty(ctx, path, snap.real_path);
+
   struct stat st;
   if (snap.is_directory) {
     fillStatForDir(&st, ino, ctx->uid, ctx->gid);
@@ -3091,6 +3187,8 @@ void mo2_unlink(fuse_req_t req, fuse_ino_t parent, const char* name)
     invalidateAttrCache(ctx, removedIno);
   }
   invalidateDirCache(ctx, parentPath);
+
+  markCatalogDirty(ctx, relative);
 
   fuse_reply_err(req, 0);
 }
@@ -3229,7 +3327,7 @@ void mo2_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
     return;
   }
 
-  flushDirtyOpenFileMetadata(ctx, fi->fh);
+  flushDirtyOpenFileMetadata(ctx, fi->fh, ino);
 
   {
     std::scoped_lock lock(ctx->open_files_mutex);
@@ -3270,7 +3368,7 @@ void mo2_forget(fuse_req_t req, fuse_ino_t ino, uint64_t /*nlookup*/)
   fuse_reply_none(req);
 }
 
-void mo2_flush(fuse_req_t req, fuse_ino_t /*ino*/, struct fuse_file_info* fi)
+void mo2_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info* fi)
 {
   Mo2FsContext* ctx = getContext(req);
   if (ctx == nullptr || fi == nullptr) {
@@ -3292,11 +3390,11 @@ void mo2_flush(fuse_req_t req, fuse_ino_t /*ino*/, struct fuse_file_info* fi)
   }
 
   samplePathStat(ctx, "flush", _t.path);
-  flushDirtyOpenFileMetadata(ctx, fi->fh);
+  flushDirtyOpenFileMetadata(ctx, fi->fh, ino);
   fuse_reply_err(req, 0);
 }
 
-void mo2_fsync(fuse_req_t req, fuse_ino_t /*ino*/, int datasync,
+void mo2_fsync(fuse_req_t req, fuse_ino_t ino, int datasync,
                struct fuse_file_info* fi)
 {
   Mo2FsContext* ctx = getContext(req);
@@ -3327,7 +3425,7 @@ void mo2_fsync(fuse_req_t req, fuse_ino_t /*ino*/, int datasync,
       return;
     }
   }
-  flushDirtyOpenFileMetadata(ctx, fi->fh);
+  flushDirtyOpenFileMetadata(ctx, fi->fh, ino);
   fuse_reply_err(req, 0);
 }
 
@@ -3458,25 +3556,32 @@ void mo2_fallocate(fuse_req_t req, fuse_ino_t ino, int mode, off_t offset,
     return;
   }
 
+  std::string changedRealPath;
   struct stat st {};
   if (fstat(fd, &st) == 0) {
-    std::string realPath;
     {
       std::shared_lock lock(ctx->open_files_mutex);
       auto it = ctx->open_files.find(fi->fh);
       if (it != ctx->open_files.end()) {
-        realPath = it->second.real_path;
+        changedRealPath = it->second.real_path;
       }
     }
-    if (!realPath.empty()) {
-      updateFileNodeKnown(ctx, relativePath, realPath, originForPath(ctx, realPath),
+    if (!changedRealPath.empty()) {
+      updateFileNodeKnown(ctx, relativePath, changedRealPath,
+                          originForPath(ctx, changedRealPath),
                           static_cast<uint64_t>(st.st_size),
                           timePointFromTimespec(st.st_mtim));
     }
     if (mode == 0) {
-      markOpenFileDirty(ctx, fi->fh, static_cast<uint64_t>(st.st_size));
+      const bool invalidateRange = markOpenFileDirty(
+          ctx, fi->fh, static_cast<uint64_t>(st.st_size));
+      if (invalidateRange && length > 0) {
+        invalidateKernelContent(ctx, ino, offset, length);
+      }
     }
   }
+
+  markCatalogDirty(ctx, relativePath, changedRealPath);
 
   fuse_reply_err(req, 0);
 }
@@ -3553,11 +3658,22 @@ void mo2_copy_file_range(fuse_req_t req, fuse_ino_t ino_in, off_t off_in,
     return;
   }
 
-  markOpenFileDirty(ctx, fi_out->fh,
-                    static_cast<uint64_t>(off_out) + static_cast<uint64_t>(copied));
+  const bool invalidateRange = markOpenFileDirty(
+      ctx, fi_out->fh,
+      static_cast<uint64_t>(off_out) + static_cast<uint64_t>(copied));
+  if (invalidateRange && copied > 0) {
+    invalidateKernelContent(ctx, ino_out, off_out, static_cast<off_t>(copied));
+  }
   ctx->write_bytes.fetch_add(static_cast<uint64_t>(copied),
                              std::memory_order_relaxed);
   samplePathStat(ctx, "write", outRelativePath);
+  std::string outputRealPath;
+  {
+    std::shared_lock lock(ctx->open_files_mutex);
+    auto it = ctx->open_files.find(fi_out->fh);
+    if (it != ctx->open_files.end()) outputRealPath = it->second.real_path;
+  }
+  markCatalogDirty(ctx, outRelativePath, outputRealPath);
   fuse_reply_write(req, static_cast<size_t>(copied));
 }
 

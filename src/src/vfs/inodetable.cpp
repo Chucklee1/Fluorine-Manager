@@ -82,7 +82,13 @@ void InodeTable::rename(const std::string& old_path, const std::string& new_path
   if (it != m_pathToInode.end()) {
     const uint64_t ino = it->second;
     m_pathToInode.erase(it);
-    m_pathToInode.emplace(newKey, ino);
+    // POSIX rename replaces an existing destination. Future lookups must use
+    // the source inode, not retain the inode of the file that was replaced.
+    auto replaced = m_pathToInode.find(newKey);
+    if (replaced != m_pathToInode.end() && replaced->second != ino) {
+      m_inodeToPath.erase(replaced->second);
+    }
+    m_pathToInode.insert_or_assign(newKey, ino);
     m_inodeToPath[ino] = newCanonical;
   }
 
@@ -104,7 +110,11 @@ void InodeTable::rename(const std::string& old_path, const std::string& new_path
     const std::string suffix = descKey.substr(oldPrefix.size());
     const std::string nextKey = newKey.empty() ? suffix : newKey + "/" + suffix;
     m_pathToInode.erase(descKey);
-    m_pathToInode.emplace(nextKey, ino);
+    auto replaced = m_pathToInode.find(nextKey);
+    if (replaced != m_pathToInode.end() && replaced->second != ino) {
+      m_inodeToPath.erase(replaced->second);
+    }
+    m_pathToInode.insert_or_assign(nextKey, ino);
 
     auto inodeIt = m_inodeToPath.find(ino);
     if (inodeIt != m_inodeToPath.end()) {

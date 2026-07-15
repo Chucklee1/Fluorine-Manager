@@ -103,27 +103,6 @@ target_link_libraries(test_external_dir_mapping PRIVATE
 add_test(NAME test_external_dir_mapping COMMAND test_external_dir_mapping)
 
 # ---------------------------------------------------------------------------
-# Overwrite duplicate scan tests
-# ---------------------------------------------------------------------------
-add_executable(test_overwrite_duplicates EXCLUDE_FROM_ALL
-    test_overwrite_duplicates.cpp
-    ${CMAKE_SOURCE_DIR}/src/src/vfs/trackedwrites.cpp
-)
-set_target_properties(test_overwrite_duplicates PROPERTIES
-    AUTOMOC OFF
-    CXX_STANDARD 23
-    CXX_STANDARD_REQUIRED ON
-)
-target_include_directories(test_overwrite_duplicates PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/src
-)
-target_link_libraries(test_overwrite_duplicates PRIVATE
-    GTest::gtest
-    GTest::gtest_main
-)
-add_test(NAME test_overwrite_duplicates COMMAND test_overwrite_duplicates)
-
-# ---------------------------------------------------------------------------
 # VFS file-operation regression tests
 # ---------------------------------------------------------------------------
 add_executable(test_vfs_file_ops EXCLUDE_FROM_ALL
@@ -176,8 +155,31 @@ target_link_libraries(test_vfs_catalog PRIVATE
 )
 add_test(NAME test_vfs_catalog COMMAND test_vfs_catalog)
 
+# ---------------------------------------------------------------------------
+# Crash-safe VFS staging promotion tests
+# ---------------------------------------------------------------------------
+add_executable(test_staging_promotion EXCLUDE_FROM_ALL
+    test_stagingpromotion.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/stagingpromotion.cpp
+)
+set_target_properties(test_staging_promotion PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_staging_promotion PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_staging_promotion PRIVATE
+    Qt6::Core
+    BLAKE3::blake3
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_staging_promotion COMMAND test_staging_promotion)
+
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
     DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
-            test_external_dir_mapping test_overwrite_duplicates test_vfs_file_ops
-            test_vfs_catalog)
+            test_external_dir_mapping test_vfs_file_ops test_vfs_catalog
+            test_staging_promotion)

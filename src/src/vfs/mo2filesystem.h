@@ -14,6 +14,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct Mo2FsContext
@@ -48,6 +49,11 @@ struct Mo2FsContext
     std::string relative_path;
     uint64_t last_read_tick = 0;
     bool metadata_dirty = false;
+    // Existing mutable providers may already have kernel pages retained by
+    // keep_cache. Invalidate the first range written by this handle, then
+    // coalesce the final whole-file invalidation at flush/release.
+    bool range_invalidation_pending = false;
+    bool content_dirty = false;
     uint64_t virtual_size = 0;
     std::chrono::system_clock::time_point virtual_mtime;
   };
@@ -55,6 +61,13 @@ struct Mo2FsContext
   std::unordered_map<uint64_t, OpenFile> open_files;
   mutable std::shared_mutex open_files_mutex;
   std::atomic<uint64_t> next_fh{1};
+
+  // Relative paths Fluorine itself mutated during this mount. These bypass
+  // fingerprint reuse and are BLAKE3-hashed again after FUSE has stopped.
+  std::unordered_map<std::string, std::unordered_set<std::string>> dirty_provider_paths;
+  std::vector<std::pair<std::string, std::string>> catalog_providers; // root, origin
+  std::string default_catalog_root;
+  mutable std::mutex dirty_paths_mutex;
 
   struct DirEntry
   {

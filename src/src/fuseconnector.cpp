@@ -535,6 +535,22 @@ bool FuseConnector::mount(
   const fs::path overwritePath(m_overwriteDir);
   m_stagingDir = (overwritePath.parent_path() / "VFS_staging").string();
 
+  const fs::path promotionDestination = m_customOutputDir.empty()
+                                            ? fs::path(m_overwriteDir)
+                                            : fs::path(m_customOutputDir);
+  const StagingPromotionResult recovery =
+      StagingPromotion::recover(m_stagingDir, promotionDestination);
+  if (recovery.blocked()) {
+    throw FuseConnectorException(
+        QObject::tr("%1\n\nRecovery files: %2")
+            .arg(QString::fromStdString(recovery.message),
+                 QString::fromStdString(recovery.recovery_path.string())));
+  }
+  if (recovery.status == StagingPromotionStatus::Recovered) {
+    log::info("Recovered and verified {} interrupted VFS promotion(s)",
+              recovery.files.size());
+  }
+
   std::error_code ec;
   fs::create_directories(m_stagingDir, ec);
   fs::create_directories(m_overwriteDir, ec);
@@ -646,13 +662,12 @@ bool FuseConnector::mount(
     // with a mod file get incorrectly tracked.  Tracking now only happens
     // through explicit user actions (UI move/sync/drag-drop) or the
     // snapshot-based detectManualMoves().
-    const auto duplicates =
-        m_trackedWrites->scanOverwriteDuplicates(m_overwriteDir, mods);
+    const auto& duplicates = catalogResult.overwrite_duplicates;
     if (!duplicates.empty()) {
       size_t identical = 0;
       size_t different = 0;
       for (const auto& dup : duplicates) {
-        if (dup.state == TrackedWrites::DuplicateState::Identical) {
+        if (dup.state == VfsDuplicateState::Identical) {
           ++identical;
         } else {
           ++different;
@@ -668,8 +683,8 @@ bool FuseConnector::mount(
         std::fprintf(stderr,
                      "[VFS]   %s -> %s (%s)\n",
                      dup.relative_path.c_str(), dup.mod_name.c_str(),
-                     dup.state == TrackedWrites::DuplicateState::Identical ? "identical"
-                                                                           : "different");
+                     dup.state == VfsDuplicateState::Identical ? "identical"
+                                                               : "different");
       }
     } else {
       std::fprintf(stderr, "[VFS] overwrite duplicate scan: no exact path matches\n");
@@ -686,6 +701,16 @@ bool FuseConnector::mount(
   m_context->overwrite             = std::make_unique<OverwriteManager>(m_stagingDir, m_overwriteDir);
   m_context->tracked_writes        = m_trackedWrites;
   m_context->backing_dir_fd        = m_backingFd;
+  m_context->default_catalog_root  = promotionDestination.string();
+  m_context->catalog_providers.reserve(mods.size() + 1);
+  for (const auto& [name, path] : mods) {
+    m_context->catalog_providers.emplace_back(path, name);
+  }
+  m_context->catalog_providers.emplace_back(promotionDestination.string(),
+                                             "Overwrite");
+  if (promotionDestination != fs::path(m_overwriteDir)) {
+    m_context->catalog_providers.emplace_back(m_overwriteDir, "Overwrite");
+  }
   m_context->uid                   = ::getuid();
   m_context->gid                   = ::getgid();
   m_context->cache_disabled        = m_disableVfsCache ||
@@ -792,6 +817,13 @@ void FuseConnector::unmount()
     m_session = nullptr;
   }
 
+  std::unordered_map<std::string, std::unordered_set<std::string>> dirtyProviderPaths;
+  if (m_context != nullptr) {
+    std::scoped_lock const lock(m_context->dirty_paths_mutex);
+    dirtyProviderPaths = m_context->dirty_provider_paths;
+  }
+  std::vector<std::string> promotedPaths;
+
   {
     const auto t0 = std::chrono::steady_clock::now();
     if (m_discardStaging) {
@@ -801,12 +833,68 @@ void FuseConnector::unmount()
       fs::remove_all(m_stagingDir, ec);
       m_discardStaging = false;
     } else {
-      flushStaging();
+      try {
+        const StagingPromotionResult promotion = flushStaging();
+        promotedPaths.reserve(promotion.files.size());
+        for (const StagingPromotedFile& file : promotion.files) {
+          promotedPaths.push_back(file.relative_path);
+        }
+        if (promotion.blocked()) {
+          log::error("VFS staging promotion blocked: {} (recovery: {})",
+                     QString::fromStdString(promotion.message),
+                     QString::fromStdString(promotion.recovery_path.string()));
+        }
+      } catch (const std::exception& error) {
+        // Leave the durable journal and staged data in place.  The next mount
+        // will replay or preserve it before exposing the VFS again.
+        log::error("VFS staging promotion failed; it will be recovered on the next launch: {}",
+                   error.what());
+      }
     }
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "[VFS] flushed staging in %lldms\n",
                  static_cast<long long>(ms));
+  }
+
+  const std::string promotionRoot = m_customOutputDir.empty()
+                                        ? m_overwriteDir
+                                        : m_customOutputDir;
+  if (auto provider = dirtyProviderPaths.find(promotionRoot);
+      provider != dirtyProviderPaths.end()) {
+    for (const std::string& path : promotedPaths) provider->second.erase(path);
+    if (provider->second.empty()) dirtyProviderPaths.erase(provider);
+  }
+
+  // Writes to tracked output mods can bypass VFS_staging, and removals have no
+  // promoted file to verify. Force-refresh exactly those provider/path pairs
+  // after all FUSE handles are closed.
+  if (!dirtyProviderPaths.empty()) {
+    VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
+    for (const auto& [root, paths] : dirtyProviderPaths) {
+      std::string origin = root == (m_customOutputDir.empty()
+                                        ? m_overwriteDir
+                                        : m_customOutputDir)
+                               ? "Overwrite"
+                               : root;
+      if (m_context != nullptr) {
+        for (const auto& [providerRoot, providerOrigin] :
+             m_context->catalog_providers) {
+          if (providerRoot == root) {
+            origin = providerOrigin;
+            break;
+          }
+        }
+      }
+      const std::vector<std::string> relativePaths(paths.begin(), paths.end());
+      try {
+        catalog.forceRefreshProviderFiles(root, origin, false, relativePaths);
+      } catch (const std::exception& error) {
+        catalog.invalidateProviderFiles(root, relativePaths);
+        log::error("Unable to force-refresh {} dirty catalog path(s) under '{}': {}",
+                   relativePaths.size(), QString::fromStdString(root), error.what());
+      }
+    }
   }
 
   // Snapshot overwrite contents for next session's manual-move detection,
@@ -1281,10 +1369,10 @@ void FuseConnector::updateForcedLibraries(
     const QList<MOBase::ExecutableForcedLoadSetting>& /*forced*/)
 {}
 
-void FuseConnector::flushStaging()
+StagingPromotionResult FuseConnector::flushStaging()
 {
   if (m_stagingDir.empty() || m_overwriteDir.empty()) {
-    return;
+    return {};
   }
 
   const fs::path staging(m_stagingDir);
@@ -1297,43 +1385,41 @@ void FuseConnector::flushStaging()
              QString::fromStdString(m_customOutputDir),
              QString::fromStdString(overwrite.string()));
 
-  if (!fs::exists(staging)) {
-    log::debug("flushStaging: staging dir does not exist, nothing to flush");
-    return;
-  }
-
-  std::error_code ec;
-  for (auto it = fs::recursive_directory_iterator(
-           staging, fs::directory_options::skip_permission_denied);
-       it != fs::recursive_directory_iterator(); ++it) {
-    const auto& entry = *it;
-    const fs::path rel = fs::relative(entry.path(), staging, ec);
-    if (ec || rel.empty()) {
-      continue;
+  StagingPromotionResult result = StagingPromotion::promote(staging, overwrite);
+  if (result.status == StagingPromotionStatus::Promoted ||
+      result.status == StagingPromotionStatus::Recovered) {
+    std::vector<std::string> relativePaths;
+    relativePaths.reserve(result.files.size());
+    for (const StagingPromotedFile& file : result.files) {
+      relativePaths.push_back(file.relative_path);
     }
 
-    const fs::path dest = overwrite / rel;
-    if (entry.is_directory(ec)) {
-      fs::create_directories(dest, ec);
-      continue;
-    }
-
-    if (!entry.is_regular_file(ec)) {
-      continue;
-    }
-
-    fs::create_directories(dest.parent_path(), ec);
-    fs::rename(entry.path(), dest, ec);
-    if (ec) {
-      ec.clear();
-      fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing, ec);
-      if (!ec) {
-        fs::remove(entry.path(), ec);
+    VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
+    try {
+      const VfsCatalogRefreshResult refreshed = catalog.forceRefreshProviderFiles(
+          overwrite.string(), "Overwrite", false, relativePaths);
+      if (refreshed.files.size() != result.files.size()) {
+        throw std::runtime_error("Catalog refresh returned an incomplete result");
       }
+      for (size_t i = 0; i < result.files.size(); ++i) {
+        if (!refreshed.files[i].exists ||
+            refreshed.files[i].relative_path != result.files[i].relative_path ||
+            refreshed.files[i].digest != result.files[i].digest) {
+          throw std::runtime_error(
+              "Catalog digest did not match promoted file " +
+              result.files[i].relative_path);
+        }
+      }
+    } catch (...) {
+      // The destination has already been atomically installed and verified.
+      // Remove possibly stale rows so the next full reconcile must hash them.
+      catalog.invalidateProviderFiles(overwrite.string(), relativePaths);
+      throw;
     }
+    log::info("Promoted and BLAKE3-verified {} staged VFS file(s)",
+              result.files.size());
   }
-
-  fs::remove_all(staging, ec);
+  return result;
 }
 
 void FuseConnector::flushStagingLive()
@@ -1346,8 +1432,48 @@ void FuseConnector::flushStagingLive()
     return;
   }
 
-  // Move staged files to overwrite
-  flushStaging();
+  // A writable handle can continue changing an unlinked staging inode after a
+  // live promotion.  Only synchronize while no such handles exist; unmount is
+  // the normal durable path.
+  {
+    std::shared_lock const lock(m_context->open_files_mutex);
+    for (const auto& [handle, file] : m_context->open_files) {
+      (void)handle;
+      if (file.writable || file.cow_pending) {
+        throw FuseConnectorException(QObject::tr(
+            "Cannot synchronize VFS staging while writable files are open. "
+            "Close the game or application first."));
+      }
+    }
+  }
+
+  StagingPromotionResult promotion;
+  try {
+    promotion = flushStaging();
+  } catch (...) {
+    std::error_code recoveryError;
+    fs::create_directories(m_stagingDir, recoveryError);
+    m_context->overwrite =
+        std::make_unique<OverwriteManager>(m_stagingDir, m_overwriteDir);
+    // If the filesystem promotion succeeded but catalog publication failed,
+    // rebuild from disk before returning the error so the live tree cannot
+    // retain paths to removed staging files.
+    rebuild(m_lastMods, QString::fromStdString(m_overwriteDir),
+            QString::fromStdString(m_dataDirName));
+    throw;
+  }
+  if (promotion.blocked()) {
+    std::error_code recoveryError;
+    fs::create_directories(m_stagingDir, recoveryError);
+    m_context->overwrite =
+        std::make_unique<OverwriteManager>(m_stagingDir, m_overwriteDir);
+    rebuild(m_lastMods, QString::fromStdString(m_overwriteDir),
+            QString::fromStdString(m_dataDirName));
+    throw FuseConnectorException(
+        QObject::tr("%1\n\nRecovery files: %2")
+            .arg(QString::fromStdString(promotion.message),
+                 QString::fromStdString(promotion.recovery_path.string())));
+  }
 
   // Re-create the staging dir (flushStaging removes it)
   std::error_code ec;
@@ -1388,6 +1514,22 @@ void FuseConnector::flushStagingLive()
 
   // Re-create OverwriteManager with fresh staging dir
   m_context->overwrite = std::make_unique<OverwriteManager>(m_stagingDir, m_overwriteDir);
+
+  if (!promotion.files.empty()) {
+    const std::string root = m_customOutputDir.empty()
+                                 ? m_overwriteDir
+                                 : m_customOutputDir;
+    std::scoped_lock const lock(m_context->dirty_paths_mutex);
+    auto provider = m_context->dirty_provider_paths.find(root);
+    if (provider != m_context->dirty_provider_paths.end()) {
+      for (const StagingPromotedFile& file : promotion.files) {
+        provider->second.erase(file.relative_path);
+      }
+      if (provider->second.empty()) {
+        m_context->dirty_provider_paths.erase(provider);
+      }
+    }
+  }
 
   log::debug("Live staging flush complete");
 }

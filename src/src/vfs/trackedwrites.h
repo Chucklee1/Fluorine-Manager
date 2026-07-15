@@ -21,21 +21,6 @@
 class TrackedWrites
 {
 public:
-  enum class DuplicateState
-  {
-    Identical,
-    Different,
-  };
-
-  struct DuplicateEntry
-  {
-    std::string relative_path;
-    std::string overwrite_path;
-    std::string mod_name;
-    std::string mod_path;
-    DuplicateState state;
-  };
-
   TrackedWrites() = default;
 
   // Load tracking data from a JSON file.
@@ -80,13 +65,6 @@ public:
   void initialScan(
       const std::string& overwrite_dir,
       const std::vector<std::pair<std::string, std::string>>& mods);
-
-  // Read-only duplicate review: for every file in overwrite, check whether the
-  // same relative path exists in any enabled mod.  The highest-priority match
-  // wins.  No mutation is performed.
-  std::vector<DuplicateEntry> scanOverwriteDuplicates(
-      const std::string& overwrite_dir,
-      const std::vector<std::pair<std::string, std::string>>& mods) const;
 
   // Get all tracked mappings (for debugging / inspection).
   std::unordered_map<std::string, std::string> allMappings() const;

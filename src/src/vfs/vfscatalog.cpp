@@ -8,6 +8,7 @@
 #include <sqlite3.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -602,15 +603,221 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
       providerRoots.push_back(std::move(providerRoot));
     }
 
+    std::vector<VfsCatalogDuplicate> duplicates;
+    auto overwriteRows = prepare(db.get(),
+        "SELECT relative_path,normalized_path,blake3 FROM catalog_files"
+        " WHERE root_key=?1 ORDER BY normalized_path;");
+    bindText(db.get(), overwriteRows.get(), 1, overwrite_dir);
+    auto matchingProvider = prepare(db.get(),
+        "SELECT blake3 FROM catalog_files"
+        " WHERE root_key=?1 AND normalized_path=?2;");
+    while (sqlite3_step(overwriteRows.get()) == SQLITE_ROW) {
+      const auto* relative = reinterpret_cast<const char*>(
+          sqlite3_column_text(overwriteRows.get(), 0));
+      const auto* normalized = reinterpret_cast<const char*>(
+          sqlite3_column_text(overwriteRows.get(), 1));
+      const void* overwriteHash = sqlite3_column_blob(overwriteRows.get(), 2);
+      const int overwriteHashSize = sqlite3_column_bytes(overwriteRows.get(), 2);
+      if (relative == nullptr || normalized == nullptr || overwriteHash == nullptr ||
+          overwriteHashSize != BLAKE3_OUT_LEN) {
+        continue;
+      }
+      // Later providers have higher priority in the VFS tree, so report the
+      // highest-priority enabled mod that contains the same path.
+      for (auto mod = mods.rbegin(); mod != mods.rend(); ++mod) {
+        sqlite3_reset(matchingProvider.get());
+        sqlite3_clear_bindings(matchingProvider.get());
+        bindText(db.get(), matchingProvider.get(), 1, mod->second);
+        bindText(db.get(), matchingProvider.get(), 2, normalized);
+        if (sqlite3_step(matchingProvider.get()) != SQLITE_ROW) continue;
+        const void* modHash = sqlite3_column_blob(matchingProvider.get(), 0);
+        const int modHashSize = sqlite3_column_bytes(matchingProvider.get(), 0);
+        const bool identical = modHash != nullptr && modHashSize == BLAKE3_OUT_LEN &&
+            std::memcmp(overwriteHash, modHash, BLAKE3_OUT_LEN) == 0;
+        duplicates.push_back({relative, mod->first, mod->second,
+                              identical ? VfsDuplicateState::Identical
+                                        : VfsDuplicateState::Different});
+        break;
+      }
+    }
+
     const VfsDigest profileRoot = calculateProfileRoot(providerRoots);
     exec(db.get(), "COMMIT;");
     state.current_file.clear();
     state.current_file_size = 0;
     reportProgress();
-    return {std::move(tree), std::move(providerRoots), profileRoot};
+    return {std::move(tree), std::move(providerRoots), profileRoot,
+            std::move(duplicates)};
   } catch (...) {
     sqlite3_exec(db.get(), "ROLLBACK;", nullptr, nullptr, nullptr);
     throw;
+  }
+}
+
+VfsCatalogRefreshResult VfsCatalog::forceRefreshProviderFiles(
+    const std::string& rootKey, const std::string& origin, bool isBacking,
+    const std::vector<std::string>& relativePaths)
+{
+  std::error_code ec;
+  fs::create_directories(m_database_path.parent_path(), ec);
+  if (ec) {
+    throw std::runtime_error("Unable to create local VFS catalog directory: " +
+                             ec.message());
+  }
+
+  sqlite3* raw = nullptr;
+  if (sqlite3_open_v2(m_database_path.c_str(), &raw,
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                          SQLITE_OPEN_FULLMUTEX,
+                      nullptr) != SQLITE_OK) {
+    DbPtr failed(raw);
+    throwDb(raw, "Opening local VFS catalog");
+  }
+  DbPtr db(raw);
+  sqlite3_busy_timeout(db.get(), 30000);
+  initializeSchema(db.get());
+  exec(db.get(), "BEGIN IMMEDIATE;");
+  try {
+    const int64_t generation = nextGeneration(db.get());
+    auto upsert = prepare(db.get(),
+        "INSERT INTO catalog_files(root_key,relative_path,normalized_path,origin,"
+        "is_backing,device,inode,size,mode,mtime_ns,ctime_ns,blake3,seen_generation)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
+        " ON CONFLICT(root_key,normalized_path) DO UPDATE SET"
+        " relative_path=excluded.relative_path,origin=excluded.origin,"
+        " is_backing=excluded.is_backing,device=excluded.device,inode=excluded.inode,"
+        " size=excluded.size,mode=excluded.mode,mtime_ns=excluded.mtime_ns,"
+        " ctime_ns=excluded.ctime_ns,blake3=excluded.blake3,"
+        " seen_generation=excluded.seen_generation;");
+    auto remove = prepare(db.get(),
+        "DELETE FROM catalog_files WHERE root_key=?1 AND normalized_path=?2;");
+
+    VfsCatalogRefreshResult result;
+    result.files.reserve(relativePaths.size());
+    for (const std::string& relative : relativePaths) {
+      const fs::path relativePath(relative);
+      if (relativePath.empty() || relativePath.is_absolute() ||
+          std::find(relativePath.begin(), relativePath.end(), fs::path("..")) !=
+              relativePath.end()) {
+        throw std::runtime_error("Unsafe catalog refresh path: " + relative);
+      }
+      const std::string normalized = normalizeForLookup(relativePath.generic_string());
+      const fs::path full = fs::path(rootKey) / relativePath;
+      struct stat st {};
+      if (::lstat(full.c_str(), &st) != 0) {
+        if (errno != ENOENT) {
+          throw std::runtime_error("Unable to inspect catalog refresh path " +
+                                   full.string() + ": " + std::strerror(errno));
+        }
+        sqlite3_reset(remove.get());
+        sqlite3_clear_bindings(remove.get());
+        bindText(db.get(), remove.get(), 1, rootKey);
+        bindText(db.get(), remove.get(), 2, normalized);
+        if (sqlite3_step(remove.get()) != SQLITE_DONE) {
+          throwDb(db.get(), "Removing missing catalog file");
+        }
+        result.files.push_back({relativePath.generic_string(), false, {}});
+        continue;
+      }
+      if (!S_ISREG(st.st_mode)) {
+        throw std::runtime_error("Catalog refresh path is not a regular file: " +
+                                 full.string());
+      }
+
+      VfsDigest digest{};
+      bool stable = false;
+      for (int attempt = 0; attempt < 3; ++attempt) {
+        const struct stat before = st;
+        digest = hashFile(full);
+        if (::lstat(full.c_str(), &st) != 0) {
+          throw std::runtime_error("File disappeared while force-hashing: " +
+                                   full.string());
+        }
+        if (sameContentFingerprint(before, st)) {
+          stable = true;
+          break;
+        }
+      }
+      if (!stable) {
+        throw std::runtime_error("File kept changing while force-hashing: " +
+                                 full.string());
+      }
+
+      sqlite3_reset(upsert.get());
+      sqlite3_clear_bindings(upsert.get());
+      bindText(db.get(), upsert.get(), 1, rootKey);
+      bindText(db.get(), upsert.get(), 2, relativePath.generic_string());
+      bindText(db.get(), upsert.get(), 3, normalized);
+      bindText(db.get(), upsert.get(), 4, origin);
+      sqlite3_bind_int(upsert.get(), 5, isBacking ? 1 : 0);
+      sqlite3_bind_int64(upsert.get(), 6, st.st_dev);
+      sqlite3_bind_int64(upsert.get(), 7, st.st_ino);
+      sqlite3_bind_int64(upsert.get(), 8, st.st_size);
+      sqlite3_bind_int64(upsert.get(), 9, st.st_mode & 07777);
+      sqlite3_bind_int64(upsert.get(), 10, timespecNs(st.st_mtim));
+      sqlite3_bind_int64(upsert.get(), 11, timespecNs(st.st_ctim));
+      sqlite3_bind_blob(upsert.get(), 12, digest.data(), digest.size(), SQLITE_TRANSIENT);
+      sqlite3_bind_int64(upsert.get(), 13, generation);
+      if (sqlite3_step(upsert.get()) != SQLITE_DONE) {
+        throwDb(db.get(), "Force-refreshing catalog file");
+      }
+      result.files.push_back({relativePath.generic_string(), true, digest});
+    }
+
+    const Root root{rootKey, rootKey, origin, isBacking};
+    result.provider_root = calculateProviderRoot(db.get(), root);
+    auto upsertRoot = prepare(db.get(),
+        "INSERT INTO catalog_roots(root_key,merkle_root,file_count,generation)"
+        " VALUES(?1,?2,?3,?4) ON CONFLICT(root_key) DO UPDATE SET"
+        " merkle_root=excluded.merkle_root,file_count=excluded.file_count,"
+        " generation=excluded.generation;");
+    bindText(db.get(), upsertRoot.get(), 1, rootKey);
+    sqlite3_bind_blob(upsertRoot.get(), 2, result.provider_root.digest.data(),
+                      result.provider_root.digest.size(), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(upsertRoot.get(), 3, result.provider_root.file_count);
+    sqlite3_bind_int64(upsertRoot.get(), 4, generation);
+    if (sqlite3_step(upsertRoot.get()) != SQLITE_DONE) {
+      throwDb(db.get(), "Updating force-refreshed catalog root");
+    }
+    exec(db.get(), "COMMIT;");
+    return result;
+  } catch (...) {
+    sqlite3_exec(db.get(), "ROLLBACK;", nullptr, nullptr, nullptr);
+    throw;
+  }
+}
+
+void VfsCatalog::invalidateProviderFiles(
+    const std::string& rootKey,
+    const std::vector<std::string>& relativePaths) noexcept
+{
+  sqlite3* raw = nullptr;
+  if (sqlite3_open_v2(m_database_path.c_str(), &raw,
+                      SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
+                      nullptr) != SQLITE_OK) {
+    if (raw != nullptr) sqlite3_close(raw);
+    return;
+  }
+  DbPtr db(raw);
+  sqlite3_busy_timeout(db.get(), 30000);
+  try {
+    initializeSchema(db.get());
+    exec(db.get(), "BEGIN IMMEDIATE;");
+    auto remove = prepare(db.get(),
+        "DELETE FROM catalog_files WHERE root_key=?1 AND normalized_path=?2;");
+    for (const std::string& relative : relativePaths) {
+      sqlite3_reset(remove.get());
+      sqlite3_clear_bindings(remove.get());
+      bindText(db.get(), remove.get(), 1, rootKey);
+      bindText(db.get(), remove.get(), 2, normalizeForLookup(relative));
+      if (sqlite3_step(remove.get()) != SQLITE_DONE) throwDb(db.get(), "Invalidating catalog file");
+    }
+    auto removeRoot = prepare(db.get(), "DELETE FROM catalog_roots WHERE root_key=?1;");
+    bindText(db.get(), removeRoot.get(), 1, rootKey);
+    if (sqlite3_step(removeRoot.get()) != SQLITE_DONE) throwDb(db.get(), "Invalidating catalog root");
+    exec(db.get(), "COMMIT;");
+  } catch (...) {
+    sqlite3_exec(db.get(), "ROLLBACK;", nullptr, nullptr, nullptr);
   }
 }
 

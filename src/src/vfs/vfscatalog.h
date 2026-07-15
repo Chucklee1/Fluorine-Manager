@@ -35,11 +35,39 @@ struct VfsProviderRoot
   VfsDigest digest{};
 };
 
+struct VfsCatalogFileDigest
+{
+  std::string relative_path;
+  bool exists = false;
+  VfsDigest digest{};
+};
+
+struct VfsCatalogRefreshResult
+{
+  VfsProviderRoot provider_root;
+  std::vector<VfsCatalogFileDigest> files;
+};
+
+enum class VfsDuplicateState
+{
+  Identical,
+  Different
+};
+
+struct VfsCatalogDuplicate
+{
+  std::string relative_path;
+  std::string mod_name;
+  std::string mod_path;
+  VfsDuplicateState state = VfsDuplicateState::Different;
+};
+
 struct VfsCatalogResult
 {
   VfsTree tree;
   std::vector<VfsProviderRoot> provider_roots;
   VfsDigest profile_root{};
+  std::vector<VfsCatalogDuplicate> overwrite_duplicates;
 };
 
 // Persistent per-machine inventory of all VFS providers. The SQLite database
@@ -62,6 +90,20 @@ public:
       const std::string& overwrite_dir,
       bool scan_base,
       ProgressCallback progress = {});
+
+  // Re-hash specific paths without consulting their cached stat fingerprint.
+  // This is used for files Fluorine has just promoted or otherwise mutated.
+  VfsCatalogRefreshResult forceRefreshProviderFiles(
+      const std::string& root_key,
+      const std::string& origin,
+      bool is_backing,
+      const std::vector<std::string>& relative_paths);
+
+  // Best-effort safety valve after a filesystem mutation succeeds but catalog
+  // refresh does not. Missing rows must be re-created on the next reconcile.
+  void invalidateProviderFiles(
+      const std::string& root_key,
+      const std::vector<std::string>& relative_paths) noexcept;
 
   // Snapshot used only for in-session rebuilds after the real data directory
   // is hidden by the FUSE mount.

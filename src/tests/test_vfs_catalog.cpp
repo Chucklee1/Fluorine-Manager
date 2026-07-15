@@ -121,6 +121,88 @@ TEST(VfsCatalog, MetadataDriftRehashesOnlyChangedFile)
   EXPECT_EQ(progress.files_hashed, 1u);
 }
 
+TEST(VfsCatalog, ForceRefreshHashesControlledWritesAndUpdatesMerkleRoot)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path overwrite = temp.path() / "overwrite";
+  const fs::path file = overwrite / "config/settings.ini";
+  writeFile(data / "base.txt", "base");
+  writeFile(file, "AAAA");
+
+  VfsCatalog catalog(temp.path() / "catalog.sqlite");
+  const auto initial = catalog.reconcileAndBuild(
+      data.string(), {}, overwrite.string(), true);
+  const auto oldRoot = initial.provider_roots.back().digest;
+  const auto oldTime = fs::last_write_time(file);
+
+  // Same size and restored mtime models an application that hides the cheap
+  // fingerprint signals. Controlled paths must still be content-hashed.
+  writeFile(file, "BBBB");
+  fs::last_write_time(file, oldTime);
+  const auto refreshed = catalog.forceRefreshProviderFiles(
+      overwrite.string(), "Overwrite", false, {"config/settings.ini"});
+
+  ASSERT_EQ(refreshed.files.size(), 1u);
+  EXPECT_TRUE(refreshed.files.front().exists);
+  EXPECT_NE(refreshed.provider_root.digest, oldRoot);
+}
+
+TEST(VfsCatalog, DuplicateReviewUsesCatalogHashesAndHighestPriorityMod)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path modA = temp.path() / "ModA";
+  const fs::path modB = temp.path() / "ModB";
+  const fs::path overwrite = temp.path() / "overwrite";
+  writeFile(data / "base.txt", "base");
+  writeFile(overwrite / "same.ini", "same");
+  writeFile(overwrite / "different.ini", "overwrite");
+  writeFile(modA / "same.ini", "same");
+  writeFile(modA / "different.ini", "lower priority");
+  writeFile(modB / "different.ini", "highest priority");
+
+  const auto result = VfsCatalog(temp.path() / "catalog.sqlite").reconcileAndBuild(
+      data.string(), {{"Mod A", modA.string()}, {"Mod B", modB.string()}},
+      overwrite.string(), true);
+  ASSERT_EQ(result.overwrite_duplicates.size(), 2u);
+  const auto same = std::find_if(
+      result.overwrite_duplicates.begin(), result.overwrite_duplicates.end(),
+      [](const VfsCatalogDuplicate& value) { return value.relative_path == "same.ini"; });
+  ASSERT_NE(same, result.overwrite_duplicates.end());
+  EXPECT_EQ(same->mod_name, "Mod A");
+  EXPECT_EQ(same->state, VfsDuplicateState::Identical);
+  const auto different = std::find_if(
+      result.overwrite_duplicates.begin(), result.overwrite_duplicates.end(),
+      [](const VfsCatalogDuplicate& value) {
+        return value.relative_path == "different.ini";
+      });
+  ASSERT_NE(different, result.overwrite_duplicates.end());
+  EXPECT_EQ(different->mod_name, "Mod B");
+  EXPECT_EQ(different->state, VfsDuplicateState::Different);
+}
+
+TEST(VfsCatalog, ForceRefreshRemovesDeletedRows)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path overwrite = temp.path() / "overwrite";
+  writeFile(data / "base.txt", "base");
+  writeFile(overwrite / "removed.ini", "temporary");
+
+  VfsCatalog catalog(temp.path() / "catalog.sqlite");
+  const auto initial = catalog.reconcileAndBuild(
+      data.string(), {}, overwrite.string(), true);
+  ASSERT_EQ(initial.provider_roots.back().file_count, 1u);
+  fs::remove(overwrite / "removed.ini");
+
+  const auto refreshed = catalog.forceRefreshProviderFiles(
+      overwrite.string(), "Overwrite", false, {"removed.ini"});
+  ASSERT_EQ(refreshed.files.size(), 1u);
+  EXPECT_FALSE(refreshed.files.front().exists);
+  EXPECT_EQ(refreshed.provider_root.file_count, 0u);
+}
+
 TEST(VfsCatalog, UsesWalJournalMode)
 {
   TempRoot temp;

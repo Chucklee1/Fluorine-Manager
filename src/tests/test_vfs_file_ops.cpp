@@ -221,3 +221,18 @@ TEST(VfsFileOps, InodeRenameMovesDescendants)
   EXPECT_EQ(table.get("meshes/actors_backup/character/body.nif"), child);
   EXPECT_EQ(table.getPath(child), "meshes/actors_backup/character/body.nif");
 }
+
+TEST(VfsFileOps, InodeRenameReplacesExistingDestination)
+{
+  InodeTable table;
+  const uint64_t source = table.getOrCreate("config/settings.tmp");
+  const uint64_t replaced = table.getOrCreate("config/settings.ini");
+  ASSERT_NE(source, replaced);
+
+  table.rename("config/settings.tmp", "config/settings.ini");
+
+  EXPECT_EQ(table.get("config/settings.tmp"), 0u);
+  EXPECT_EQ(table.get("config/settings.ini"), source);
+  EXPECT_EQ(table.getPath(source), "config/settings.ini");
+  EXPECT_TRUE(table.getPath(replaced).empty());
+}

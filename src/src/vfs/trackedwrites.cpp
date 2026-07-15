@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -70,47 +69,6 @@ void skipWhitespace(const std::string& data, size_t& pos)
 {
   while (pos < data.size() && std::isspace(static_cast<unsigned char>(data[pos])))
     ++pos;
-}
-
-bool filesIdentical(const fs::path& lhs, const fs::path& rhs)
-{
-  std::error_code lhsEc;
-  std::error_code rhsEc;
-  const auto lhsSize = fs::file_size(lhs, lhsEc);
-  const auto rhsSize = fs::file_size(rhs, rhsEc);
-  if (lhsEc || rhsEc || lhsSize != rhsSize) {
-    return false;
-  }
-
-  std::ifstream left(lhs, std::ios::binary);
-  std::ifstream right(rhs, std::ios::binary);
-  if (!left.is_open() || !right.is_open()) {
-    return false;
-  }
-
-  constexpr std::size_t kChunk = 64 * 1024;
-  std::vector<char> leftBuf(kChunk);
-  std::vector<char> rightBuf(kChunk);
-
-  while (left && right) {
-    left.read(leftBuf.data(), static_cast<std::streamsize>(leftBuf.size()));
-    right.read(rightBuf.data(), static_cast<std::streamsize>(rightBuf.size()));
-
-    const std::streamsize leftCount = left.gcount();
-    const std::streamsize rightCount = right.gcount();
-    if (leftCount != rightCount) {
-      return false;
-    }
-    if (leftCount == 0) {
-      break;
-    }
-    if (std::memcmp(leftBuf.data(), rightBuf.data(),
-                    static_cast<std::size_t>(leftCount)) != 0) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 }  // namespace
@@ -467,59 +425,4 @@ std::unordered_map<std::string, std::string> TrackedWrites::allMappings() const
 {
   std::lock_guard lock(m_mutex);
   return m_tracked;
-}
-
-std::vector<TrackedWrites::DuplicateEntry>
-TrackedWrites::scanOverwriteDuplicates(
-    const std::string& overwrite_dir,
-    const std::vector<std::pair<std::string, std::string>>& mods) const
-{
-  std::vector<DuplicateEntry> result;
-
-  std::error_code ec;
-  if (!fs::exists(overwrite_dir, ec)) {
-    return result;
-  }
-
-  for (auto it = fs::recursive_directory_iterator(
-           overwrite_dir, fs::directory_options::skip_permission_denied, ec);
-       it != fs::recursive_directory_iterator(); ++it) {
-    if (!it->is_regular_file(ec)) {
-      continue;
-    }
-
-    auto rel = fs::relative(it->path(), overwrite_dir, ec);
-    if (ec) {
-      ec.clear();
-      continue;
-    }
-
-    std::string matchedModName;
-    std::string matchedModPath;
-    for (const auto& [modName, modPath] : mods) {
-      std::error_code modEc;
-      if (fs::exists(fs::path(modPath) / rel, modEc) && !modEc) {
-        matchedModName = modName;
-        matchedModPath = modPath;
-      }
-    }
-
-    if (matchedModPath.empty()) {
-      continue;
-    }
-
-    const fs::path modFile = fs::path(matchedModPath) / rel;
-    const bool identical   = filesIdentical(it->path(), modFile);
-
-    result.push_back(DuplicateEntry{
-        .relative_path = rel.string(),
-        .overwrite_path = it->path().string(),
-        .mod_name       = matchedModName,
-        .mod_path       = matchedModPath,
-        .state          = identical ? DuplicateState::Identical
-                                    : DuplicateState::Different,
-    });
-  }
-
-  return result;
 }

@@ -3,6 +3,7 @@
 
 #include "envdump.h"
 #include "vfs/mo2filesystem.h"
+#include "vfs/stagingpromotion.h"
 #include "vfs/trackedwrites.h"
 
 #include <QObject>
@@ -81,7 +82,7 @@ public:
   void clearRootFiles();
 
 private:
-  void flushStaging();
+  StagingPromotionResult flushStaging();
   void deployExternalMappings(const MappingType& mapping, const QString& dataDir);
   void cleanupExternalMappings();
 
