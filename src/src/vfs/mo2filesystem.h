@@ -186,6 +186,12 @@ struct Mo2FsContext
   // Not meant to stay on by default — see the June 2026 shader-cache/INI-
   // clobber fix for why keep_cache=1 exists normally.
   bool cache_disabled = false;
+
+  // When true, mo2_lookup inserts phantom directories for missing path
+  // components that look like directories (no dot).  Needed by Starfield
+  // which calls CreateFile on paths whose parents haven't been mkdir'd.
+  // Most games must leave this false to avoid shadowing real entries.
+  bool auto_create_dirs = false;
 };
 
 // Eagerly materialize the persistent catalog's resolved tree as runtime inode

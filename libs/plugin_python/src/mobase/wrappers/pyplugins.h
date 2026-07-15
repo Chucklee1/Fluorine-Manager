@@ -438,6 +438,10 @@ namespace mo2::python {
         {
             PYBIND11_OVERRIDE(bool, IPluginGame, usesVFS, );
         }
+        bool needsAutoCreateDirectories() const override
+        {
+            PYBIND11_OVERRIDE(bool, IPluginGame, needsAutoCreateDirectories, );
+        }
         QIcon gameIcon() const override
         {
             PYBIND11_OVERRIDE_PURE(QIcon, IPluginGame, gameIcon, );

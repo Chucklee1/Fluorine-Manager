@@ -664,6 +664,7 @@ bool FuseConnector::mount(
   m_context->gid                   = ::getgid();
   m_context->cache_disabled        = m_disableVfsCache ||
                                      std::getenv("FLUORINE_VFS_DISABLE_CACHE") != nullptr;
+  m_context->auto_create_dirs      = m_autoCreateDirs;
   const auto indexStart = std::chrono::steady_clock::now();
   const std::size_t prewarmed = mo2PrewarmLookupIndex(m_context.get());
   const auto indexMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -914,6 +915,13 @@ void FuseConnector::updateMapping(const MappingType& mapping)
     throw FuseConnectorException(QObject::tr("Managed game not available"));
   }
 
+  // Propagate the game's auto-create-dirs preference to the VFS context.
+  // Starfield sets this to true; most other games (e.g. BG3) leave it false.
+  m_autoCreateDirs = game->needsAutoCreateDirectories();
+  if (m_context) {
+    m_context->auto_create_dirs = m_autoCreateDirs;
+  }
+
   const QString gameDir      = game->gameDirectory().absolutePath();
   const QString dataDirPath  = game->dataDirectory().absolutePath();
   const QString dataDirName  = game->dataDirectory().dirName();
@@ -1009,6 +1017,96 @@ void FuseConnector::deployExternalMappings(const MappingType& mapping,
   const QString cleanDataDir = QDir::cleanPath(dataDir);
   const QString dataPrefix   = cleanDataDir + QStringLiteral("/");
 
+  // Helper: create a directory (and all missing parents) and record each
+  // segment we actually created so cleanup can remove it later.
+  std::error_code ec;
+  auto createTrackedDirs = [&](const fs::path& dirPath) {
+    std::vector<fs::path> toCreate;
+    for (fs::path p = dirPath; !p.empty() && !fs::exists(p, ec);
+         p = p.parent_path()) {
+      toCreate.push_back(p);
+      if (p == p.root_path()) {
+        break;
+      }
+    }
+    // Build top-down so nested dirs succeed.
+    for (auto it = toCreate.rbegin(); it != toCreate.rend(); ++it) {
+      if (fs::create_directory(*it, ec) && !ec) {
+        m_externalDirs.push_back(it->string());
+      }
+    }
+  };
+
+  // --- Pass 1: createTarget directory mappings must be processed first ---
+  // If a per-file mapping (e.g. a mod .pak) creates entries in the
+  // destination before the directory symlink is established, the
+  // directory symlink check sees real content and falls back to
+  // per-file symlinks.  Processing the directory mapping first avoids
+  // this: the symlink is created while the destination is still empty,
+  // then file mappings create their symlinks through the directory
+  // symlink into the overwrite directory.
+  for (const auto& map : mapping) {
+    const QString src =
+        QDir::cleanPath(QDir::fromNativeSeparators(map.source));
+    const QString dst =
+        QDir::cleanPath(QDir::fromNativeSeparators(map.destination));
+
+    const bool targetsDataDir =
+        (dst == cleanDataDir || dst.startsWith(dataPrefix));
+
+    if (targetsDataDir) {
+      continue;
+    }
+
+    if (!map.isDirectory || !map.createTarget) {
+      continue;
+    }
+
+    const fs::path srcPath(src.toStdString());
+    const fs::path dstPath(dst.toStdString());
+
+    if (!fs::exists(srcPath, ec)) {
+      fs::create_directories(srcPath, ec);
+      if (ec) {
+        ec.clear();
+      }
+    }
+    const bool dstExists  = fs::exists(dstPath, ec);
+    ec.clear();
+    const bool dstIsLink  = dstExists && fs::is_symlink(dstPath, ec);
+    ec.clear();
+    const bool dstIsEmpty = dstExists && fs::is_directory(dstPath, ec) &&
+                            fs::is_empty(dstPath, ec);
+    ec.clear();
+
+    if (!dstExists || dstIsLink || dstIsEmpty) {
+      createTrackedDirs(dstPath.parent_path());
+      if (dstIsLink) {
+        fs::remove(dstPath, ec);
+        ec.clear();
+      } else if (dstIsEmpty) {
+        fs::remove(dstPath, ec);
+        ec.clear();
+      }
+      fs::create_directory_symlink(srcPath, dstPath, ec);
+      if (!ec) {
+        m_externalSymlinks.push_back(dstPath.string());
+        log::debug("Deployed directory symlink {} -> {}", dst, src);
+        continue;
+      }
+      log::warn("Failed to symlink directory {} -> {}: {}", dst, src,
+                QString::fromStdString(ec.message()));
+      ec.clear();
+    } else {
+      log::warn(
+          "Mapped folder {} contains real files; falling back to per-file "
+          "symlinks. Move existing contents into {} and restart to fully "
+          "redirect new writes.",
+          dst, src);
+    }
+  }
+
+  // --- Pass 2: everything else (file mappings, non-createTarget dirs) ---
   for (const auto& map : mapping) {
     const QString src =
         QDir::cleanPath(QDir::fromNativeSeparators(map.source));
@@ -1032,89 +1130,17 @@ void FuseConnector::deployExternalMappings(const MappingType& mapping,
       continue;
     }
 
-    // Non-data-dir mapping — deploy via real symlinks so the game
-    // (running through Proton) can see the files.
-    std::error_code ec;
-
-    // Helper: create a directory (and all missing parents) and record each
-    // segment we actually created so cleanup can remove it later.
-    auto createTrackedDirs = [&](const fs::path& dirPath) {
-      std::vector<fs::path> toCreate;
-      for (fs::path p = dirPath; !p.empty() && !fs::exists(p, ec);
-           p = p.parent_path()) {
-        toCreate.push_back(p);
-        if (p == p.root_path()) {
-          break;
-        }
-      }
-      // Build top-down so nested dirs succeed.
-      for (auto it = toCreate.rbegin(); it != toCreate.rend(); ++it) {
-        if (fs::create_directory(*it, ec) && !ec) {
-          m_externalDirs.push_back(it->string());
-        }
-      }
-    };
+    // Skip createTarget directory mappings — already handled in pass 1.
+    if (map.isDirectory && map.createTarget) {
+      continue;
+    }
 
     if (map.isDirectory) {
       const fs::path srcPath(src.toStdString());
       const fs::path dstPath(dst.toStdString());
 
-      // For createTarget directory mappings (e.g. SKSE Log Redirector
-      // pointing My Games/Skyrim → Skyrim Special Edition), publish a single
-      // directory symlink so any new file the game writes under the dest
-      // path is also redirected — not just the files that exist in source
-      // at deploy time. Falls back to per-file symlinks when the dest dir
-      // already contains real content we mustn't clobber.
-      if (map.createTarget) {
-        if (!fs::exists(srcPath, ec)) {
-          fs::create_directories(srcPath, ec);
-          if (ec) {
-            ec.clear();
-          }
-        }
-        const bool dstExists  = fs::exists(dstPath, ec);
-        ec.clear();
-        const bool dstIsLink  = dstExists && fs::is_symlink(dstPath, ec);
-        ec.clear();
-        const bool dstIsEmpty = dstExists && fs::is_directory(dstPath, ec) &&
-                                fs::is_empty(dstPath, ec);
-        ec.clear();
-
-        if (!dstExists || dstIsLink || dstIsEmpty) {
-          createTrackedDirs(dstPath.parent_path());
-          if (dstIsLink) {
-            fs::remove(dstPath, ec);
-            ec.clear();
-          } else if (dstIsEmpty) {
-            fs::remove(dstPath, ec);
-            ec.clear();
-          }
-          fs::create_directory_symlink(srcPath, dstPath, ec);
-          if (!ec) {
-            m_externalSymlinks.push_back(dstPath.string());
-            log::debug("Deployed directory symlink {} -> {}", dst, src);
-            continue;
-          }
-          log::warn("Failed to symlink directory {} -> {}: {}", dst, src,
-                    QString::fromStdString(ec.message()));
-          ec.clear();
-        } else {
-          log::warn(
-              "Mapped folder {} contains real files; falling back to per-file "
-              "symlinks. Move existing contents into {} and restart to fully "
-              "redirect new writes.",
-              dst, src);
-        }
-      }
-
       if (!fs::exists(srcPath, ec)) {
         continue;
-      }
-
-      if (map.createTarget) {
-        // Pre-create the dst root so an empty source still leaves it tracked
-        // for removal on cleanup.
-        createTrackedDirs(dstPath);
       }
 
       for (auto it = fs::recursive_directory_iterator(

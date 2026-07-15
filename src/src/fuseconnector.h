@@ -51,6 +51,10 @@ public:
   // vfs/mo2filesystem.h for what this actually toggles.
   void setDisableVfsCache(bool disabled) { m_disableVfsCache = disabled; }
 
+  // When true, the FUSE VFS inserts phantom directories for missing path
+  // components (needed by Starfield).  Must be set before the next mount().
+  void setAutoCreateDirs(bool enabled) { m_autoCreateDirs = enabled; }
+
   void unmount();
   void discardStagingOnUnmount();
   bool isMounted() const;
@@ -114,6 +118,7 @@ private:
   bool m_mounted        = false;
   bool m_discardStaging = false;
   bool m_disableVfsCache = false;
+  bool m_autoCreateDirs = false;
 
   // Gives logind an accurate reason for suspend/shutdown/lock prompts while
   // mounted, instead of the generic "systemd (1)". See sleepinhibitor.h.

@@ -287,6 +287,14 @@ bool GameStarfield::prepareIni(const QString& exec)
   return true;  // no need to write to Starfield.ini
 }
 
+bool GameStarfield::needsAutoCreateDirectories() const
+{
+  // Starfield calls CreateFile("ShaderCache/Lighting/X.pso") without
+  // mkdir for intermediate directories.  The FUSE VFS must insert
+  // phantom directory entries so the kernel path resolver can continue.
+  return true;
+}
+
 QStringList GameStarfield::DLCPlugins() const
 {
   return {"Constellation.esm", "ShatteredSpace.esm", "SFBGS050.esm"};
