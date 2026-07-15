@@ -9,6 +9,8 @@
 #include "vfstree.h"
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -193,6 +195,22 @@ struct Mo2FsContext
   // flush stale kernel page cache without needing fuse_req_session(req).
   struct fuse_session* session = nullptr;
 
+  // Kernel page-cache invalidation can block while a FUSE write request owns
+  // the folio being invalidated. Running the notification from that request's
+  // worker deadlocks: the kernel waits for the FUSE reply while the worker
+  // waits for the kernel to release the folio. Queue notifications to a
+  // dedicated thread so request workers can always send their replies.
+  struct KernelInvalidation
+  {
+    fuse_ino_t ino = 0;
+    off_t offset = 0;
+    off_t length = 0;
+  };
+  std::deque<KernelInvalidation> kernel_invalidations;
+  std::mutex kernel_invalidation_mutex;
+  std::condition_variable kernel_invalidation_cv;
+  bool stop_kernel_invalidations = false;
+
   // Diagnostic toggle (Settings > Proton/Wine tab, or FLUORINE_VFS_DISABLE_CACHE
   // env var): zeroes the kernel-facing TTLs and disables keep_cache so a
   // "stale VFS data" report can be tested against caching as the suspect.
@@ -210,6 +228,10 @@ struct Mo2FsContext
 // Eagerly materialize the persistent catalog's resolved tree as runtime inode
 // and lookup entries. Must be called before the FUSE session starts.
 std::size_t mo2PrewarmLookupIndex(Mo2FsContext* ctx);
+
+// Lifecycle for the dedicated kernel page-cache invalidation worker.
+void mo2RunKernelInvalidations(Mo2FsContext* ctx);
+void mo2StopKernelInvalidations(Mo2FsContext* ctx);
 
 void mo2_init(void* userdata, struct fuse_conn_info* conn);
 void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name);

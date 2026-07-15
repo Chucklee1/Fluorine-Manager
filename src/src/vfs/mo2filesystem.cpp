@@ -1255,16 +1255,79 @@ void invalidateKernelContent(Mo2FsContext* ctx, fuse_ino_t ino,
                              off_t offset, off_t length)
 {
   if (ctx == nullptr || ctx->session == nullptr || ino == 0) return;
-  const int result = fuse_lowlevel_notify_inval_inode(
-      ctx->session, ino, offset, length);
-  if (result != 0 && result != -ENOENT) {
-    std::fprintf(stderr,
-                 "[VFS] content invalidation failed ino=%llu off=%lld len=%lld rc=%d\n",
-                 static_cast<unsigned long long>(ino),
-                 static_cast<long long>(offset),
-                 static_cast<long long>(length), result);
+
+  bool coveredByWholeInvalidation = false;
+  {
+    std::scoped_lock lock(ctx->kernel_invalidation_mutex);
+    if (ctx->stop_kernel_invalidations) return;
+
+    // Whole-inode invalidation supersedes any queued ranges for this inode.
+    // Likewise, a queued whole-inode request already covers this one.
+    if (offset == 0 && length == 0) {
+      std::erase_if(ctx->kernel_invalidations,
+                    [ino](const Mo2FsContext::KernelInvalidation& pending) {
+                      return pending.ino == ino;
+                    });
+    } else {
+      const auto whole = std::find_if(
+          ctx->kernel_invalidations.begin(), ctx->kernel_invalidations.end(),
+          [ino](const Mo2FsContext::KernelInvalidation& pending) {
+            return pending.ino == ino && pending.offset == 0 &&
+                   pending.length == 0;
+          });
+      if (whole != ctx->kernel_invalidations.end()) {
+        coveredByWholeInvalidation = true;
+      }
+    }
+    if (!coveredByWholeInvalidation) {
+      ctx->kernel_invalidations.push_back({ino, offset, length});
+    }
+  }
+  if (!coveredByWholeInvalidation) {
+    ctx->kernel_invalidation_cv.notify_one();
   }
   invalidateAttrCache(ctx, ino);
+}
+
+void runKernelInvalidations(Mo2FsContext* ctx)
+{
+  if (ctx == nullptr) return;
+
+  for (;;) {
+    Mo2FsContext::KernelInvalidation pending;
+    {
+      std::unique_lock lock(ctx->kernel_invalidation_mutex);
+      ctx->kernel_invalidation_cv.wait(lock, [ctx]() {
+        return ctx->stop_kernel_invalidations ||
+               !ctx->kernel_invalidations.empty();
+      });
+      if (ctx->stop_kernel_invalidations) return;
+      pending = ctx->kernel_invalidations.front();
+      ctx->kernel_invalidations.pop_front();
+    }
+
+    const int result = fuse_lowlevel_notify_inval_inode(
+        ctx->session, pending.ino, pending.offset, pending.length);
+    if (result != 0 && result != -ENOENT) {
+      std::fprintf(stderr,
+                   "[VFS] content invalidation failed ino=%llu off=%lld "
+                   "len=%lld rc=%d\n",
+                   static_cast<unsigned long long>(pending.ino),
+                   static_cast<long long>(pending.offset),
+                   static_cast<long long>(pending.length), result);
+    }
+  }
+}
+
+void stopKernelInvalidations(Mo2FsContext* ctx)
+{
+  if (ctx == nullptr) return;
+  {
+    std::scoped_lock lock(ctx->kernel_invalidation_mutex);
+    ctx->stop_kernel_invalidations = true;
+    ctx->kernel_invalidations.clear();
+  }
+  ctx->kernel_invalidation_cv.notify_all();
 }
 
 void flushDirtyOpenFileMetadata(Mo2FsContext* ctx, uint64_t fh, fuse_ino_t ino)
@@ -1436,6 +1499,16 @@ bool ensureReadableOpenFile(Mo2FsContext* ctx, uint64_t fh, int* outFd,
 }
 
 }  // namespace
+
+void mo2RunKernelInvalidations(Mo2FsContext* ctx)
+{
+  runKernelInvalidations(ctx);
+}
+
+void mo2StopKernelInvalidations(Mo2FsContext* ctx)
+{
+  stopKernelInvalidations(ctx);
+}
 
 std::size_t mo2PrewarmLookupIndex(Mo2FsContext* ctx)
 {

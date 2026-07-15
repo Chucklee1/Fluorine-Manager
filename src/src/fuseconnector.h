@@ -116,6 +116,7 @@ private:
 
   struct fuse_session* m_session = nullptr;
   std::thread m_fuseThread;
+  std::thread m_invalidationThread;
   bool m_mounted        = false;
   bool m_discardStaging = false;
   bool m_disableVfsCache = false;

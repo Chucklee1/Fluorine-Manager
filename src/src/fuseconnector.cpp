@@ -768,6 +768,13 @@ bool FuseConnector::mount(
             .arg(QString::fromStdString(m_mountPoint)));
   }
 
+  // Reverse inode invalidation may wait for a kernel folio currently owned by
+  // an in-flight FUSE write. Keep it off the finite request-worker pool so the
+  // request can reply and release that folio.
+  m_invalidationThread = std::thread([context = m_context]() {
+    mo2RunKernelInvalidations(context.get());
+  });
+
   m_fuseThread = std::thread([this]() {
     // Enable clone_fd: each worker thread gets its own /dev/fuse fd,
     // eliminating contention on a single fd lock under heavy parallel I/O.
@@ -812,7 +819,17 @@ void FuseConnector::unmount()
     m_fuseThread.join();
   }
 
+  if (m_context != nullptr) {
+    mo2StopKernelInvalidations(m_context.get());
+  }
+  if (m_invalidationThread.joinable()) {
+    m_invalidationThread.join();
+  }
+
   if (m_session != nullptr) {
+    if (m_context != nullptr) {
+      m_context->session = nullptr;
+    }
     fuse_session_destroy(m_session);
     m_session = nullptr;
   }
