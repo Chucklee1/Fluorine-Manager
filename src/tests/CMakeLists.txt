@@ -100,6 +100,7 @@ add_executable(test_vfs_catalog EXCLUDE_FROM_ALL
     test_vfs_catalog.cpp
     ${CMAKE_SOURCE_DIR}/src/src/vfs/vfscatalog.cpp
     ${CMAKE_SOURCE_DIR}/src/src/vfs/vfstree.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/permissionrepair.cpp
     ${CMAKE_SOURCE_DIR}/src/src/fluorinepaths.cpp
     ${CMAKE_SOURCE_DIR}/src/src/fluorineconfig.cpp
 )

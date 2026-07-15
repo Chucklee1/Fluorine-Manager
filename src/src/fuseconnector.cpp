@@ -60,6 +60,17 @@ namespace
 {
 namespace fs = std::filesystem;
 
+std::string digestPrefix(const VfsDigest& digest)
+{
+  constexpr char hex[] = "0123456789abcdef";
+  std::string result(16, '0');
+  for (size_t i = 0; i < 8; ++i) {
+    result[i * 2] = hex[digest[i] >> 4];
+    result[i * 2 + 1] = hex[digest[i] & 0x0f];
+  }
+  return result;
+}
+
 std::string decodeProcMountField(const std::string& in)
 {
   std::string out;
@@ -547,6 +558,7 @@ bool FuseConnector::mount(
   const auto treeStart = std::chrono::steady_clock::now();
   VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
   uint64_t lastProgress = 0;
+  VfsCatalogProgress finalProgress;
   std::unique_ptr<QProgressDialog> catalogProgress;
   if (qApp != nullptr && QThread::currentThread() == qApp->thread()) {
     catalogProgress = std::make_unique<QProgressDialog>(
@@ -556,15 +568,18 @@ bool FuseConnector::mount(
     catalogProgress->setMinimumDuration(750);
     catalogProgress->setAutoClose(false);
   }
-  auto tree = std::make_shared<VfsTree>(catalog.reconcileAndBuild(
+  auto catalogResult = catalog.reconcileAndBuild(
       m_dataDirPath, mods, m_overwriteDir, true,
-      [&lastProgress, &catalogProgress](const VfsCatalogProgress& p) {
+      [&lastProgress, &catalogProgress, &finalProgress](const VfsCatalogProgress& p) {
+        finalProgress = p;
         if (catalogProgress) {
           catalogProgress->setLabelText(QObject::tr(
-              "Verified %1 files; hashed %2 changed files (%3 MiB)…")
+              "Verified %1 files; hashed %2 changed files (%3 MiB at %4 MiB/s)…\n%5")
               .arg(p.files_scanned)
               .arg(p.files_hashed)
-              .arg(p.bytes_hashed / (1024 * 1024)));
+              .arg(p.bytes_hashed / (1024 * 1024))
+              .arg(p.hash_mib_per_second, 0, 'f', 1)
+              .arg(QString::fromStdString(p.current_file)));
           QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
           if (catalogProgress->wasCanceled()) {
             throw std::runtime_error("VFS catalog indexing cancelled");
@@ -579,8 +594,19 @@ bool FuseConnector::mount(
                      static_cast<unsigned long long>(p.files_hashed),
                      static_cast<unsigned long long>(p.bytes_hashed),
                      p.current_root.c_str());
-      }));
+      });
+  auto tree = std::make_shared<VfsTree>(std::move(catalogResult.tree));
   if (catalogProgress) catalogProgress->close();
+  std::fprintf(stderr,
+               "[VFS] [catalog] complete scanned=%llu hashed=%llu bytes=%llu "
+               "elapsed_ms=%llu mib_s=%.1f roots_changed=%llu profile=%s\n",
+               static_cast<unsigned long long>(finalProgress.files_scanned),
+               static_cast<unsigned long long>(finalProgress.files_hashed),
+               static_cast<unsigned long long>(finalProgress.bytes_hashed),
+               static_cast<unsigned long long>(finalProgress.elapsed_ms),
+               finalProgress.hash_mib_per_second,
+               static_cast<unsigned long long>(finalProgress.provider_roots_changed),
+               digestPrefix(catalogResult.profile_root).c_str());
   m_baseFileCache = catalog.loadBaseSnapshot(m_dataDirPath);
   m_cachedDataDirPath = m_dataDirPath;
 
@@ -868,8 +894,9 @@ void FuseConnector::rebuild(
   }
 
   VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
-  auto newTree = std::make_shared<VfsTree>(catalog.reconcileAndBuild(
-      m_dataDirPath, mods, m_overwriteDir, false));
+  auto catalogResult = catalog.reconcileAndBuild(
+      m_dataDirPath, mods, m_overwriteDir, false);
+  auto newTree = std::make_shared<VfsTree>(std::move(catalogResult.tree));
 
   // Inject file-level data-dir mappings (e.g. plugins.txt, loadorder.txt)
   injectExtraFiles(*newTree, m_extraVfsFiles);
@@ -1328,8 +1355,9 @@ void FuseConnector::flushStagingLive()
 
   // Rebuild the VFS tree to pick up new overwrite files
   VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
-  auto newTree = std::make_shared<VfsTree>(catalog.reconcileAndBuild(
-      m_dataDirPath, m_lastMods, m_overwriteDir, false));
+  auto catalogResult = catalog.reconcileAndBuild(
+      m_dataDirPath, m_lastMods, m_overwriteDir, false);
+  auto newTree = std::make_shared<VfsTree>(std::move(catalogResult.tree));
 
   {
     std::unique_lock const lock(m_context->tree_mutex);

@@ -14,6 +14,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <memory>
+#include <map>
+#include <optional>
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -22,7 +24,7 @@ namespace
 {
 namespace fs = std::filesystem;
 
-constexpr int kSchemaVersion = 1;
+constexpr int kSchemaVersion = 2;
 constexpr size_t kHashBufferSize = 1024 * 1024;
 
 struct DbCloser
@@ -166,6 +168,114 @@ struct Root
   bool backing = false;
 };
 
+void hashBytes(blake3_hasher& hasher, const void* data, size_t size)
+{
+  blake3_hasher_update(&hasher, data, size);
+}
+
+void hashString(blake3_hasher& hasher, const std::string& value)
+{
+  uint64_t size = static_cast<uint64_t>(value.size());
+  std::array<unsigned char, sizeof(size)> encoded{};
+  for (size_t i = 0; i < encoded.size(); ++i) {
+    encoded[i] = static_cast<unsigned char>(size & 0xffu);
+    size >>= 8;
+  }
+  hashBytes(hasher, encoded.data(), encoded.size());
+  hashBytes(hasher, value.data(), value.size());
+}
+
+VfsDigest finishHash(blake3_hasher& hasher)
+{
+  VfsDigest digest{};
+  static_assert(std::tuple_size_v<VfsDigest> == BLAKE3_OUT_LEN);
+  blake3_hasher_finalize(&hasher, digest.data(), digest.size());
+  return digest;
+}
+
+struct MerkleNode
+{
+  std::map<std::string, MerkleNode> directories;
+  std::map<std::string, VfsDigest> files;
+};
+
+VfsDigest hashMerkleDirectory(const MerkleNode& node)
+{
+  blake3_hasher hasher;
+  blake3_hasher_init(&hasher);
+  constexpr char domain[] = "fluorine.vfs.directory.v1";
+  hashBytes(hasher, domain, sizeof(domain) - 1);
+
+  for (const auto& [name, directory] : node.directories) {
+    const unsigned char type = 1;
+    const VfsDigest child = hashMerkleDirectory(directory);
+    hashBytes(hasher, &type, sizeof(type));
+    hashString(hasher, name);
+    hashBytes(hasher, child.data(), child.size());
+  }
+  for (const auto& [name, digest] : node.files) {
+    const unsigned char type = 0;
+    hashBytes(hasher, &type, sizeof(type));
+    hashString(hasher, name);
+    hashBytes(hasher, digest.data(), digest.size());
+  }
+  return finishHash(hasher);
+}
+
+VfsProviderRoot calculateProviderRoot(sqlite3* db, const Root& root)
+{
+  auto rows = prepare(db,
+      "SELECT normalized_path,blake3 FROM catalog_files"
+      " WHERE root_key=?1 ORDER BY normalized_path;");
+  bindText(db, rows.get(), 1, root.key);
+
+  MerkleNode merkle;
+  uint64_t fileCount = 0;
+  while (sqlite3_step(rows.get()) == SQLITE_ROW) {
+    const auto* path = reinterpret_cast<const char*>(sqlite3_column_text(rows.get(), 0));
+    const void* blob = sqlite3_column_blob(rows.get(), 1);
+    const int bytes = sqlite3_column_bytes(rows.get(), 1);
+    if (path == nullptr || blob == nullptr || bytes != BLAKE3_OUT_LEN) continue;
+
+    const std::string normalized(path);
+    const auto parts = splitPath(normalized);
+    if (parts.empty()) continue;
+    MerkleNode* directory = &merkle;
+    for (size_t i = 0; i + 1 < parts.size(); ++i) {
+      directory = &directory->directories[parts[i]];
+    }
+
+    VfsDigest content{};
+    std::memcpy(content.data(), blob, content.size());
+    blake3_hasher leaf;
+    blake3_hasher_init(&leaf);
+    constexpr char domain[] = "fluorine.vfs.file.v1";
+    hashBytes(leaf, domain, sizeof(domain) - 1);
+    hashString(leaf, normalized);
+    hashBytes(leaf, content.data(), content.size());
+    directory->files[parts.back()] = finishHash(leaf);
+    ++fileCount;
+  }
+
+  return {root.key, root.origin, root.backing, fileCount,
+          hashMerkleDirectory(merkle)};
+}
+
+VfsDigest calculateProfileRoot(const std::vector<VfsProviderRoot>& roots)
+{
+  blake3_hasher hasher;
+  blake3_hasher_init(&hasher);
+  constexpr char domain[] = "fluorine.vfs.profile.v1";
+  hashBytes(hasher, domain, sizeof(domain) - 1);
+  for (const auto& root : roots) {
+    const unsigned char role = root.is_backing ? 1 : 0;
+    hashBytes(hasher, &role, sizeof(role));
+    hashString(hasher, root.origin);
+    hashBytes(hasher, root.digest.data(), root.digest.size());
+  }
+  return finishHash(hasher);
+}
+
 void initializeSchema(sqlite3* db)
 {
   exec(db, "PRAGMA journal_mode=WAL;");
@@ -186,9 +296,20 @@ void initializeSchema(sqlite3* db)
        "CREATE INDEX IF NOT EXISTS catalog_files_seen"
        " ON catalog_files(root_key, seen_generation);");
   exec(db,
+       "CREATE TABLE IF NOT EXISTS catalog_roots("
+       " root_key TEXT PRIMARY KEY, merkle_root BLOB NOT NULL,"
+       " file_count INTEGER NOT NULL, generation INTEGER NOT NULL);");
+  exec(db,
        "CREATE TEMP TABLE IF NOT EXISTS catalog_seen("
        " root_key TEXT NOT NULL, normalized_path TEXT NOT NULL,"
        " PRIMARY KEY(root_key,normalized_path)) WITHOUT ROWID;");
+
+  auto current = prepare(db,
+      "SELECT value FROM catalog_meta WHERE key='schema_version';");
+  if (sqlite3_step(current.get()) == SQLITE_ROW &&
+      sqlite3_column_int(current.get(), 0) > kSchemaVersion) {
+    throw std::runtime_error("VFS catalog was created by a newer Fluorine version");
+  }
 
   auto stmt = prepare(db,
       "INSERT INTO catalog_meta(key,value) VALUES('schema_version',?1)"
@@ -220,13 +341,14 @@ fs::path VfsCatalog::databasePath(const std::string& data_dir)
   return fs::path(fluorineVfsCacheDir().toStdString()) / name;
 }
 
-VfsTree VfsCatalog::reconcileAndBuild(
+VfsCatalogResult VfsCatalog::reconcileAndBuild(
     const std::string& data_dir,
     const std::vector<std::pair<std::string, std::string>>& mods,
     const std::string& overwrite_dir,
     bool scan_base,
     ProgressCallback progress)
 {
+  const auto scanStart = std::chrono::steady_clock::now();
   std::error_code ec;
   fs::create_directories(m_database_path.parent_path(), ec);
   if (ec) {
@@ -300,14 +422,41 @@ VfsTree VfsCatalog::reconcileAndBuild(
     auto prune = prepare(db.get(),
         "DELETE FROM catalog_files WHERE root_key=?1 AND normalized_path NOT IN"
         " (SELECT normalized_path FROM catalog_seen WHERE root_key=?1);");
+    auto findRoot = prepare(db.get(),
+        "SELECT merkle_root FROM catalog_roots WHERE root_key=?1;");
+    auto upsertRoot = prepare(db.get(),
+        "INSERT INTO catalog_roots(root_key,merkle_root,file_count,generation)"
+        " VALUES(?1,?2,?3,?4) ON CONFLICT(root_key) DO UPDATE SET"
+        " merkle_root=excluded.merkle_root,file_count=excluded.file_count,"
+        " generation=excluded.generation;");
 
     VfsCatalogProgress state;
+    std::vector<VfsProviderRoot> providerRoots;
+    providerRoots.reserve(roots.size() + (scan_base ? 0 : 1));
+    if (!scan_base) {
+      providerRoots.push_back(calculateProviderRoot(
+          db.get(), Root{data_dir, data_dir, "_base_game", true}));
+    }
+    const auto reportProgress = [&]() {
+      state.elapsed_ms = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::steady_clock::now() - scanStart).count());
+      state.hash_mib_per_second = state.elapsed_ms == 0 ? 0.0 :
+          (static_cast<double>(state.bytes_hashed) / (1024.0 * 1024.0)) /
+          (static_cast<double>(state.elapsed_ms) / 1000.0);
+      if (progress) progress(state);
+    };
     for (const Root& root : roots) {
       state.current_root = root.path;
-      if (!fs::exists(root.path, ec)) continue;
       const std::string rootPrefix = fs::path(root.path).string();
 
-      for (auto it = fs::recursive_directory_iterator(
+      const bool rootExists = fs::exists(root.path, ec);
+      if (ec) {
+        throw std::runtime_error("Unable to inspect VFS provider " + root.path +
+                                 ": " + ec.message());
+      }
+      if (rootExists) {
+        for (auto it = fs::recursive_directory_iterator(
                root.path, fs::directory_options::skip_permission_denied, ec);
            !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         const fs::directory_entry& entry = *it;
@@ -354,7 +503,9 @@ VfsTree VfsCatalog::reconcileAndBuild(
           if (reuseHash) std::memcpy(digest.data(), blob, digest.size());
         }
         if (!reuseHash) {
-          if (progress) progress(state);  // show the file count before a long hash
+          state.current_file = full;
+          state.current_file_size = static_cast<uint64_t>(st.st_size);
+          reportProgress();  // show the file before a long hash
           bool stable = false;
           for (int attempt = 0; attempt < 3; ++attempt) {
             const struct stat before = st;
@@ -376,6 +527,7 @@ VfsTree VfsCatalog::reconcileAndBuild(
           }
           ++state.files_hashed;
           state.bytes_hashed += static_cast<uint64_t>(st.st_size);
+          reportProgress();
         }
 
         if (!reuseHash) {
@@ -411,8 +563,11 @@ VfsTree VfsCatalog::reconcileAndBuild(
                              timePoint(st.st_mtim), root.origin, root.backing,
                              st.st_mode & 07777);
         ++tree.file_count;
+        state.current_file.clear();
+        state.current_file_size = 0;
 
-        if (progress && (state.files_scanned % 2048 == 0)) progress(state);
+        if (progress && (state.files_scanned % 2048 == 0)) reportProgress();
+        }
       }
       ec.clear();
 
@@ -420,11 +575,39 @@ VfsTree VfsCatalog::reconcileAndBuild(
       sqlite3_clear_bindings(prune.get());
       bindText(db.get(), prune.get(), 1, root.key);
       if (sqlite3_step(prune.get()) != SQLITE_DONE) throwDb(db.get(), "Pruning catalog root");
+
+      VfsProviderRoot providerRoot = calculateProviderRoot(db.get(), root);
+      sqlite3_reset(findRoot.get());
+      sqlite3_clear_bindings(findRoot.get());
+      bindText(db.get(), findRoot.get(), 1, root.key);
+      bool rootChanged = true;
+      if (sqlite3_step(findRoot.get()) == SQLITE_ROW) {
+        const void* old = sqlite3_column_blob(findRoot.get(), 0);
+        const int bytes = sqlite3_column_bytes(findRoot.get(), 0);
+        rootChanged = old == nullptr || bytes != static_cast<int>(providerRoot.digest.size()) ||
+                      std::memcmp(old, providerRoot.digest.data(), providerRoot.digest.size()) != 0;
+      }
+      if (rootChanged) ++state.provider_roots_changed;
+
+      sqlite3_reset(upsertRoot.get());
+      sqlite3_clear_bindings(upsertRoot.get());
+      bindText(db.get(), upsertRoot.get(), 1, root.key);
+      sqlite3_bind_blob(upsertRoot.get(), 2, providerRoot.digest.data(),
+                        providerRoot.digest.size(), SQLITE_TRANSIENT);
+      sqlite3_bind_int64(upsertRoot.get(), 3, providerRoot.file_count);
+      sqlite3_bind_int64(upsertRoot.get(), 4, generation);
+      if (sqlite3_step(upsertRoot.get()) != SQLITE_DONE) {
+        throwDb(db.get(), "Updating catalog Merkle root");
+      }
+      providerRoots.push_back(std::move(providerRoot));
     }
 
+    const VfsDigest profileRoot = calculateProfileRoot(providerRoots);
     exec(db.get(), "COMMIT;");
-    if (progress) progress(state);
-    return tree;
+    state.current_file.clear();
+    state.current_file_size = 0;
+    reportProgress();
+    return {std::move(tree), std::move(providerRoots), profileRoot};
   } catch (...) {
     sqlite3_exec(db.get(), "ROLLBACK;", nullptr, nullptr, nullptr);
     throw;
