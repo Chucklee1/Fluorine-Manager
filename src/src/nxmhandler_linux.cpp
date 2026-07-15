@@ -243,6 +243,45 @@ void runDesktopCommand(const QString& program, const QStringList& arguments)
   }
 }
 
+void refreshDesktopAssociationCaches(const QString& appsDir)
+{
+  runDesktopCommand(QStringLiteral("update-desktop-database"), QStringList{appsDir});
+  runDesktopCommand(QStringLiteral("xdg-desktop-menu"),
+                    QStringList{QStringLiteral("forceupdate")});
+}
+
+// Older releases also wrote user preferences beside the desktop files. That
+// mimeapps.list location is deprecated, but clean up our entries when the file
+// already exists so upgrading users are not left with conflicting defaults.
+// Never create the deprecated file as part of cleanup.
+void cleanLegacyMimeAppsList(const QString& path)
+{
+  if (!QFileInfo::exists(path)) {
+    return;
+  }
+
+  QStringList lines = readMimeAppsList(path);
+  const QStringList sections = {
+      QStringLiteral("[Default Applications]"),
+      QStringLiteral("[Added Associations]"),
+      QStringLiteral("[Removed Associations]"),
+  };
+
+  for (const auto& scheme : UrlSchemes) {
+    for (const auto& section : sections) {
+      updateMimeSection(
+          lines, section, scheme,
+          [](QStringList desktopFiles) {
+            removeDesktopFile(desktopFiles, NxmDesktopFile);
+            removeDesktopFile(desktopFiles, LegacyNxmDesktopFile);
+            return desktopFiles;
+          },
+          false);
+    }
+  }
+
+  writeTextFile(path, lines.join('\n') + "\n");
+}
 
 // xdg-desktop-portal remembers chooser picks in its permission store. An
 // earlier build registered both com.fluorine.manager.desktop and
@@ -498,9 +537,13 @@ void NxmHandlerLinux::registerHandler()
 
   QFile::remove(appsDir + "/" + LegacyNxmDesktopFile);
 
+  cleanLegacyMimeAppsList(appsDir + "/mimeapps.list");
+
   for (const auto& scheme : UrlSchemes) {
     updateMimeAppsList(configDir + "/mimeapps.list", scheme, NxmDesktopFile);
   }
+
+  refreshDesktopAssociationCaches(appsDir);
 
   for (const auto& scheme : UrlSchemes) {
     clearStalePortalChoice(scheme);
@@ -527,8 +570,12 @@ void NxmHandlerLinux::unregisterHandler()
     removeMimeAppsAssociation(configDir + "/mimeapps.list", scheme, NxmDesktopFile);
   }
 
+  cleanLegacyMimeAppsList(appsDir + "/mimeapps.list");
+
   QFile::remove(appsDir + "/" + NxmDesktopFile);
   QFile::remove(appsDir + "/" + LegacyNxmDesktopFile);
+
+  refreshDesktopAssociationCaches(appsDir);
 
   for (const auto& scheme : UrlSchemes) {
     clearStalePortalChoice(scheme);
