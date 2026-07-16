@@ -101,4 +101,25 @@ RUN uv pip install --system --break-system-packages \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain stable --profile minimal
 
+# ── libloot (LOOT's library) Python bindings — for OpenMW "Sort with LOOT" ──
+# No Linux wheel is published, so we build from source with maturin against the
+# bundled interpreter and install it into /opt/python-bundled. The wheel/project
+# is named "libloot" but the importable module is "loot" (python/Cargo.toml
+# [lib] name = "loot"). build-inner.sh stages the resulting loot*.so into the
+# runtime site-packages. The whole step is best-effort/optional at runtime: if
+# the module is absent the "Sort with LOOT" tool degrades to a clear message.
+ARG LIBLOOT_VERSION=0.29.6
+RUN uv pip install --system --break-system-packages \
+      --python /opt/python-bundled/bin/python3 --no-cache "maturin>=1.8,<2.0" && \
+    git clone --depth 1 --branch "${LIBLOOT_VERSION}" \
+      https://github.com/loot/libloot /tmp/libloot && \
+    /opt/python-bundled/bin/python3 -m maturin build --release \
+      --manifest-path /tmp/libloot/python/Cargo.toml \
+      --interpreter /opt/python-bundled/bin/python3 \
+      --compatibility linux --out /tmp/libloot-wheels && \
+    uv pip install --system --break-system-packages \
+      --python /opt/python-bundled/bin/python3 --no-cache /tmp/libloot-wheels/*.whl && \
+    /opt/python-bundled/bin/python3 -c "import loot; print('libloot', loot.libloot_version())" && \
+    rm -rf /tmp/libloot /tmp/libloot-wheels
+
 WORKDIR /build

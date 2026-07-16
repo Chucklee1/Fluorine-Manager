@@ -442,6 +442,14 @@ namespace mo2::python {
         {
             PYBIND11_OVERRIDE(bool, IPluginGame, needsAutoCreateDirectories, );
         }
+        QStringList pluginFileExtensions() const override
+        {
+            PYBIND11_OVERRIDE(QStringList, IPluginGame, pluginFileExtensions, );
+        }
+        QString sortToolName() const override
+        {
+            PYBIND11_OVERRIDE(QString, IPluginGame, sortToolName, );
+        }
         QIcon gameIcon() const override
         {
             PYBIND11_OVERRIDE_PURE(QIcon, IPluginGame, gameIcon, );

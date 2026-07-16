@@ -333,14 +333,33 @@ rm -f  "${PYTHON_OUT}/lib/python3.12/turtle.py"
 # are not needed at runtime. PyQt6 is staged separately to plugins/libs/PyQt6/.
 rm -rf "${PYTHON_OUT}/lib/python3.12/site-packages"
 mkdir -p "${PYTHON_OUT}/lib/python3.12/site-packages"
-# Copy runtime-required packages back in
-for pkg in psutil vdf larian_formats; do
+# Copy runtime-required packages back in.
+# `loot` is libloot's Python binding (a single loot*.so extension), used by the
+# OpenMW "Sort with LOOT" tool. It is optional: if the build image didn't
+# produce it, the find_spec lookup returns nothing and we simply skip it — the
+# tool then degrades gracefully at runtime.
+for pkg in psutil vdf larian_formats loot; do
     pkg_dir="$("${PBS_SRC}/bin/python3" -c "import importlib.util; s=importlib.util.find_spec('${pkg}'); print(s.submodule_search_locations[0] if s and s.submodule_search_locations else (s.origin if s else ''))" 2>/dev/null || true)"
     if [ -d "${pkg_dir}" ]; then
         cp -a "${pkg_dir}" "${PYTHON_OUT}/lib/python3.12/site-packages/"
     elif [ -f "${pkg_dir}" ]; then
         cp -f "${pkg_dir}" "${PYTHON_OUT}/lib/python3.12/site-packages/"
     fi
+done
+
+# Bundle any non-system shared libs the libloot extension (loot*.so) links
+# against. The main dep-collection loops above don't scan the bundled Python
+# site-packages, and loot*.so is dlopen'd by the interpreter with our lib/ on
+# LD_LIBRARY_PATH, so its deps must live there. Usually a static Rust build only
+# needs glibc/libgcc (host-provided) and this finds nothing — but it future-
+# proofs the bundle if a transitive crate pulls in a native library.
+find "${PYTHON_OUT}/lib/python3.12/site-packages" -name "loot*.so" 2>/dev/null | while read -r loot_so; do
+    ldd "${loot_so}" 2>/dev/null | grep "=>" | awk '{print $3}' | grep "^/" | while read -r dep; do
+        dep_name="$(basename "${dep}")"
+        echo "${dep_name}" | grep -qE "${SKIP_PATTERN}" && continue
+        [ -f "${OUT_DIR}/lib/${dep_name}" ] && continue
+        cp -Lf "${dep}" "${OUT_DIR}/lib/" 2>/dev/null && echo "  + ${dep_name} (libloot dep)" || true
+    done
 done
 
 # Pre-compile .py → .pyc (PBS ships .py + .pyc; this ensures cache is fresh).

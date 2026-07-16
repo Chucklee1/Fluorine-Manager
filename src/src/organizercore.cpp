@@ -1997,50 +1997,46 @@ void OrganizerCore::updateModsActiveState(const QList<unsigned int>& modIndices,
                                           bool active)
 {
   int enabled = 0;
+  // Use the game's own plugin extensions instead of a hardcoded esm/esl/esp
+  // set, so games with their own formats (OpenMW: .omwaddon/.omwgame/
+  // .omwscripts) get their plugins toggled along with the mod. Matching is
+  // done manually and case-insensitively: QDir name filters are case-sensitive
+  // on Linux, which silently skipped e.g. "Foo.ESP".
+  QStringList pluginExtensions;
+  for (const QString& ext : managedGame()->pluginFileExtensions()) {
+    pluginExtensions << ext.toLower();
+  }
   for (auto index : modIndices) {
     ModInfo::Ptr const modInfo = ModInfo::getByIndex(index);
     QDir const dir(modInfo->absolutePath());
-    for (const QString& esm : dir.entryList(QStringList() << "*.esm", QDir::Files)) {
-      const FileEntryPtr file = m_DirectoryStructure->findFile(ToWString(esm));
-      if (file.get() == nullptr) {
-        log::warn("failed to activate {}", esm);
+    for (const QString& fileName : dir.entryList(QDir::Files)) {
+      QString matchedExt;
+      for (const QString& ext : pluginExtensions) {
+        if (fileName.endsWith("." + ext, Qt::CaseInsensitive)) {
+          matchedExt = ext;
+          break;
+        }
+      }
+      if (matchedExt.isEmpty()) {
         continue;
       }
 
-      if (active != m_PluginList.isEnabled(esm) && file->getAlternatives().empty()) {
-        m_PluginList.blockSignals(true);
-        m_PluginList.enableESP(esm, active);
-        m_PluginList.blockSignals(false);
-      }
-    }
-
-    for (const QString& esl : dir.entryList(QStringList() << "*.esl", QDir::Files)) {
-      const FileEntryPtr file = m_DirectoryStructure->findFile(ToWString(esl));
+      const FileEntryPtr file = m_DirectoryStructure->findFile(ToWString(fileName));
       if (file.get() == nullptr) {
-        log::warn("failed to activate {}", esl);
+        log::warn("failed to activate {}", fileName);
         continue;
       }
 
-      if (active != m_PluginList.isEnabled(esl) && file->getAlternatives().empty()) {
+      if (active != m_PluginList.isEnabled(fileName) &&
+          file->getAlternatives().empty()) {
         m_PluginList.blockSignals(true);
-        m_PluginList.enableESP(esl, active);
+        m_PluginList.enableESP(fileName, active);
         m_PluginList.blockSignals(false);
-        ++enabled;
-      }
-    }
-    QStringList const esps = dir.entryList(QStringList() << "*.esp", QDir::Files);
-    for (const QString& esp : esps) {
-      const FileEntryPtr file = m_DirectoryStructure->findFile(ToWString(esp));
-      if (file.get() == nullptr) {
-        log::warn("failed to activate {}", esp);
-        continue;
-      }
-
-      if (active != m_PluginList.isEnabled(esp) && file->getAlternatives().empty()) {
-        m_PluginList.blockSignals(true);
-        m_PluginList.enableESP(esp, active);
-        m_PluginList.blockSignals(false);
-        ++enabled;
+        // masters don't count towards the "multiple plugins activated" warning
+        // (same exemption the old code gave .esm files)
+        if (matchedExt != "esm" && matchedExt != "omwgame") {
+          ++enabled;
+        }
       }
     }
   }
