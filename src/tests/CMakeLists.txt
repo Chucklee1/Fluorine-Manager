@@ -6,7 +6,7 @@ find_package(SQLite3 REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # ---------------------------------------------------------------------------
-# OpenMW native config generation tests
+# Python regression tests
 # ---------------------------------------------------------------------------
 add_test(
     NAME test_openmw_cfg
@@ -15,6 +15,10 @@ add_test(
 add_test(
     NAME test_flatpak_access
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_flatpak_access.py
+)
+add_test(
+    NAME test_epic_utils
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_epic_utils.py
 )
 
 # ---------------------------------------------------------------------------
