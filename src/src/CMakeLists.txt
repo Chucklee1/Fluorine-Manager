@@ -41,6 +41,7 @@ file(GLOB ORGANIZER_SOURCES
 # These files are compiled into libuibase.so (shared with plugins) — exclude from organizer.
 list(REMOVE_ITEM ORGANIZER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gamedetection.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/heroicjson.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/steamdetection.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/vdfparser.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/iconextractor.cpp
