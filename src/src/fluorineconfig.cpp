@@ -118,13 +118,16 @@ QString FluorineConfig::compatDataPath() const
     return {};
   }
 
-  QDir prefixDir(prefix_path);
+  QDir prefixDir(QDir::cleanPath(prefix_path));
   if (prefixDir.dirName() == "pfx") {
     prefixDir.cdUp();
     return QDir::cleanPath(prefixDir.absolutePath());
   }
 
-  return QDir::cleanPath(QFileInfo(prefix_path).dir().absolutePath());
+  // Some older/imported configurations point at the compatdata root itself
+  // instead of its pfx child. In that case the deletion boundary is the
+  // configured directory, never its parent.
+  return QDir::cleanPath(prefixDir.absolutePath());
 }
 
 bool FluorineConfig::markPrefixOwned() const
@@ -145,7 +148,8 @@ bool FluorineConfig::markPrefixOwned() const
 bool FluorineConfig::canDestroyPrefix() const
 {
   const QString compatData = compatDataPath();
-  if (compatData.isEmpty() || QFileInfo(compatData).isSymLink()) {
+  if (compatData.isEmpty() || QFileInfo(compatData).isSymLink() ||
+      QFileInfo(prefix_path).isSymLink()) {
     return false;
   }
 

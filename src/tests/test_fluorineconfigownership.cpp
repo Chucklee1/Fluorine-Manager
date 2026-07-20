@@ -25,6 +25,24 @@ TEST(FluorineConfigOwnership, RefusesUnmarkedCustomPrefix)
   EXPECT_FALSE(config.canDestroyPrefix());
 }
 
+TEST(FluorineConfigOwnership, TreatsDirectCompatibilityRootAsDeletionBoundary)
+{
+  QTemporaryDir temporary;
+  ASSERT_TRUE(temporary.isValid());
+
+  const QString root = QDir(temporary.path()).filePath("direct-root");
+  ASSERT_TRUE(QDir().mkpath(QDir(root).filePath("pfx/drive_c")));
+
+  FluorineConfig config;
+  config.prefix_path = root;
+
+  EXPECT_EQ(config.compatDataPath(), QDir::cleanPath(root));
+  EXPECT_FALSE(config.canDestroyPrefix());
+
+  ASSERT_TRUE(config.markPrefixOwned());
+  EXPECT_TRUE(config.canDestroyPrefix());
+}
+
 TEST(FluorineConfigOwnership, AcceptsMarkedManagedPrefix)
 {
   QTemporaryDir temporary;
@@ -96,5 +114,26 @@ TEST(FluorineConfigOwnership, RefusesSymlinkedCompatibilityRoot)
   FluorineConfig config;
   config.prefix_path = QDir(link).filePath("pfx");
   EXPECT_FALSE(config.markPrefixOwned());
+  EXPECT_FALSE(config.canDestroyPrefix());
+}
+
+TEST(FluorineConfigOwnership, RefusesSymlinkedPfxInsideMarkedRoot)
+{
+  QTemporaryDir temporary;
+  ASSERT_TRUE(temporary.isValid());
+
+  const QString target = QDir(temporary.path()).filePath("external-pfx");
+  ASSERT_TRUE(QDir().mkpath(QDir(target).filePath("drive_c")));
+
+  const QString root = QDir(temporary.path()).filePath("managed-root");
+  ASSERT_TRUE(QDir().mkpath(root));
+  ASSERT_TRUE(QFile::link(target, QDir(root).filePath("pfx")));
+
+  QFile marker(QDir(root).filePath(".fluorine-managed-prefix"));
+  ASSERT_TRUE(marker.open(QIODevice::WriteOnly));
+  marker.close();
+
+  FluorineConfig config;
+  config.prefix_path = QDir(root).filePath("pfx");
   EXPECT_FALSE(config.canDestroyPrefix());
 }
