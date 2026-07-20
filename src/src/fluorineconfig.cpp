@@ -1,4 +1,5 @@
 #include "fluorineconfig.h"
+#include "fluorinepaths.h"
 
 #include <QDir>
 #include <QFile>
@@ -15,6 +16,8 @@
 
 namespace
 {
+constexpr auto PrefixOwnershipMarker = ".fluorine-managed-prefix";
+
 QString fluorineConfigPath()
 {
   QString configRoot = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
@@ -124,12 +127,57 @@ QString FluorineConfig::compatDataPath() const
   return QDir::cleanPath(QFileInfo(prefix_path).dir().absolutePath());
 }
 
-void FluorineConfig::destroyPrefix() const
+bool FluorineConfig::markPrefixOwned() const
+{
+  const QString compatData = compatDataPath();
+  if (compatData.isEmpty() || QFileInfo(compatData).isSymLink() ||
+      !QDir().mkpath(compatData)) {
+    return false;
+  }
+
+  QFile marker(QDir(compatData).filePath(QString::fromLatin1(PrefixOwnershipMarker)));
+  if (!marker.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+    return false;
+  }
+  return marker.write("Fluorine Manager managed prefix\n") >= 0;
+}
+
+bool FluorineConfig::canDestroyPrefix() const
+{
+  const QString compatData = compatDataPath();
+  if (compatData.isEmpty() || QFileInfo(compatData).isSymLink()) {
+    return false;
+  }
+
+  const QFileInfo marker(
+      QDir(compatData).filePath(QString::fromLatin1(PrefixOwnershipMarker)));
+  if (marker.isFile() && !marker.isSymLink()) {
+    return true;
+  }
+
+  // Prefixes created before ownership markers were introduced are safe only
+  // at Fluorine's historical default location. Custom legacy locations must
+  // be removed manually rather than risking unrelated or externally managed
+  // data.
+  const QString legacyDefault =
+      QDir(fluorineDataDir()).filePath(QStringLiteral("Prefix"));
+  return QDir::cleanPath(compatData) == QDir::cleanPath(legacyDefault);
+}
+
+bool FluorineConfig::destroyPrefix() const
 {
   const QString compatData = compatDataPath();
   if (compatData.isEmpty()) {
     deleteConfig();
-    return;
+    return true;
+  }
+
+  if (!canDestroyPrefix()) {
+    MOBase::log::error(
+        "Refusing to delete unowned Wine prefix root '{}'. Remove it manually "
+        "if it is no longer needed.",
+        compatData);
+    return false;
   }
 
   // Kill any wine processes still bound to this prefix. Otherwise they hold
@@ -177,10 +225,12 @@ void FluorineConfig::destroyPrefix() const
       MOBase::log::warn("destroyPrefix: failed to remove '{}' — files may be "
                         "locked by lingering processes",
                         compatData.toStdString());
+      return false;
     }
   }
 
   deleteConfig();
+  return true;
 }
 
 bool FluorineConfig::isSetup()

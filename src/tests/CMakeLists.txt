@@ -5,6 +5,8 @@ find_package(GTest REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/prefix_safety_tests.cmake)
+
 # ---------------------------------------------------------------------------
 # OpenMW native config generation tests
 # ---------------------------------------------------------------------------

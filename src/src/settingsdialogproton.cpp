@@ -225,8 +225,34 @@ void ProtonSettingsTab::onCreatePrefix()
   }
 
   const QString pfxPath = QDir(basePath).filePath("pfx");
+  const QFileInfo baseInfo(basePath);
+  const QFileInfo pfxInfo(pfxPath);
+  FluorineConfig ownership;
+  ownership.prefix_path = pfxPath;
+
+  const bool baseHasContent =
+      QDir(basePath).exists() &&
+      !QDir(basePath)
+           .entryList(QDir::AllEntries | QDir::NoDotAndDotDot)
+           .isEmpty();
+  if (baseInfo.isSymLink() || pfxInfo.isSymLink() ||
+      (baseHasContent && !ownership.canDestroyPrefix())) {
+    QMessageBox::warning(
+        parentWidget(), tr("Unsafe Prefix Location"),
+        tr("Fluorine will not initialize an existing or externally managed "
+           "prefix at:\n%1\n\nChoose an empty directory reserved for Fluorine.")
+            .arg(basePath));
+    ui->protonStatusLabel->setText(tr("Select an empty Fluorine prefix location"));
+    return;
+  }
+
   if (!QDir().mkpath(pfxPath)) {
     ui->protonStatusLabel->setText(tr("Failed to create prefix directory"));
+    return;
+  }
+
+  if (!ownership.markPrefixOwned()) {
+    ui->protonStatusLabel->setText(tr("Failed to mark prefix as Fluorine-managed"));
     return;
   }
 
@@ -245,7 +271,24 @@ void ProtonSettingsTab::onDeletePrefix()
     return;
   }
 
-  cfg->destroyPrefix();
+  const auto answer = QMessageBox::warning(
+      parentWidget(), tr("Delete Prefix"),
+      tr("This will permanently delete Fluorine's Wine prefix at:\n%1\n\n"
+         "Continue?")
+          .arg(cfg->compatDataPath()),
+      QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+  if (answer != QMessageBox::Yes) {
+    return;
+  }
+
+  if (!cfg->destroyPrefix()) {
+    QMessageBox::critical(
+        parentWidget(), tr("Prefix Not Deleted"),
+        tr("Fluorine refused to delete this prefix because it could not verify "
+           "ownership. Remove it manually if it is no longer needed."));
+    ui->protonStatusLabel->setText(tr("Prefix ownership could not be verified"));
+    return;
+  }
 
   ui->prefixLocationEdit->clear();
   ui->protonStatusLabel->setText(tr("No Prefix"));
@@ -262,6 +305,25 @@ void ProtonSettingsTab::onRecreatePrefix()
   if (!cfg.has_value() || !cfg->prefixExists()) {
     ui->protonStatusLabel->setText(tr("No existing prefix to recreate"));
     refreshState();
+    return;
+  }
+
+  if (!cfg->canDestroyPrefix()) {
+    QMessageBox::critical(
+        parentWidget(), tr("Prefix Not Recreated"),
+        tr("Fluorine refused to recreate this prefix because it could not "
+           "verify ownership."));
+    ui->protonStatusLabel->setText(tr("Prefix ownership could not be verified"));
+    return;
+  }
+
+  const auto answer = QMessageBox::warning(
+      parentWidget(), tr("Recreate Prefix"),
+      tr("This will delete and rebuild Fluorine's Wine prefix at:\n%1\n\n"
+         "Continue?")
+          .arg(cfg->prefix_path),
+      QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+  if (answer != QMessageBox::Yes) {
     return;
   }
 

@@ -422,7 +422,13 @@ void PrefixSetupDialog::onDeleteAndClose()
   // Delete the prefix.
   FluorineConfig cfg;
   cfg.prefix_path = m_prefixPath;
-  cfg.destroyPrefix();
+  if (!cfg.destroyPrefix()) {
+    QMessageBox::critical(
+        this, tr("Prefix Not Deleted"),
+        tr("Fluorine refused to delete this prefix because it could not verify "
+           "ownership."));
+    return;
+  }
 
   reject();
 }
