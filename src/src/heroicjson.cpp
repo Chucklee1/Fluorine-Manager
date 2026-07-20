@@ -27,6 +27,9 @@ HeroicEpicInstall parseInstall(const QJsonObject& game, const QString& fallbackA
   result.is_installed = game.contains(QStringLiteral("is_installed"))
                             ? game.value(QStringLiteral("is_installed")).toBool()
                             : installedByPresence;
+  result.is_dlc = install.contains(QStringLiteral("is_dlc"))
+                      ? install.value(QStringLiteral("is_dlc")).toBool()
+                      : game.value(QStringLiteral("is_dlc")).toBool();
   return result;
 }
 }  // namespace

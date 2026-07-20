@@ -377,7 +377,7 @@ QVector<DetectedGame> detectHeroicGames()
         const QVector<HeroicEpicInstall> installs =
             parseHeroicEpicInstalls(f.readAll());
         for (const HeroicEpicInstall& install : installs) {
-          if (!install.is_installed ||
+          if (!install.is_installed || install.is_dlc ||
               install.platform.compare(QStringLiteral("windows"),
                                        Qt::CaseInsensitive) != 0 ||
               install.install_path.isEmpty() ||

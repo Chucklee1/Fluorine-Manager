@@ -14,7 +14,8 @@ TEST(HeroicJson, ParsesModernLibraryCache)
           "is_installed": true,
           "install": {
             "install_path": "/games/Cyberpunk2077",
-            "platform": "Windows"
+            "platform": "Windows",
+            "is_dlc": false
           }
         },
         {
@@ -40,7 +41,33 @@ TEST(HeroicJson, ParsesModernLibraryCache)
   EXPECT_EQ(installs[0].install_path, QStringLiteral("/games/Cyberpunk2077"));
   EXPECT_EQ(installs[0].platform, QStringLiteral("Windows"));
   EXPECT_TRUE(installs[0].is_installed);
+  EXPECT_FALSE(installs[0].is_dlc);
   EXPECT_FALSE(installs[1].is_installed);
+}
+
+TEST(HeroicJson, ParsesDlcFlagFromModernNestedInstall)
+{
+  const QByteArray json = R"json(
+    {
+      "library": [
+        {
+          "app_name": "CyberpunkDlc",
+          "title": "Cyberpunk 2077: Phantom Liberty",
+          "is_installed": true,
+          "install": {
+            "install_path": "/games/Cyberpunk2077",
+            "platform": "Windows",
+            "is_dlc": true
+          }
+        }
+      ]
+    }
+  )json";
+
+  const QVector<HeroicEpicInstall> installs = parseHeroicEpicInstalls(json);
+
+  ASSERT_EQ(installs.size(), 1);
+  EXPECT_TRUE(installs[0].is_dlc);
 }
 
 TEST(HeroicJson, TreatsLegendaryInstalledEntriesAsInstalled)
@@ -51,7 +78,8 @@ TEST(HeroicJson, TreatsLegendaryInstalledEntriesAsInstalled)
         "app_name": "Ginger",
         "title": "Cyberpunk 2077",
         "install_path": "/games/Cyberpunk2077",
-        "platform": "Windows"
+        "platform": "Windows",
+        "is_dlc": true
       }
     }
   )json";
@@ -63,6 +91,7 @@ TEST(HeroicJson, TreatsLegendaryInstalledEntriesAsInstalled)
   EXPECT_EQ(installs[0].install_path, QStringLiteral("/games/Cyberpunk2077"));
   EXPECT_EQ(installs[0].platform, QStringLiteral("Windows"));
   EXPECT_TRUE(installs[0].is_installed);
+  EXPECT_TRUE(installs[0].is_dlc);
 }
 
 TEST(HeroicJson, UsesObjectKeyWhenLegendaryOmitsAppName)

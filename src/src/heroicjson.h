@@ -13,6 +13,7 @@ struct HeroicEpicInstall
   QString install_path;
   QString platform;
   bool is_installed = false;
+  bool is_dlc       = false;
 };
 
 /// Parse either Heroic's modern legendary_library.json cache or Legendary's
