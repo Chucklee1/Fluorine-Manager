@@ -21,3 +21,4 @@ target_link_libraries(test_fluorineconfigownership PRIVATE
 )
 add_test(NAME test_fluorineconfigownership COMMAND test_fluorineconfigownership)
 add_custom_target(prefix-safety-tests DEPENDS test_fluorineconfigownership)
+add_dependencies(fluorine-tests test_fluorineconfigownership)
