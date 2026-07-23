@@ -5,6 +5,7 @@
 #include "vfs/mo2filesystem.h"
 #include "vfs/stagingpromotion.h"
 #include "vfs/trackedwrites.h"
+#include "vfs/vfsindex.h"
 
 #include <QObject>
 #include <QString>
@@ -45,6 +46,7 @@ public:
 
   void setPluginLoadOrder(const std::vector<std::string>& load_order);
   void setTrackingFilePath(const std::string& path);
+  void setIndexPublicationContext(VfsIndexPublicationContext context);
   std::shared_ptr<TrackedWrites> trackedWrites() const;
 
   // Diagnostic: zeroes the VFS's kernel-facing cache TTLs and disables
@@ -83,6 +85,8 @@ public:
 
 private:
   StagingPromotionResult flushStaging();
+  VfsIndexPublicationResult publishIndex(
+      VfsTree& tree, const VfsCatalogResult& catalog_result);
   void deployExternalMappings(const MappingType& mapping, const QString& dataDir);
   void cleanupExternalMappings();
 
@@ -99,6 +103,7 @@ private:
 
   std::vector<std::pair<std::string, std::string>> m_lastMods;
   std::vector<std::string> m_pluginLoadOrder;
+  VfsIndexPublicationContext m_indexPublicationContext;
 
   // Symlinks created for non-data-dir mappings (e.g. Paks, OBSE, UE4SS).
   std::vector<std::string> m_externalSymlinks;

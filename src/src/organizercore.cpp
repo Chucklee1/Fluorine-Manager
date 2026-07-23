@@ -1,6 +1,7 @@
 #include "organizercore.h"
 #include "categoriesdialog.h"
 #include "credentialsdialog.h"
+#include "fluorine_build_info.h"
 #include "fluorineupdater.h"
 #include "slrmanager.h"
 #include "delayedfilewriter.h"
@@ -33,6 +34,7 @@
 #include "syncoverwritedialog.h"
 #include "virtualfiletree.h"
 #include "vfs/permissionrepair.h"
+#include "vfs/gamesavemigration.h"
 #include <ipluginmodpage.h>
 #include <questionboxmemory.h>
 #include <uibase/game_features/dataarchives.h>
@@ -388,6 +390,26 @@ QString resolveAbsoluteSaveDir(const WinePrefix& prefix,
       QDir(prefix.myGamesPath()).filePath(dataDirName + "/Saves");
   log::debug("resolveAbsoluteSaveDir: fallback -> '{}'", fallback);
   return fallback;
+}
+
+void migrateGameLocalSavesFromOverwrite(const IPluginGame* game,
+                                        const QString& overwriteDir)
+{
+  if (game == nullptr || overwriteDir.isEmpty()) {
+    return;
+  }
+
+  const auto stats = MOBase::Vfs::migrateGameLocalSaves(
+      game->dataDirectory().absolutePath().toStdString(),
+      game->savesDirectory().absolutePath().toStdString(),
+      overwriteDir.toStdString());
+  if (stats.moved == 0 && stats.failed == 0 && stats.skipped == 0) {
+    return;
+  }
+  log::info("Game-local save migration path='{}' inspected={} moved={} "
+            "skipped={} failed={}",
+            stats.relativePath, stats.inspected, stats.moved, stats.skipped,
+            stats.failed);
 }
 
 OrganizerCore::OrganizerCore(Settings& settings)
@@ -917,6 +939,25 @@ void OrganizerCore::createOverwriteDirectories()
 
 void OrganizerCore::prepareVFS()
 {
+  {
+    const auto instance = InstanceManager::singleton().currentInstance();
+    m_USVFS.setIndexPublicationContext(
+        {.output_base=basePath().toStdString(),
+         .producer=std::string("Fluorine ") + FLUORINE_VERSION_STRING,
+         .instance_name=
+             instance != nullptr ? instance->displayName().toStdString() : "",
+         .profile_name=
+             m_CurrentProfile != nullptr
+                 ? m_CurrentProfile->name().toStdString()
+                 : "",
+#ifdef _WIN32
+         .consumer_path_style=VfsIndexConsumerPathStyle::NativeWindows
+#else
+         .consumer_path_style=VfsIndexConsumerPathStyle::Wine
+#endif
+        });
+  }
+
   // Read the load order and pass it to the FUSE VFS so plugin files get
   // incrementing timestamps matching their position. This prevents LOOT
   // from reporting "ambiguous load order".
@@ -964,6 +1005,11 @@ void OrganizerCore::prepareVFS()
         QDir(QDir::fromNativeSeparators(basePath())).filePath("rootbuilder");
     m_USVFS.setRootBuilderEnabled(vfsRootBuilder, storageDir.toStdString());
   }
+
+  // Recover saves left in Overwrite by an earlier run before the VFS catalog
+  // is rebuilt. This is relevant to games such as RPG Maker titles whose save
+  // directory lives below the game data root.
+  migrateGameLocalSavesFromOverwrite(managedGame(), overwritePath());
 
   // Diagnostic toggle from Settings > Proton/Wine tab (see settingsdialogproton.cpp).
   m_USVFS.setDisableVfsCache(
@@ -2824,6 +2870,21 @@ bool OrganizerCore::beforeRun(
     QString* saveBindMountSource, QString* saveBindMountTarget)
 {
   saveCurrentProfile();
+  {
+    const auto instance = InstanceManager::singleton().currentInstance();
+    m_USVFS.setIndexPublicationContext(
+        {.output_base=basePath().toStdString(),
+         .producer=std::string("Fluorine ") + FLUORINE_VERSION_STRING,
+         .instance_name=
+             instance != nullptr ? instance->displayName().toStdString() : "",
+         .profile_name=profileName.toStdString(),
+#ifdef _WIN32
+         .consumer_path_style=VfsIndexConsumerPathStyle::NativeWindows
+#else
+         .consumer_path_style=VfsIndexConsumerPathStyle::Wine
+#endif
+        });
+  }
   if (saveBindMountSource) saveBindMountSource->clear();
   if (saveBindMountTarget) saveBindMountTarget->clear();
 
@@ -2919,6 +2980,10 @@ bool OrganizerCore::beforeRun(
         QDir(QDir::fromNativeSeparators(basePath())).filePath("rootbuilder");
     m_USVFS.setRootBuilderEnabled(vfsRootBuilder, storageDir.toStdString());
   }
+
+  // beforeRun can mount without the Data tab having called prepareVFS first.
+  // Recover any prior in-game saves before this launch builds its VFS catalog.
+  migrateGameLocalSavesFromOverwrite(managedGame(), overwritePath());
 
   // Diagnostic toggle from Settings > Proton/Wine tab (see settingsdialogproton.cpp).
   m_USVFS.setDisableVfsCache(
@@ -3172,6 +3237,7 @@ void OrganizerCore::afterRun(const QFileInfo& binary, DWORD exitCode)
   // and tears down the FUSE session. This mirrors Windows behaviour where
   // USVFS is only active while a hooked process is running.
   m_USVFS.unmount();
+  migrateGameLocalSavesFromOverwrite(managedGame(), overwritePath());
   movePGPatcherLogsToLogsFolder();
 
   // Restore write permissions on the game directory.  In rare cases

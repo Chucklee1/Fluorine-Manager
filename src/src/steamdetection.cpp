@@ -189,13 +189,11 @@ void scanProtonDir(const QString& dir, bool isSteamBuiltin,
 
 }  // namespace
 
-QVector<SteamProtonInfo> findSteamProtons()
+QVector<SteamProtonInfo>
+findProtonsForPaths(const QStringList& steamLibraries,
+                    const QStringList& compatibilityToolDirs)
 {
   QVector<SteamProtonInfo> protons;
-
-  const QStringList steamLibraries = findSteamLibraryPaths();
-  if (steamLibraries.isEmpty())
-    return protons;
 
   // 1. Steam's built-in Protons across every Steam library. Steam may install
   // tools like "Proton 10.0" under a secondary library's steamapps/common.
@@ -216,8 +214,10 @@ QVector<SteamProtonInfo> findSteamProtons()
                   false, protons);
   }
 
-  // 3. System-level Protons.
-  scanProtonDir(QStringLiteral("/usr/share/steam/compatibilitytools.d"), false, protons);
+  // 3. Other supported compatibility-tool directories (system and Heroic).
+  for (const QString& directory : compatibilityToolDirs) {
+    scanProtonDir(directory, false, protons);
+  }
 
   // Filter to Proton 10+.
   protons.erase(
@@ -277,4 +277,19 @@ QVector<SteamProtonInfo> findSteamProtons()
             });
 
   return protons;
+}
+
+QVector<SteamProtonInfo> findSteamProtons()
+{
+  const QString home = QDir::homePath();
+  const QStringList compatibilityToolDirs = {
+      QStringLiteral("/usr/share/steam/compatibilitytools.d"),
+      QDir(home).filePath(QStringLiteral(".config/heroic/tools/proton")),
+      QDir(home).filePath(QStringLiteral(
+          ".var/app/com.heroicgameslauncher.hgl/config/heroic/tools/proton")),
+  };
+
+  // Do not require Steam to be installed: Heroic and system Proton runners
+  // are valid inputs for Fluorine's direct Proton launcher.
+  return findProtonsForPaths(findSteamLibraryPaths(), compatibilityToolDirs);
 }

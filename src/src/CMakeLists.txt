@@ -41,6 +41,7 @@ file(GLOB ORGANIZER_SOURCES
 # These files are compiled into libuibase.so (shared with plugins) — exclude from organizer.
 list(REMOVE_ITEM ORGANIZER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gamedetection.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/heroicjson.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/steamdetection.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/vdfparser.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/iconextractor.cpp
@@ -144,6 +145,11 @@ target_compile_definitions(organizer PRIVATE
     SPDLOG_USE_STD_FORMAT
     FUSE_USE_VERSION=312
     $<$<TARGET_EXISTS:Qt6::WebEngineWidgets>:MO2_WEBENGINE>)
+
+if(TARGET mo2::bsa_ffi)
+    target_link_libraries(organizer PRIVATE mo2::bsa_ffi)
+    target_compile_definitions(organizer PRIVATE FLUORINE_HAS_BSA_FFI=1)
+endif()
 
 option(MO2_BUNDLE_7Z_RUNTIME "Copy a Linux 7z module into organizer/lib" ON)
 option(MO2_STAGE_PYTHON_PLUGIN_PAYLOAD

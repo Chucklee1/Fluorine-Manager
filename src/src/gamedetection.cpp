@@ -1,4 +1,5 @@
 #include "gamedetection.h"
+#include "heroicjson.h"
 #include "knowngames.h"
 #include "vdfparser.h"
 
@@ -358,52 +359,65 @@ QVector<DetectedGame> detectHeroicGames()
 
     // --- Epic ---
     {
-      QString epicPath = heroicPath + "/store_cache/legendary_library.json";
-      if (!QFileInfo::exists(epicPath))
-        epicPath = heroicPath + "/legendaryConfig/legendary/installed.json";
-
-      QFile f(epicPath);
-      if (f.open(QIODevice::ReadOnly)) {
-        QJsonDocument const doc = QJsonDocument::fromJson(f.readAll());
-        if (doc.isObject()) {
-          const QJsonObject obj = doc.object();
-          for (auto it = obj.begin(); it != obj.end(); ++it) {
-            const QString appName = it.key();
-            const QJsonObject gd  = it.value().toObject();
-
-            if (!gd[QStringLiteral("is_installed")].toBool())
-              continue;
-
-            const QString platform = gd[QStringLiteral("platform")].toString();
-            if (platform.toLower() != QStringLiteral("windows"))
-              continue;
-
-            const QString installPath = gd[QStringLiteral("install_path")].toString();
-            if (installPath.isEmpty() || !QFileInfo::exists(installPath))
-              continue;
-
-            const QString title = gd[QStringLiteral("title")].toString(appName);
-            const KnownGame* kg =
-                findKnownGameByEpicId(appName);
-            if (!kg)
-              kg = findKnownGameByTitle(title);
-
-            DetectedGame g;
-            g.name         = title;
-            g.app_id       = appName;
-            g.install_path = installPath;
-            g.prefix_path  = getHeroicGamePrefix(heroicPath, appName);
-            g.launcher     = QStringLiteral("Heroic (Epic)");
-            if (kg) {
-              g.my_games_folder        = kg->my_games_folder ? QString::fromLatin1(kg->my_games_folder) : QString();
-              g.appdata_local_folder   = kg->appdata_local_folder ? QString::fromLatin1(kg->appdata_local_folder) : QString();
-              g.appdata_roaming_folder = kg->appdata_roaming_folder ? QString::fromLatin1(kg->appdata_roaming_folder) : QString();
-              g.registry_path  = QString::fromLatin1(kg->registry_path);
-              g.registry_value = QString::fromLatin1(kg->registry_value);
-            }
-            games.append(g);
-          }
+      // installed.json is authoritative for installation state and paths;
+      // Heroic's cache enriches those entries with namespace and title data.
+      auto parseFile = [&](const QString& relativePath) {
+        QFile file(heroicPath + relativePath);
+        if (!file.open(QIODevice::ReadOnly)) {
+          return QVector<HeroicEpicInstall>{};
         }
+        return parseHeroicEpicInstalls(file.readAll());
+      };
+
+      const QVector<HeroicEpicInstall> installedManifest = parseFile(
+          QStringLiteral("/legendaryConfig/legendary/installed.json"));
+      const QVector<HeroicEpicInstall> libraryCache =
+          parseFile(QStringLiteral("/store_cache/legendary_library.json"));
+      const QVector<HeroicEpicInstall> installs =
+          mergeHeroicEpicInstalls(installedManifest, libraryCache);
+
+      for (const HeroicEpicInstall& install : installs) {
+        if (!install.is_installed || install.is_dlc ||
+            install.platform.compare(QStringLiteral("windows"),
+                                     Qt::CaseInsensitive) != 0 ||
+            install.install_path.isEmpty() ||
+            !QFileInfo::exists(install.install_path)) {
+          continue;
+        }
+
+        const QString epicId = install.namespace_id.isEmpty()
+                                   ? install.app_name
+                                   : install.namespace_id;
+        const KnownGame* kg = findKnownGameByEpicId(epicId);
+        if (!kg && epicId != install.app_name) {
+          kg = findKnownGameByEpicId(install.app_name);
+        }
+        if (!kg) {
+          kg = findKnownGameByTitle(install.title);
+        }
+
+        DetectedGame g;
+        g.name         = install.title;
+        g.app_id       = install.app_name;
+        g.install_path = install.install_path;
+        g.prefix_path  = getHeroicGamePrefix(heroicPath, install.app_name);
+        g.launcher     = QStringLiteral("Heroic (Epic)");
+        if (kg) {
+          g.my_games_folder = kg->my_games_folder
+                                  ? QString::fromLatin1(kg->my_games_folder)
+                                  : QString();
+          g.appdata_local_folder =
+              kg->appdata_local_folder
+                  ? QString::fromLatin1(kg->appdata_local_folder)
+                  : QString();
+          g.appdata_roaming_folder =
+              kg->appdata_roaming_folder
+                  ? QString::fromLatin1(kg->appdata_roaming_folder)
+                  : QString();
+          g.registry_path  = QString::fromLatin1(kg->registry_path);
+          g.registry_value = QString::fromLatin1(kg->registry_value);
+        }
+        games.append(g);
       }
     }
   }

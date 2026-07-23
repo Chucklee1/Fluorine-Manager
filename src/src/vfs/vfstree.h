@@ -1,16 +1,20 @@
 #ifndef VFS_VFSTREE_H
 #define VFS_VFSTREE_H
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 struct VfsNode;
+
+using VfsDigest = std::array<unsigned char, 32>;
 
 struct VfsFileInfo
 {
@@ -20,6 +24,9 @@ struct VfsFileInfo
   std::string origin;
   bool is_backing = false;
   mode_t cached_mode = 0;  // permission bits from stat() at tree-build time
+  // Reused from the persistent catalog. Session/profile mappings deliberately
+  // leave this empty rather than hashing on the launch path.
+  std::optional<VfsDigest> cached_blake3;
 };
 
 struct CachedBaseFile
@@ -47,7 +54,8 @@ struct VfsNode
                   const std::string& real_path, uint64_t size,
                   std::chrono::system_clock::time_point mtime,
                   const std::string& origin, bool is_backing = false,
-                  mode_t cached_mode = 0);
+                  mode_t cached_mode = 0,
+                  std::optional<VfsDigest> cached_blake3 = std::nullopt);
 
   void insertDirectory(const std::vector<std::string>& components);
 
