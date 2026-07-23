@@ -82,6 +82,50 @@ target_link_libraries(test_metainiutils PRIVATE
 add_test(NAME test_metainiutils COMMAND test_metainiutils)
 
 # ---------------------------------------------------------------------------
+# Heroic/Legendary JSON schema normalization tests
+# ---------------------------------------------------------------------------
+add_executable(test_heroicjson EXCLUDE_FROM_ALL
+    test_heroicjson.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/heroicjson.cpp
+)
+set_target_properties(test_heroicjson PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_heroicjson PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_heroicjson PRIVATE
+    Qt6::Core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_heroicjson COMMAND test_heroicjson)
+
+# ---------------------------------------------------------------------------
+# Proton discovery tests (including Heroic without Steam)
+# ---------------------------------------------------------------------------
+add_executable(test_protondetection EXCLUDE_FROM_ALL
+    test_protondetection.cpp
+)
+set_target_properties(test_protondetection PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_protondetection PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_protondetection PRIVATE
+    Qt6::Core
+    mo2::uibase
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_protondetection COMMAND test_protondetection)
+
+# ---------------------------------------------------------------------------
 # External directory mapping (SKSE Log Redirector style) tests
 #
 # Exercises the deploy/cleanup logic for `isDirectory && createTarget`
@@ -282,6 +326,7 @@ add_test(NAME test_staging_promotion COMMAND test_staging_promotion)
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
     DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
+            test_heroicjson test_protondetection
             test_external_dir_mapping test_vfs_file_ops
             test_vfs_descriptor_cleanup test_vfs_runtime_index
             test_game_save_migration

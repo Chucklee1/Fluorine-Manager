@@ -199,6 +199,7 @@ if(NOT WIN32)
 		PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/src>)
 	target_sources(uibase PRIVATE
 		${CMAKE_SOURCE_DIR}/src/src/gamedetection.cpp
+		${CMAKE_SOURCE_DIR}/src/src/heroicjson.cpp
 		${CMAKE_SOURCE_DIR}/src/src/steamdetection.cpp
 		${CMAKE_SOURCE_DIR}/src/src/vdfparser.cpp
 		${CMAKE_SOURCE_DIR}/src/src/iconextractor.cpp
