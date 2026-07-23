@@ -396,10 +396,10 @@ cp -a "${PYQT6_SRC}/." "${PYQT6_OUT}/"
 rm -rf "${PYQT6_OUT}/Qt6"
 
 # Prune unused PyQt6 modules. Full-repo grep of libs/ + src/ confirms shipped
-# Python plugins only import the five modules below. Pruning happens BEFORE
+# Python plugins only import the modules below. Pruning happens BEFORE
 # the deps-scan loop further down so libQt6Designer/Help/Sql/Test/SvgWidgets/
 # Bluetooth/... stop getting copied into lib/ as a side effect.
-PYQT6_KEEP_MODULES="QtCore QtGui QtWidgets QtOpenGL QtOpenGLWidgets"
+PYQT6_KEEP_MODULES="QtCore QtGui QtWidgets QtNetwork QtOpenGL QtOpenGLWidgets"
 rm -rf "${PYQT6_OUT}/bindings" "${PYQT6_OUT}/uic" "${PYQT6_OUT}/lupdate"
 find "${PYQT6_OUT}" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 find "${PYQT6_OUT}" -type f -name '*.pyi' -delete 2>/dev/null || true

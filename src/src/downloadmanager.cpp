@@ -565,6 +565,14 @@ bool DownloadManager::addDownload(const QStringList& URLs, QString gameName, int
   request.setAttribute(QNetworkRequest::CacheSaveControlAttribute, false);
   request.setAttribute(QNetworkRequest::CacheLoadControlAttribute,
                        QNetworkRequest::AlwaysNetwork);
+  // GitGud's package endpoint occasionally closes an HTTP/2 stream while Qt
+  // still has a queued socket read, producing a harmless but noisy
+  // "QIODevice::read (QSslSocket): device not open" warning. Its generic
+  // package downloads do not need multiplexing, so use HTTP/1.1 for this host.
+  if (preferredUrl.host().endsWith(QStringLiteral("gitgud.io"),
+                                   Qt::CaseInsensitive)) {
+    request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+  }
   request.setHttp2Configuration(h2Conf);
   return addDownload(m_NexusInterface->getAccessManager()->get(request), URLs, fileName,
                      gameName, modID, fileID, fileInfo, reservedID);
@@ -1106,6 +1114,10 @@ void DownloadManager::resumeDownloadInt(int index)
     QNetworkRequest request(QUrl::fromEncoded(info->currentURL().toLocal8Bit()));
     request.setHeader(QNetworkRequest::UserAgentHeader,
                       m_NexusInterface->getAccessManager()->userAgent());
+    if (request.url().host().endsWith(QStringLiteral("gitgud.io"),
+                                      Qt::CaseInsensitive)) {
+      request.setAttribute(QNetworkRequest::Http2AllowedAttribute, false);
+    }
     if (info->m_State != STATE_ERROR) {
       info->m_ResumePos      = info->m_Output.size();
       QByteArray const rangeHeader = "bytes=" + QByteArray::number(info->m_ResumePos) + "-";
