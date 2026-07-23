@@ -7,6 +7,8 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(TEST_FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/prefix_safety_tests.cmake)
+
 # ---------------------------------------------------------------------------
 # OpenMW native config generation tests
 # ---------------------------------------------------------------------------
@@ -326,6 +328,7 @@ add_test(NAME test_staging_promotion COMMAND test_staging_promotion)
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
     DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
+            test_fluorineconfigownership
             test_heroicjson test_protondetection
             test_external_dir_mapping test_vfs_file_ops
             test_vfs_descriptor_cleanup test_vfs_runtime_index

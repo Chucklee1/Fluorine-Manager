@@ -20,7 +20,10 @@ public:
   static void deleteConfig() ;
   bool prefixExists() const;
   QString compatDataPath() const;
-  void destroyPrefix() const;
+  bool markPrefixOwned() const;
+  bool canDestroyPrefix() const;
+  bool resetPrefixForRecreation() const;
+  bool destroyPrefix() const;
 
   static bool isSetup();
   static std::optional<QString> prefixPath();
