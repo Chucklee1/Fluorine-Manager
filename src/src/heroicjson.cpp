@@ -4,6 +4,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonValue>
+#include <QHash>
+#include <QSet>
 
 #include <utility>
 
@@ -24,9 +26,15 @@ HeroicEpicInstall parseInstall(const QJsonObject& game, const QString& fallbackA
   result.platform =
       install.value(QStringLiteral("platform"))
           .toString(game.value(QStringLiteral("platform")).toString());
-  result.is_installed = game.contains(QStringLiteral("is_installed"))
-                            ? game.value(QStringLiteral("is_installed")).toBool()
-                            : installedByPresence;
+  if (game.contains(QStringLiteral("is_installed"))) {
+    result.is_installed = game.value(QStringLiteral("is_installed")).toBool();
+  } else if (install.contains(QStringLiteral("is_installed"))) {
+    result.is_installed = install.value(QStringLiteral("is_installed")).toBool();
+  } else {
+    // Modern Heroic caches may omit is_installed. A populated nested install
+    // record is the remaining installation signal in that schema.
+    result.is_installed = installedByPresence || !result.install_path.isEmpty();
+  }
   result.is_dlc = install.contains(QStringLiteral("is_dlc"))
                       ? install.value(QStringLiteral("is_dlc")).toBool()
                       : game.value(QStringLiteral("is_dlc")).toBool();
@@ -75,4 +83,60 @@ QVector<HeroicEpicInstall> parseHeroicEpicInstalls(const QByteArray& json)
     }
   }
   return installs;
+}
+
+QVector<HeroicEpicInstall> mergeHeroicEpicInstalls(
+    const QVector<HeroicEpicInstall>& installedManifest,
+    const QVector<HeroicEpicInstall>& libraryCache)
+{
+  QVector<HeroicEpicInstall> result;
+  QHash<QString, qsizetype> indexes;
+  QSet<QString> manifestAppNames;
+
+  auto insertOrReplaceManifest = [&](const HeroicEpicInstall& install) {
+    const auto existing = indexes.constFind(install.app_name);
+    if (existing == indexes.constEnd()) {
+      indexes.insert(install.app_name, result.size());
+      result.append(install);
+    } else {
+      result[*existing] = install;
+    }
+    manifestAppNames.insert(install.app_name);
+  };
+
+  for (const HeroicEpicInstall& install : installedManifest) {
+    insertOrReplaceManifest(install);
+  }
+
+  for (const HeroicEpicInstall& cached : libraryCache) {
+    const auto existing = indexes.constFind(cached.app_name);
+    if (existing == indexes.constEnd()) {
+      indexes.insert(cached.app_name, result.size());
+      result.append(cached);
+      continue;
+    }
+
+    HeroicEpicInstall& merged = result[*existing];
+    if (!cached.namespace_id.isEmpty()) {
+      merged.namespace_id = cached.namespace_id;
+    }
+    if (!cached.title.isEmpty() && cached.title != cached.app_name) {
+      merged.title = cached.title;
+    }
+    if (merged.install_path.isEmpty()) {
+      merged.install_path = cached.install_path;
+    }
+    if (merged.platform.isEmpty()) {
+      merged.platform = cached.platform;
+    }
+    merged.is_dlc = merged.is_dlc || cached.is_dlc;
+
+    // Cache-only duplicate records may contribute installation state. When
+    // installed.json supplied the record, its state remains authoritative.
+    if (!manifestAppNames.contains(cached.app_name)) {
+      merged.is_installed = merged.is_installed || cached.is_installed;
+    }
+  }
+
+  return result;
 }

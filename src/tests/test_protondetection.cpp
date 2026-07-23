@@ -5,6 +5,7 @@
 #include <QFileInfo>
 #include <QTemporaryDir>
 #include <gtest/gtest.h>
+#include <uibase/log.h>
 
 namespace
 {
@@ -16,7 +17,18 @@ void createFile(const QString& path)
 }
 }  // namespace
 
-TEST(ProtonDetection, FindsHeroicRunnerWithoutSteamLibraries)
+class ProtonDetection : public ::testing::Test
+{
+protected:
+  static void SetUpTestSuite()
+  {
+    MOBase::log::LoggerConfiguration configuration;
+    configuration.name = "test_protondetection";
+    MOBase::log::createDefault(configuration);
+  }
+};
+
+TEST_F(ProtonDetection, FindsHeroicRunnerWithoutSteamLibraries)
 {
   QTemporaryDir temporary;
   ASSERT_TRUE(temporary.isValid());
@@ -34,7 +46,7 @@ TEST(ProtonDetection, FindsHeroicRunnerWithoutSteamLibraries)
   EXPECT_FALSE(protons[0].is_steam_proton);
 }
 
-TEST(ProtonDetection, RejectsRunnerWithoutWineBinary)
+TEST_F(ProtonDetection, RejectsRunnerWithoutWineBinary)
 {
   QTemporaryDir temporary;
   ASSERT_TRUE(temporary.isValid());
@@ -45,7 +57,7 @@ TEST(ProtonDetection, RejectsRunnerWithoutWineBinary)
   EXPECT_TRUE(findProtonsForPaths({}, {temporary.path()}).isEmpty());
 }
 
-TEST(ProtonDetection, DeduplicatesCanonicalRunnerPaths)
+TEST_F(ProtonDetection, DeduplicatesCanonicalRunnerPaths)
 {
   QTemporaryDir temporary;
   ASSERT_TRUE(temporary.isValid());
