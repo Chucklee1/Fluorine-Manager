@@ -166,7 +166,14 @@ if [ -d "build/src/src/stylesheets" ]; then
     echo "Bundled stylesheets"
 fi
 
-
+# ── Interactive tutorials ──
+# TutorialManager resolves these at runtime relative to the application binary.
+# CMake's development run tree has them, but the portable staging step must copy
+# them explicitly alongside ModOrganizer-core.
+if [ -d "src/src/tutorials" ]; then
+    cp -a "src/src/tutorials" "${OUT_DIR}/"
+    echo "Bundled tutorials"
+fi
 
 # ── 7z runtime ──
 SO7="build/src/src/lib/7z.so"
