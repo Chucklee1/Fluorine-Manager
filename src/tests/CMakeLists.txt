@@ -328,6 +328,7 @@ add_test(NAME test_staging_promotion COMMAND test_staging_promotion)
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
     DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
+            test_fluorineconfigownership
             test_heroicjson test_protondetection
             test_external_dir_mapping test_vfs_file_ops
             test_vfs_descriptor_cleanup test_vfs_runtime_index

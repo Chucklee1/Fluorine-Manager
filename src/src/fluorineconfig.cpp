@@ -168,6 +168,22 @@ bool FluorineConfig::canDestroyPrefix() const
   return QDir::cleanPath(compatData) == QDir::cleanPath(legacyDefault);
 }
 
+bool FluorineConfig::resetPrefixForRecreation() const
+{
+  if (!canDestroyPrefix()) {
+    return false;
+  }
+
+  QDir prefixDir(prefix_path);
+  if (prefixDir.exists() && !prefixDir.removeRecursively()) {
+    return false;
+  }
+
+  // A direct-root configuration removes its marker along with the prefix.
+  // Re-establish ownership before setup so later deletion remains guarded.
+  return markPrefixOwned();
+}
+
 bool FluorineConfig::destroyPrefix() const
 {
   const QString compatData = compatDataPath();

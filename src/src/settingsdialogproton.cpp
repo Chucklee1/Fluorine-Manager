@@ -327,9 +327,9 @@ void ProtonSettingsTab::onRecreatePrefix()
     return;
   }
 
-  QDir prefixDir(cfg->prefix_path);
-  if (prefixDir.exists() && !prefixDir.removeRecursively()) {
-    ui->protonStatusLabel->setText(tr("Failed to delete existing prefix"));
+  if (!cfg->resetPrefixForRecreation()) {
+    ui->protonStatusLabel->setText(
+        tr("Failed to safely prepare the existing prefix for recreation"));
     refreshState();
     return;
   }

@@ -55,6 +55,25 @@ TEST(FluorineConfigOwnership, AcceptsMarkedManagedPrefix)
       QDir(config.compatDataPath()).filePath(".fluorine-managed-prefix")));
 }
 
+TEST(FluorineConfigOwnership, DirectRootRecreationRestoresOwnershipMarker)
+{
+  QTemporaryDir temporary;
+  ASSERT_TRUE(temporary.isValid());
+
+  const QString root = QDir(temporary.path()).filePath("direct-root");
+  ASSERT_TRUE(QDir().mkpath(QDir(root).filePath("pfx/drive_c")));
+
+  FluorineConfig config;
+  config.prefix_path = root;
+  ASSERT_TRUE(config.markPrefixOwned());
+
+  ASSERT_TRUE(config.resetPrefixForRecreation());
+  EXPECT_FALSE(config.prefixExists());
+  EXPECT_TRUE(config.canDestroyPrefix());
+  EXPECT_TRUE(
+      QFile::exists(QDir(root).filePath(".fluorine-managed-prefix")));
+}
+
 TEST(FluorineConfigOwnership, DeletesOnlyMarkedCompatibilityRoot)
 {
   QTemporaryDir temporary;
