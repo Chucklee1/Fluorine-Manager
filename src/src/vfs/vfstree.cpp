@@ -270,7 +270,8 @@ void VfsNode::insertFile(const std::vector<std::string>& components,
                          const std::string& real_path, uint64_t size,
                          std::chrono::system_clock::time_point mtime,
                          const std::string& origin, bool is_backing,
-                         mode_t cached_mode)
+                         mode_t cached_mode,
+                         std::optional<VfsDigest> cached_blake3)
 {
   if (components.empty()) {
     return;
@@ -296,7 +297,8 @@ void VfsNode::insertFile(const std::vector<std::string>& components,
       fileNode->is_directory     = false;
       fileNode->file_info        = {.real_path=real_path, .size=size, .mtime=mtime,
                                     .origin=origin, .is_backing=is_backing,
-                                    .cached_mode=cached_mode};
+                                    .cached_mode=cached_mode,
+                                    .cached_blake3=std::move(cached_blake3)};
       current->dir_info.children[key] = std::move(fileNode);
       return;
     }
@@ -642,6 +644,14 @@ bool serializeNode(std::ostream& out, const VfsNode& node)
     if (!writePod(out, backing)) return false;
     uint32_t mode = node.file_info.cached_mode;
     if (!writePod(out, mode)) return false;
+    const uint8_t hasDigest = node.file_info.cached_blake3.has_value() ? 1 : 0;
+    if (!writePod(out, hasDigest)) return false;
+    if (hasDigest != 0) {
+      out.write(reinterpret_cast<const char*>(
+                    node.file_info.cached_blake3->data()),
+                node.file_info.cached_blake3->size());
+      if (!out.good()) return false;
+    }
     return true;
   }
 
@@ -679,6 +689,16 @@ bool deserializeNode(std::istream& in, VfsNode& node)
     uint32_t mode = 0;
     if (!readPod(in, mode)) return false;
     node.file_info.cached_mode = static_cast<mode_t>(mode);
+    uint8_t hasDigest = 0;
+    if (!readPod(in, hasDigest) || hasDigest > 1) return false;
+    if (hasDigest != 0) {
+      VfsDigest digest{};
+      in.read(reinterpret_cast<char*>(digest.data()), digest.size());
+      if (!in.good()) return false;
+      node.file_info.cached_blake3 = digest;
+    } else {
+      node.file_info.cached_blake3.reset();
+    }
     return true;
   }
 

@@ -3,6 +3,7 @@
 #include "settings.h"
 #include "sleepinhibitor.h"
 #include "vfs/vfscatalog.h"
+#include "vfs/vfsindex.h"
 #include "vfs/vfstree.h"
 
 #include <QCoreApplication>
@@ -615,13 +616,20 @@ bool FuseConnector::mount(
   if (catalogProgress) catalogProgress->close();
   std::fprintf(stderr,
                "[VFS] [catalog] complete scanned=%llu hashed=%llu bytes=%llu "
-               "elapsed_ms=%llu mib_s=%.1f roots_changed=%llu profile=%s\n",
+               "elapsed_ms=%llu mib_s=%.1f roots_changed=%llu "
+               "archives=%llu indexed=%llu reused=%llu members=%llu errors=%llu "
+               "profile=%s\n",
                static_cast<unsigned long long>(finalProgress.files_scanned),
                static_cast<unsigned long long>(finalProgress.files_hashed),
                static_cast<unsigned long long>(finalProgress.bytes_hashed),
                static_cast<unsigned long long>(finalProgress.elapsed_ms),
                finalProgress.hash_mib_per_second,
                static_cast<unsigned long long>(finalProgress.provider_roots_changed),
+               static_cast<unsigned long long>(finalProgress.archives_discovered),
+               static_cast<unsigned long long>(finalProgress.archives_indexed),
+               static_cast<unsigned long long>(finalProgress.archives_reused),
+               static_cast<unsigned long long>(finalProgress.archive_members),
+               static_cast<unsigned long long>(finalProgress.archive_errors),
                digestPrefix(catalogResult.profile_root).c_str());
   m_baseFileCache = catalog.loadBaseSnapshot(m_dataDirPath);
   m_cachedDataDirPath = m_dataDirPath;
@@ -635,6 +643,8 @@ bool FuseConnector::mount(
   if (!m_pluginLoadOrder.empty()) {
     stampPluginTimestamps(*tree, m_pluginLoadOrder);
   }
+
+  publishIndex(*tree, catalogResult);
 
   {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -697,6 +707,7 @@ bool FuseConnector::mount(
 
   m_context                        = std::make_shared<Mo2FsContext>();
   m_context->tree                  = tree;
+  m_context->archive_members       = catalogResult.archive_member_index;
   m_context->inodes                = std::make_unique<InodeTable>();
   m_context->overwrite             = std::make_unique<OverwriteManager>(m_stagingDir, m_overwriteDir);
   m_context->tracked_writes        = m_trackedWrites;
@@ -715,13 +726,19 @@ bool FuseConnector::mount(
   m_context->gid                   = ::getgid();
   m_context->cache_disabled        = m_disableVfsCache ||
                                      std::getenv("FLUORINE_VFS_DISABLE_CACHE") != nullptr;
+  m_context->disable_no_opendir    =
+      std::getenv("FLUORINE_VFS_DISABLE_NO_OPENDIR") != nullptr;
+  m_context->readdirplus_enabled   =
+      std::getenv("FLUORINE_VFS_ENABLE_READDIRPLUS") != nullptr;
+  m_context->zero_file_flags       =
+      std::getenv("FLUORINE_VFS_ZERO_FILE_FLAGS") != nullptr;
   m_context->auto_create_dirs      = m_autoCreateDirs;
   const auto indexStart = std::chrono::steady_clock::now();
   const std::size_t prewarmed = mo2PrewarmLookupIndex(m_context.get());
   const auto indexMs = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - indexStart).count();
   std::fprintf(stderr,
-               "[VFS] prewarmed %zu resolved lookup entries in %lldms\n",
+               "[VFS] built immutable runtime index (%zu lookup entries) in %lldms\n",
                prewarmed, static_cast<long long>(indexMs));
   // NOTE: Do NOT include mount_point here — low-level API passes it
   // separately to fuse_session_mount(). Including it here causes
@@ -832,6 +849,25 @@ void FuseConnector::unmount()
     }
     fuse_session_destroy(m_session);
     m_session = nullptr;
+  }
+
+  // A forced/session-driven unmount is not guaranteed to deliver release()
+  // for every kernel-visible file handle. All request and invalidation workers
+  // have stopped, so close any retained descriptors before staging promotion
+  // inspects or moves their files.
+  if (m_context != nullptr) {
+    const Mo2OpenFileCleanupResult cleanup =
+        mo2CloseOpenFiles(m_context.get());
+    std::fprintf(
+        stderr,
+        "[VFS] closed remaining open handles logical=%zu descriptors=%zu "
+        "writable=%zu close_errors=%zu\n",
+        cleanup.logical_handles, cleanup.descriptors_closed,
+        cleanup.writable_descriptors_closed, cleanup.close_errors);
+    if (cleanup.close_errors != 0) {
+      log::warn("Failed to close {} of {} remaining VFS file descriptors",
+                cleanup.close_errors, cleanup.descriptors_closed);
+    }
   }
 
   std::unordered_map<std::string, std::unordered_set<std::string>> dirtyProviderPaths;
@@ -977,9 +1013,42 @@ void FuseConnector::setTrackingFilePath(const std::string& path)
   std::fprintf(stderr, "[VFS] setTrackingFilePath: '%s'\n", path.c_str());
 }
 
+void FuseConnector::setIndexPublicationContext(
+    VfsIndexPublicationContext context)
+{
+  m_indexPublicationContext = std::move(context);
+}
+
 std::shared_ptr<TrackedWrites> FuseConnector::trackedWrites() const
 {
   return m_trackedWrites;
+}
+
+VfsIndexPublicationResult FuseConnector::publishIndex(
+    VfsTree& tree, const VfsCatalogResult& catalogResult)
+{
+  VfsIndexPublisher publisher;
+  if (m_indexPublicationContext.output_base.empty()) {
+    VfsIndexPublisher::removePublicationArtifacts(tree);
+    return {.success=false,
+            .error="index publication context is not configured"};
+  }
+
+  VfsIndexPublicationResult publication = publisher.publish(
+      tree, catalogResult.provider_roots, catalogResult.profile_root,
+      fs::path(m_dataDirPath), m_indexPublicationContext);
+  if (!publication.success) {
+    log::warn("VFS index publication failed; continuing without an index "
+              "locator: {}",
+              publication.error);
+    return publication;
+  }
+
+  injectExtraFiles(
+      tree, {{kVfsIndexVirtualLocator, publication.locator_path.string()}});
+  log::info("Published VFS index generation {} with {} resolved files",
+            publication.generation, publication.file_count);
+  return publication;
 }
 
 void FuseConnector::rebuild(
@@ -1011,9 +1080,21 @@ void FuseConnector::rebuild(
     stampPluginTimestamps(*newTree, m_pluginLoadOrder);
   }
 
+  publishIndex(*newTree, catalogResult);
+
+  std::scoped_lock const namespaceLock(m_context->namespace_mutation_mutex);
+  std::shared_ptr<VfsRuntimeIndex> newRuntimeIndex;
   {
-    std::unique_lock const lock(m_context->tree_mutex);
+    std::unique_lock const lock(m_context->inode_mutex);
+    newRuntimeIndex = VfsRuntimeIndex::build(
+        *newTree, *m_context->inodes, m_context->uid, m_context->gid);
+  }
+  {
+    std::unique_lock const treeLock(m_context->tree_mutex);
+    std::unique_lock const indexLock(m_context->runtime_index_mutex);
     m_context->tree.swap(newTree);
+    m_context->runtime_index.swap(newRuntimeIndex);
+    m_context->archive_members = catalogResult.archive_member_index;
   }
   {
     std::scoped_lock const lock(m_context->open_dirs_mutex);
@@ -1502,9 +1583,25 @@ void FuseConnector::flushStagingLive()
       m_dataDirPath, m_lastMods, m_overwriteDir, false);
   auto newTree = std::make_shared<VfsTree>(std::move(catalogResult.tree));
 
+  injectExtraFiles(*newTree, m_extraVfsFiles);
+  if (!m_pluginLoadOrder.empty()) {
+    stampPluginTimestamps(*newTree, m_pluginLoadOrder);
+  }
+  publishIndex(*newTree, catalogResult);
+
+  std::scoped_lock const namespaceLock(m_context->namespace_mutation_mutex);
+  std::shared_ptr<VfsRuntimeIndex> newRuntimeIndex;
   {
-    std::unique_lock const lock(m_context->tree_mutex);
+    std::unique_lock const lock(m_context->inode_mutex);
+    newRuntimeIndex = VfsRuntimeIndex::build(
+        *newTree, *m_context->inodes, m_context->uid, m_context->gid);
+  }
+  {
+    std::unique_lock const treeLock(m_context->tree_mutex);
+    std::unique_lock const indexLock(m_context->runtime_index_mutex);
     m_context->tree.swap(newTree);
+    m_context->runtime_index.swap(newRuntimeIndex);
+    m_context->archive_members = catalogResult.archive_member_index;
   }
   {
     std::scoped_lock const lock(m_context->open_dirs_mutex);
