@@ -4,6 +4,8 @@ find_package(Qt6 REQUIRED COMPONENTS Core)
 find_package(GTest REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(TEST_FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 
 # ---------------------------------------------------------------------------
 # OpenMW native config generation tests
@@ -170,6 +172,99 @@ target_link_libraries(test_vfs_file_ops PRIVATE
 add_test(NAME test_vfs_file_ops COMMAND test_vfs_file_ops)
 
 # ---------------------------------------------------------------------------
+# FUSE shutdown descriptor ownership/cleanup tests
+# ---------------------------------------------------------------------------
+add_executable(test_vfs_descriptor_cleanup EXCLUDE_FROM_ALL
+    test_vfs_descriptor_cleanup.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/openfilecleanup.cpp
+)
+set_target_properties(test_vfs_descriptor_cleanup PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_vfs_descriptor_cleanup PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_compile_definitions(test_vfs_descriptor_cleanup PRIVATE
+    FUSE_USE_VERSION=312
+)
+target_link_libraries(test_vfs_descriptor_cleanup PRIVATE
+    PkgConfig::TEST_FUSE3
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_vfs_descriptor_cleanup COMMAND test_vfs_descriptor_cleanup)
+
+# ---------------------------------------------------------------------------
+# Immutable runtime lookup/metadata index tests
+# ---------------------------------------------------------------------------
+add_executable(test_vfs_runtime_index EXCLUDE_FROM_ALL
+    test_vfs_runtime_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/runtimeindex.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/inodetable.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/vfstree.cpp
+)
+set_target_properties(test_vfs_runtime_index PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_vfs_runtime_index PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_vfs_runtime_index PRIVATE
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_vfs_runtime_index COMMAND test_vfs_runtime_index)
+
+# ---------------------------------------------------------------------------
+# Game-local save migration tests
+# ---------------------------------------------------------------------------
+add_executable(test_game_save_migration EXCLUDE_FROM_ALL
+    test_game_save_migration.cpp
+)
+set_target_properties(test_game_save_migration PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_game_save_migration PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_game_save_migration PRIVATE
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_game_save_migration COMMAND test_game_save_migration)
+
+# ---------------------------------------------------------------------------
+# Crash-safe consumer-facing VFS publication/validation contract tests
+# ---------------------------------------------------------------------------
+add_executable(test_vfs_index EXCLUDE_FROM_ALL
+    test_vfs_index.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/vfsindex.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfs/vfstree.cpp
+)
+set_target_properties(test_vfs_index PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_vfs_index PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_vfs_index PRIVATE
+    Qt6::Core
+    SQLite::SQLite3
+    BLAKE3::blake3
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_vfs_index COMMAND test_vfs_index)
+
+# ---------------------------------------------------------------------------
 # Persistent VFS catalog / BLAKE3 verification tests
 # ---------------------------------------------------------------------------
 add_executable(test_vfs_catalog EXCLUDE_FROM_ALL
@@ -197,6 +292,12 @@ target_link_libraries(test_vfs_catalog PRIVATE
     GTest::gtest
     GTest::gtest_main
 )
+target_compile_definitions(test_vfs_catalog PRIVATE
+    FLUORINE_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+if(TARGET mo2::bsa_ffi)
+    target_link_libraries(test_vfs_catalog PRIVATE mo2::bsa_ffi)
+    target_compile_definitions(test_vfs_catalog PRIVATE FLUORINE_HAS_BSA_FFI=1)
+endif()
 add_test(NAME test_vfs_catalog COMMAND test_vfs_catalog)
 
 # ---------------------------------------------------------------------------
@@ -225,5 +326,9 @@ add_test(NAME test_staging_promotion COMMAND test_staging_promotion)
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
     DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
-            test_heroicjson test_protondetection test_external_dir_mapping
-            test_vfs_file_ops test_vfs_catalog test_staging_promotion)
+            test_heroicjson test_protondetection
+            test_external_dir_mapping test_vfs_file_ops
+            test_vfs_descriptor_cleanup test_vfs_runtime_index
+            test_game_save_migration
+            test_vfs_catalog test_vfs_index
+            test_staging_promotion)

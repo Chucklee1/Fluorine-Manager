@@ -146,6 +146,11 @@ target_compile_definitions(organizer PRIVATE
     FUSE_USE_VERSION=312
     $<$<TARGET_EXISTS:Qt6::WebEngineWidgets>:MO2_WEBENGINE>)
 
+if(TARGET mo2::bsa_ffi)
+    target_link_libraries(organizer PRIVATE mo2::bsa_ffi)
+    target_compile_definitions(organizer PRIVATE FLUORINE_HAS_BSA_FFI=1)
+endif()
+
 option(MO2_BUNDLE_7Z_RUNTIME "Copy a Linux 7z module into organizer/lib" ON)
 option(MO2_STAGE_PYTHON_PLUGIN_PAYLOAD
     "Stage shipped Python plugin payload into build plugins/ for Linux runs" OFF)

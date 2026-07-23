@@ -6,9 +6,13 @@
 
 #include <blake3.h>
 #include <sqlite3.h>
+#ifdef FLUORINE_HAS_BSA_FFI
+#include <bsa_ffi.h>
+#endif
 
 #include <array>
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -16,16 +20,19 @@
 #include <fcntl.h>
 #include <memory>
 #include <map>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 
 namespace
 {
 namespace fs = std::filesystem;
 
-constexpr int kSchemaVersion = 2;
+constexpr int kSchemaVersion = 3;
 constexpr size_t kHashBufferSize = 1024 * 1024;
 
 struct DbCloser
@@ -70,6 +77,15 @@ void bindText(sqlite3* db, sqlite3_stmt* stmt, int index, const std::string& val
   if (sqlite3_bind_text(stmt, index, value.data(), static_cast<int>(value.size()),
                         SQLITE_TRANSIENT) != SQLITE_OK) {
     throwDb(db, "Binding VFS catalog text");
+  }
+}
+
+void bindDigest(sqlite3* db, sqlite3_stmt* stmt, int index,
+                const VfsDigest& digest)
+{
+  if (sqlite3_bind_blob(stmt, index, digest.data(), digest.size(),
+                        SQLITE_TRANSIENT) != SQLITE_OK) {
+    throwDb(db, "Binding VFS catalog digest");
   }
 }
 
@@ -160,6 +176,18 @@ uint64_t fnv1a(const std::string& value)
   }
   return hash;
 }
+
+bool isBethesdaArchive(const std::string& path)
+{
+  const std::string normalized = normalizeForLookup(path);
+  return normalized.ends_with(".bsa") || normalized.ends_with(".ba2");
+}
+
+struct ArchiveCandidate
+{
+  std::string real_path;
+  VfsDigest digest{};
+};
 
 struct Root
 {
@@ -301,6 +329,14 @@ void initializeSchema(sqlite3* db)
        " root_key TEXT PRIMARY KEY, merkle_root BLOB NOT NULL,"
        " file_count INTEGER NOT NULL, generation INTEGER NOT NULL);");
   exec(db,
+       "CREATE TABLE IF NOT EXISTS archive_catalogs("
+       " digest BLOB PRIMARY KEY, member_count INTEGER NOT NULL,"
+       " error TEXT NOT NULL DEFAULT '');"
+       "CREATE TABLE IF NOT EXISTS archive_members("
+       " digest BLOB NOT NULL, relative_path TEXT NOT NULL,"
+       " normalized_path TEXT NOT NULL,"
+       " PRIMARY KEY(digest,normalized_path)) WITHOUT ROWID;");
+  exec(db,
        "CREATE TEMP TABLE IF NOT EXISTS catalog_seen("
        " root_key TEXT NOT NULL, normalized_path TEXT NOT NULL,"
        " PRIMARY KEY(root_key,normalized_path)) WITHOUT ROWID;");
@@ -326,6 +362,156 @@ int64_t nextGeneration(sqlite3* db)
   auto stmt = prepare(db, "SELECT value FROM catalog_meta WHERE key='generation';");
   if (sqlite3_step(stmt.get()) != SQLITE_ROW) throwDb(db, "Reading catalog generation");
   return sqlite3_column_int64(stmt.get(), 0);
+}
+
+std::shared_ptr<const VfsArchiveMemberIndex> reconcileArchiveManifests(
+    sqlite3* db,
+    const std::map<VfsDigest, std::string>& archive_candidates,
+    const std::map<std::string, VfsDigest>& visible_archives,
+    VfsCatalogProgress& state)
+{
+  auto findCatalog = prepare(db,
+      "SELECT member_count,error FROM archive_catalogs WHERE digest=?1;");
+  std::vector<ArchiveCandidate> uncached;
+  uncached.reserve(archive_candidates.size());
+  for (const auto& [digest, path] : archive_candidates) {
+    sqlite3_reset(findCatalog.get());
+    sqlite3_clear_bindings(findCatalog.get());
+    bindDigest(db, findCatalog.get(), 1, digest);
+    if (sqlite3_step(findCatalog.get()) == SQLITE_ROW) {
+      ++state.archives_reused;
+      const auto* error = reinterpret_cast<const char*>(
+          sqlite3_column_text(findCatalog.get(), 1));
+      if (error != nullptr && *error != '\0') ++state.archive_errors;
+      continue;
+    }
+    uncached.push_back({path, digest});
+  }
+
+#ifdef FLUORINE_HAS_BSA_FFI
+  if (!uncached.empty()) {
+    std::atomic<std::size_t> next{0};
+    std::atomic<uint64_t> indexed{0};
+    std::atomic<uint64_t> errors{0};
+    std::mutex dbMutex;
+    std::mutex errorMutex;
+    std::exception_ptr workerError;
+    std::atomic<bool> stop{false};
+
+    const unsigned int hardware = std::max(1u, std::thread::hardware_concurrency());
+    const std::size_t workerCount =
+        std::min<std::size_t>(uncached.size(), hardware);
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+    for (std::size_t worker = 0; worker < workerCount; ++worker) {
+      workers.emplace_back([&]() {
+        while (!stop.load(std::memory_order_relaxed)) {
+          const std::size_t index = next.fetch_add(1, std::memory_order_relaxed);
+          if (index >= uncached.size()) return;
+          const ArchiveCandidate& candidate = uncached[index];
+          BsaFfiStringList list = bsa_ffi_list_files(candidate.real_path.c_str());
+          const std::string parseError = list.error != nullptr ? list.error : "";
+
+          try {
+            std::scoped_lock lock(dbMutex);
+            auto removeMembers = prepare(
+                db, "DELETE FROM archive_members WHERE digest=?1;");
+            bindDigest(db, removeMembers.get(), 1, candidate.digest);
+            if (sqlite3_step(removeMembers.get()) != SQLITE_DONE) {
+              throwDb(db, "Clearing archive manifest members");
+            }
+
+            uint64_t memberCount = 0;
+            if (parseError.empty()) {
+              auto insertMember = prepare(db,
+                  "INSERT OR IGNORE INTO archive_members("
+                  "digest,relative_path,normalized_path) VALUES(?1,?2,?3);");
+              for (std::size_t item = 0; item < list.count; ++item) {
+                if (list.items == nullptr || list.items[item] == nullptr) continue;
+                std::string relative(list.items[item]);
+                std::replace(relative.begin(), relative.end(), '\\', '/');
+                const std::string normalized = normalizeForLookup(relative);
+                if (normalized.empty()) continue;
+                sqlite3_reset(insertMember.get());
+                sqlite3_clear_bindings(insertMember.get());
+                bindDigest(db, insertMember.get(), 1, candidate.digest);
+                bindText(db, insertMember.get(), 2, relative);
+                bindText(db, insertMember.get(), 3, normalized);
+                if (sqlite3_step(insertMember.get()) != SQLITE_DONE) {
+                  throwDb(db, "Adding archive manifest member");
+                }
+                if (sqlite3_changes(db) != 0) ++memberCount;
+              }
+            }
+
+            auto insertCatalog = prepare(db,
+                "INSERT OR REPLACE INTO archive_catalogs("
+                "digest,member_count,error) VALUES(?1,?2,?3);");
+            bindDigest(db, insertCatalog.get(), 1, candidate.digest);
+            sqlite3_bind_int64(insertCatalog.get(), 2,
+                               static_cast<sqlite3_int64>(memberCount));
+            bindText(db, insertCatalog.get(), 3, parseError);
+            if (sqlite3_step(insertCatalog.get()) != SQLITE_DONE) {
+              throwDb(db, "Publishing archive manifest");
+            }
+            indexed.fetch_add(1, std::memory_order_relaxed);
+            if (!parseError.empty()) errors.fetch_add(1, std::memory_order_relaxed);
+          } catch (...) {
+            stop.store(true, std::memory_order_relaxed);
+            std::scoped_lock lock(errorMutex);
+            if (workerError == nullptr) workerError = std::current_exception();
+          }
+          bsa_ffi_string_list_free(list);
+        }
+      });
+    }
+    for (auto& worker : workers) worker.join();
+    if (workerError != nullptr) std::rethrow_exception(workerError);
+    state.archives_indexed += indexed.load(std::memory_order_relaxed);
+    state.archive_errors += errors.load(std::memory_order_relaxed);
+  }
+#else
+  // Archive support is optional at build time. Keep the filesystem catalog
+  // usable without pretending the archives were successfully indexed.
+  state.archive_errors += uncached.size();
+#endif
+
+  std::set<VfsDigest> visibleDigests;
+  for (const auto& [path, digest] : visible_archives) {
+    (void)path;
+    visibleDigests.insert(digest);
+  }
+
+  std::size_t memberCount = 0;
+  std::size_t archiveCount = 0;
+  for (const VfsDigest& digest : visibleDigests) {
+    sqlite3_reset(findCatalog.get());
+    sqlite3_clear_bindings(findCatalog.get());
+    bindDigest(db, findCatalog.get(), 1, digest);
+    if (sqlite3_step(findCatalog.get()) != SQLITE_ROW) continue;
+    const auto* error = reinterpret_cast<const char*>(
+        sqlite3_column_text(findCatalog.get(), 1));
+    if (error != nullptr && *error != '\0') continue;
+    memberCount += static_cast<std::size_t>(
+        sqlite3_column_int64(findCatalog.get(), 0));
+    ++archiveCount;
+  }
+
+  auto index = std::make_shared<VfsArchiveMemberIndex>(memberCount, archiveCount);
+  auto members = prepare(db,
+      "SELECT normalized_path FROM archive_members WHERE digest=?1;");
+  for (const VfsDigest& digest : visibleDigests) {
+    sqlite3_reset(members.get());
+    sqlite3_clear_bindings(members.get());
+    bindDigest(db, members.get(), 1, digest);
+    while (sqlite3_step(members.get()) == SQLITE_ROW) {
+      const auto* path = reinterpret_cast<const char*>(
+          sqlite3_column_text(members.get(), 0));
+      if (path != nullptr) index->add(path);
+    }
+  }
+  state.archive_members = memberCount;
+  return index;
 }
 
 }  // namespace
@@ -375,6 +561,9 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
     VfsTree tree;
     tree.root.is_directory = true;
     tree.dir_count = 1;
+    std::map<VfsDigest, std::string> archiveCandidates;
+    std::map<std::string, VfsDigest> visibleArchives;
+    VfsCatalogProgress state;
 
     std::vector<Root> roots;
     if (scan_base) roots.push_back({data_dir, data_dir, "_base_game", true});
@@ -383,7 +572,7 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
 
     if (!scan_base) {
       auto base = prepare(db.get(),
-          "SELECT relative_path,size,mtime_ns,mode FROM catalog_files"
+          "SELECT relative_path,size,mtime_ns,mode,blake3 FROM catalog_files"
           " WHERE root_key=?1 ORDER BY normalized_path;");
       bindText(db.get(), base.get(), 1, data_dir);
       while (sqlite3_step(base.get()) == SQLITE_ROW) {
@@ -396,8 +585,28 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
             std::chrono::system_clock::time_point(
                 std::chrono::nanoseconds(sqlite3_column_int64(base.get(), 2))),
             "_base_game", true,
-            static_cast<mode_t>(sqlite3_column_int64(base.get(), 3)));
+            static_cast<mode_t>(sqlite3_column_int64(base.get(), 3)),
+            [&]() -> std::optional<VfsDigest> {
+              const void* blob = sqlite3_column_blob(base.get(), 4);
+              const int bytes = sqlite3_column_bytes(base.get(), 4);
+              if (blob == nullptr || bytes != BLAKE3_OUT_LEN) return std::nullopt;
+              VfsDigest value{};
+              std::memcpy(value.data(), blob, value.size());
+              return value;
+            }());
         ++tree.file_count;
+        if (isBethesdaArchive(relative)) {
+          const void* blob = sqlite3_column_blob(base.get(), 4);
+          const int bytes = sqlite3_column_bytes(base.get(), 4);
+          if (blob != nullptr && bytes == BLAKE3_OUT_LEN) {
+            VfsDigest digest{};
+            std::memcpy(digest.data(), blob, digest.size());
+            const std::string full = (fs::path(data_dir) / relative).string();
+            archiveCandidates.insert_or_assign(digest, full);
+            visibleArchives.insert_or_assign(normalizeForLookup(relative), digest);
+            ++state.archives_discovered;
+          }
+        }
       }
     }
 
@@ -431,7 +640,6 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
         " merkle_root=excluded.merkle_root,file_count=excluded.file_count,"
         " generation=excluded.generation;");
 
-    VfsCatalogProgress state;
     std::vector<VfsProviderRoot> providerRoots;
     providerRoots.reserve(roots.size() + (scan_base ? 0 : 1));
     if (!scan_base) {
@@ -470,6 +678,7 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
         const auto components = splitPath(relative);
         if (S_ISDIR(st.st_mode)) {
           tree.root.insertDirectory(components);
+          visibleArchives.erase(normalizeForLookup(relative));
           ++tree.dir_count;
           continue;
         }
@@ -562,8 +771,13 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
         tree.root.insertFile(components, storedPath,
                              static_cast<uint64_t>(st.st_size),
                              timePoint(st.st_mtim), root.origin, root.backing,
-                             st.st_mode & 07777);
+                             st.st_mode & 07777, digest);
         ++tree.file_count;
+        if (isBethesdaArchive(relative)) {
+          archiveCandidates.insert_or_assign(digest, full);
+          visibleArchives.insert_or_assign(normalized, digest);
+          ++state.archives_discovered;
+        }
         state.current_file.clear();
         state.current_file_size = 0;
 
@@ -602,6 +816,9 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
       }
       providerRoots.push_back(std::move(providerRoot));
     }
+
+    auto archiveMemberIndex = reconcileArchiveManifests(
+        db.get(), archiveCandidates, visibleArchives, state);
 
     std::vector<VfsCatalogDuplicate> duplicates;
     auto overwriteRows = prepare(db.get(),
@@ -647,7 +864,7 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
     state.current_file_size = 0;
     reportProgress();
     return {std::move(tree), std::move(providerRoots), profileRoot,
-            std::move(duplicates)};
+            std::move(duplicates), std::move(archiveMemberIndex)};
   } catch (...) {
     sqlite3_exec(db.get(), "ROLLBACK;", nullptr, nullptr, nullptr);
     throw;

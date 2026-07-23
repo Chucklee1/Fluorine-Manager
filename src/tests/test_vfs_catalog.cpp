@@ -260,10 +260,54 @@ TEST(VfsCatalog, UpgradesVersionOneCatalogWithoutRehashing)
                 -1, &stmt, nullptr),
             SQLITE_OK);
   ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
-  EXPECT_EQ(sqlite3_column_int(stmt, 0), 2);
+  EXPECT_EQ(sqlite3_column_int(stmt, 0), 3);
   sqlite3_finalize(stmt);
   sqlite3_close(db);
 }
+
+#ifdef FLUORINE_HAS_BSA_FFI
+TEST(VfsCatalog, CatalogsBsaAndBa2MembersAndReusesContentManifests)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path overwrite = temp.path() / "overwrite";
+  fs::create_directories(data);
+  fs::create_directories(overwrite);
+
+  const fs::path fixtures =
+      fs::path(FLUORINE_TEST_SOURCE_DIR) / "libs/libbsarch/examples";
+  ASSERT_TRUE(fs::copy_file(fixtures / "test_read.bsa", data / "Example.bsa"));
+  ASSERT_TRUE(fs::copy_file(fixtures / "test_read.ba2", data / "Example.ba2"));
+
+  VfsCatalog catalog(temp.path() / "catalog.sqlite");
+  VfsCatalogProgress firstProgress;
+  const auto first = catalog.reconcileAndBuild(
+      data.string(), {}, overwrite.string(), true,
+      [&](const VfsCatalogProgress& value) { firstProgress = value; });
+
+  EXPECT_EQ(firstProgress.archives_discovered, 2u);
+  EXPECT_EQ(firstProgress.archives_indexed, 2u);
+  EXPECT_EQ(firstProgress.archives_reused, 0u);
+  EXPECT_EQ(firstProgress.archive_errors, 0u);
+  ASSERT_NE(first.archive_member_index, nullptr);
+  EXPECT_EQ(first.archive_member_index->archiveCount(), 2u);
+  EXPECT_GE(first.archive_member_index->memberCount(), 2u);
+  EXPECT_TRUE(first.archive_member_index->mightContain("textures/grass/test.dds"));
+  EXPECT_FALSE(first.archive_member_index->mightContain("textures/not-present.dds"));
+
+  VfsCatalogProgress secondProgress;
+  const auto second = catalog.reconcileAndBuild(
+      data.string(), {}, overwrite.string(), true,
+      [&](const VfsCatalogProgress& value) { secondProgress = value; });
+  EXPECT_EQ(secondProgress.files_hashed, 0u);
+  EXPECT_EQ(secondProgress.archives_discovered, 2u);
+  EXPECT_EQ(secondProgress.archives_indexed, 0u);
+  EXPECT_EQ(secondProgress.archives_reused, 2u);
+  EXPECT_EQ(secondProgress.archive_errors, 0u);
+  ASSERT_NE(second.archive_member_index, nullptr);
+  EXPECT_TRUE(second.archive_member_index->mightContain("textures/grass/test.dds"));
+}
+#endif
 
 TEST(VfsCatalog, MerkleRootsTrackContentAndPriorityIndependently)
 {

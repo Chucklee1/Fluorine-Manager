@@ -215,19 +215,6 @@ public:
 
   void refuseValidation();
 
-  /**
-   * @brief fetch the user's legacy personal API key via the OAuth bearer
-   *        token and persist it as the legacy API key.
-   *
-   * Several plugins (Plugin Browser, older Python plugins) only consume the
-   * legacy `apiKey` field. The OAuth flow alone never populates it, so they
-   * fail with "User API Key is missing" even after a successful login.
-   * Calling Nexus' v1 `/users/validate.json` with the bearer token returns
-   * the user's personal API key in the `key` field; we store it so legacy
-   * code paths see a key.
-   **/
-  void fetchAndStoreLegacyApiKey();
-
 signals:
 
   /**
