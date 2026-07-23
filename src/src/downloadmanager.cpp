@@ -43,6 +43,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <QInputDialog>
 #include <QMessageBox>
 #include <QRegularExpression>
+#include <QStorageInfo>
 #include <QTextDocument>
 #include <QTimer>
 #include <QUrlQuery>
@@ -78,6 +79,21 @@ static bool looksLikeCdnObjectKey(const QString& name)
     }
   }
   return true;
+}
+
+static void logDownloadFileFailure(const char* operation, const QFile& output,
+                                   qint64 requested = -1, qint64 written = -1)
+{
+  const QString outputPath = output.fileName();
+  const QStorageInfo storage(QFileInfo(outputPath).absolutePath());
+  log::error(
+      "Download file {} failed: path='{}' requested_bytes={} written_bytes={} "
+      "file_error={} ('{}') storage_root='{}' available_bytes={} "
+      "total_bytes={} read_only={} valid={} ready={}",
+      operation, outputPath, requested, written, static_cast<int>(output.error()),
+      output.errorString(), storage.rootPath(), storage.bytesAvailable(),
+      storage.bytesTotal(), storage.isReadOnly(), storage.isValid(),
+      storage.isReady());
 }
 
 unsigned int DownloadManager::DownloadInfo::s_NextDownloadID = 1U;
@@ -225,6 +241,7 @@ void DownloadManager::DownloadInfo::setName(QString newName, bool renameFile)
   }
   if (renameFile) {
     if ((newName != m_Output.fileName()) && !m_Output.rename(newName)) {
+      logDownloadFileFailure("rename", m_Output);
       reportError(tr(R"(failed to rename "%1" to "%2")")
                       .arg(m_Output.fileName())
                       .arg(newName));
@@ -669,9 +686,11 @@ void DownloadManager::startDownload(QNetworkReply* reply, DownloadInfo* newDownl
   createMetaFile(newDownload);
 
   if (!newDownload->m_Output.open(mode)) {
-    reportError(tr("failed to download %1: could not open output file: %2")
+    logDownloadFileFailure("open", newDownload->m_Output);
+    reportError(tr("failed to download %1: could not open output file %2: %3")
                     .arg(reply->url().toString())
-                    .arg(newDownload->m_Output.fileName()));
+                    .arg(newDownload->m_Output.fileName())
+                    .arg(newDownload->m_Output.errorString()));
     return;
   }
 
@@ -2417,10 +2436,8 @@ void DownloadManager::downloadFinished(int index)
 
   if (info != nullptr) {
     QNetworkReply* reply = info->m_Reply;
-    QByteArray data;
     if (reply->isOpen() && info->m_HasData) {
-      data = reply->readAll();
-      info->m_Output.write(data);
+      writeData(info);
     }
     info->m_Output.close();
     TaskProgressManager::instance().forgetMe(info->m_TaskProgressId);
@@ -2577,6 +2594,7 @@ void DownloadManager::metaDataChanged()
       refreshAlphabeticalTranslation();
       if (!info->m_Output.isOpen() &&
           !info->m_Output.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        logDownloadFileFailure("resume open", info->m_Output);
         reportError(tr("failed to re-open %1").arg(info->m_FileName));
         setState(info, STATE_CANCELING);
       }
@@ -2638,20 +2656,29 @@ void DownloadManager::checkDownloadTimeout()
 void DownloadManager::writeData(DownloadInfo* info)
 {
   if (info != nullptr && info->m_Reply != nullptr) {
-    qint64 ret = info->m_Output.write(info->m_Reply->readAll());
-    if (ret < info->m_Reply->size()) {
-      QString const fileName =
-          info->m_FileName;  // m_FileName may be destroyed after setState
+    const QByteArray data = info->m_Reply->readAll();
+    const qint64 requested = data.size();
+    const qint64 written = info->m_Output.write(data);
+    if (written != requested) {
+      // Capture diagnostics before canceling: aborting the reply can finish the
+      // download and destroy DownloadInfo through the connected slots.
+      const QString fileName = info->m_FileName;
+      const QString outputPath = info->m_Output.fileName();
+      const QFileDevice::FileError fileError = info->m_Output.error();
+      const QString fileErrorString = info->m_Output.errorString();
+
+      logDownloadFileFailure("write", info->m_Output, requested, written);
+
       setState(info, DownloadState::STATE_CANCELED);
 
-      log::error("Unable to write download \"{}\" to drive (return {})",
-                 info->m_FileName, ret);
-
-      reportError(tr("Unable to write download to drive (return %1).\n"
-                     "Check the drive's available storage.\n\n"
-                     "Canceling download \"%2\"...")
-                      .arg(ret)
-                      .arg(fileName));
+      reportError(
+          tr("Unable to write download \"%1\" to:\n%2\n\n"
+             "%3 (error %4; wrote %5 of %6 bytes).\n"
+             "Check the terminal log for filesystem diagnostics.")
+              .arg(fileName, outputPath, fileErrorString)
+              .arg(static_cast<int>(fileError))
+              .arg(written)
+              .arg(requested));
     }
   }
 }
