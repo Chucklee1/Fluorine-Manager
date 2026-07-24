@@ -23,11 +23,14 @@ import base64
 import binascii
 import json
 import os
+import re
 import shutil
+import sys
 import tempfile
+from collections import deque
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Iterable, Iterator, TextIO, TypedDict
+from typing import Iterable, Iterator, Mapping, TextIO, TypedDict
 
 # Morrowind masters, in canonical load order.
 #
@@ -62,16 +65,34 @@ _LOCAL_SAVES_END = "# END FLUORINE OPENMW LOCAL SAVES"
 _LOCAL_SAVES_ORIGINAL = "# FLUORINE ORIGINAL USER-DATA "
 
 _SELECTION_KEYS = ("content", "groundcover", "fallback-archive")
-_SELECTION_STATE_VERSION = 2
+_OPENMW_PATH_TOKENS = frozenset(
+    {"?local?", "?userconfig?", "?userdata?", "?global?"}
+)
+_SELECTION_STATE_VERSION = 3
 _OPENMW_NATIVE_SUFFIXES = (".omwaddon", ".omwgame", ".omwscripts")
 _OPENMW_PLAYER_STUB_SUFFIXES = tuple(
     suffix + ".esp" for suffix in _OPENMW_NATIVE_SUFFIXES
 )
 
 
-class OpenMWSelectionState(TypedDict):
+class OpenMWSelectionStateV1(TypedDict):
     version: int
     known_plugins: list[str]
+    enabled_plugins: list[str]
+    groundcover: list[str]
+    known_archives: list[str]
+    archives: list[str]
+
+
+class OpenMWSelectionStateV2(OpenMWSelectionStateV1):
+    profile_config_entries: list[str]
+    profile_config_entries_known: bool
+    profile_config_terminal: bool
+
+
+class OpenMWSelectionState(TypedDict):
+    version: int
+    plugin_order: list[str]
     enabled_plugins: list[str]
     groundcover: list[str]
     known_archives: list[str]
@@ -79,6 +100,55 @@ class OpenMWSelectionState(TypedDict):
     profile_config_entries: list[str]
     profile_config_entries_known: bool
     profile_config_terminal: bool
+    content_migration_source: str
+    groundcover_migration_source: str
+    archive_migration_source: str
+    order_migration_source: str
+    plugin_state_migrated: bool
+
+
+class OpenMWConfigSelection(TypedDict):
+    content: list[str]
+    groundcover: list[str]
+    fallback_archive: list[str]
+    content_present: bool
+    groundcover_present: bool
+    fallback_archive_present: bool
+    plugin_order: list[str]
+    replaced_channels: list[str]
+
+
+class _OpenMWConfigSource(TypedDict):
+    selection: OpenMWConfigSelection
+    plugin_entries: list[tuple[str, str]]
+    config_dirs: list[str]
+    replace_config: bool
+
+
+class MorrowindIniSelection(TypedDict):
+    game_files: list[str]
+    archives: list[str]
+    game_files_present: bool
+    archives_present: bool
+
+
+class PluginInventoryReconciliation(TypedDict):
+    state: OpenMWSelectionState
+    available_plugins: list[str]
+    enabled_plugins: list[str]
+    active_plugins: list[str]
+    unavailable_plugins: list[str]
+    newly_discovered: list[str]
+    insertion_positions: dict[str, int]
+    alias_diagnostics: list[str]
+    duplicate_diagnostics: list[str]
+
+
+class OpenMWLauncherProfile(TypedDict):
+    current_profile: str | None
+    data: list[str]
+    content: list[str]
+    fallback_archive: list[str]
 
 
 def find_openmw_cfg(
@@ -117,24 +187,300 @@ def _read_lines(cfg_path: Path) -> list[str]:
     return cfg_path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
-def read_openmw_selection(cfg_path: Path) -> dict[str, list[str]]:
-    """Read the ordered plugin and archive selections from an OpenMW config."""
-    result = {key: [] for key in _SELECTION_KEYS}
+def _parse_openmw_config_path(value: str, cfg_path: Path) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError(f"Malformed OpenMW config directive in {cfg_path}")
+    if not value.startswith('"'):
+        return value
+
+    result: list[str] = []
+    escaped = False
+    closed = False
+    position = 1
+    while position < len(value):
+        character = value[position]
+        position += 1
+        if escaped:
+            result.append(character)
+            escaped = False
+        elif character == "&":
+            escaped = True
+        elif character == '"':
+            closed = True
+            break
+        else:
+            result.append(character)
+    if escaped or not closed or not result:
+        raise ValueError(f"Malformed OpenMW config path in {cfg_path}: {value!r}")
+    return "".join(result)
+
+
+def _default_openmw_path_tokens(root_cfg: Path) -> dict[str, Path]:
+    """Return platform roots that can be inferred without the OpenMW binary."""
+    tokens: dict[str, Path] = {}
+    if not sys.platform.startswith("linux"):
+        return tokens
+
+    config_dir = root_cfg.parent
+    app_root: Path | None = None
+    if (
+        config_dir.name == "openmw"
+        and config_dir.parent.name == "config"
+        and config_dir.parent.parent.parent.name == "app"
+        and config_dir.parent.parent.parent.parent.name == ".var"
+    ):
+        app_root = config_dir.parent.parent
+
+    if app_root is not None:
+        tokens["?userconfig?"] = config_dir
+        tokens["?userdata?"] = app_root / "data" / "openmw"
+    else:
+        home_env = os.environ.get("HOME")
+        home = Path(home_env) if home_env else Path.home()
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config"))
+        data_home = Path(os.environ.get("XDG_DATA_HOME", home / ".local/share"))
+        tokens["?userconfig?"] = config_home / "openmw"
+        tokens["?userdata?"] = data_home / "openmw"
+    tokens["?global?"] = Path("/usr/share/games/openmw")
+    return tokens
+
+
+def _openmw_path_tokens(
+    root_cfg: Path,
+    path_tokens: Mapping[str, Path | str] | None,
+) -> dict[str, Path]:
+    tokens = (
+        _default_openmw_path_tokens(root_cfg)
+        if path_tokens is None else {}
+    )
+    for raw_token, raw_path in (path_tokens or {}).items():
+        token = raw_token
+        if token not in _OPENMW_PATH_TOKENS:
+            raise ValueError(f"Unknown OpenMW path token: {raw_token!r}")
+        if not str(raw_path):
+            raise ValueError(f"Empty OpenMW path token root: {raw_token!r}")
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            raise ValueError(
+                f"OpenMW path token root must be absolute: {raw_token!r}"
+            )
+        tokens[token] = path.resolve(strict=False)
+    return tokens
+
+
+def _resolve_openmw_config_dir(
+    value: str,
+    cfg_path: Path,
+    path_tokens: Mapping[str, Path],
+) -> Path:
+    token_match = re.match(r"^(\?[^?]+\?)(.*)$", value)
+    if token_match is not None:
+        token = token_match.group(1)
+        root = path_tokens.get(token)
+        if token not in _OPENMW_PATH_TOKENS or root is None:
+            raise ValueError(
+                f"Unresolved OpenMW path token in {cfg_path}: "
+                f"{token_match.group(1)!r}"
+            )
+        remainder = token_match.group(2).lstrip("/\\")
+        directory = root / remainder if remainder else root
+    elif value.startswith("?"):
+        raise ValueError(
+            f"Unresolved OpenMW path token in {cfg_path}: {value!r}"
+        )
+    else:
+        directory = Path(value).expanduser()
+        if not directory.is_absolute():
+            directory = cfg_path.parent / directory
+    return directory.resolve(strict=False)
+
+
+def _parse_openmw_source(
+    cfg_path: Path, *, parse_config_dirs: bool
+) -> _OpenMWConfigSource:
+    values = {key: [] for key in _SELECTION_KEYS}
     seen = {key: set() for key in _SELECTION_KEYS}
+    present = {key: False for key in _SELECTION_KEYS}
+    replaced: list[str] = []
+    plugin_entries: list[tuple[str, str]] = []
+    config_dirs: list[str] = []
+    replace_config = False
+
     for raw in _read_lines(cfg_path):
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, value = line.split("=", 1)
-        key = key.strip().lower()
-        value = value.strip()
-        if key not in result or not value:
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip().casefold()
+        value = raw_value.strip()
+        if key == "replace":
+            targets = value.split()
+            if not targets or any(
+                re.fullmatch(r"[A-Za-z0-9-]+", target) is None
+                for target in targets
+            ):
+                raise ValueError(f"Malformed OpenMW replace directive: {raw!r}")
+            for raw_target in targets:
+                target = raw_target.casefold()
+                if target == "config":
+                    replace_config = True
+                    continue
+                if target not in values:
+                    continue
+                present[target] = True
+                if target not in replaced:
+                    replaced.append(target)
             continue
+        if key == "config":
+            if parse_config_dirs:
+                config_dirs.append(_parse_openmw_config_path(value, cfg_path))
+            continue
+        if key not in values or not value:
+            continue
+        if key in ("content", "groundcover"):
+            value = canonical_plugin_name(value)
+        present[key] = True
         folded = value.casefold()
-        if folded not in seen[key]:
-            seen[key].add(folded)
-            result[key].append(value)
-    return result
+        if folded in seen[key]:
+            continue
+        seen[key].add(folded)
+        values[key].append(value)
+        if key in ("content", "groundcover"):
+            plugin_entries.append((key, value))
+
+    return {
+        "selection": {
+            "content": values["content"],
+            "groundcover": values["groundcover"],
+            "fallback_archive": values["fallback-archive"],
+            "content_present": present["content"],
+            "groundcover_present": present["groundcover"],
+            "fallback_archive_present": present["fallback-archive"],
+            "plugin_order": [value for _, value in plugin_entries],
+            "replaced_channels": replaced,
+        },
+        "plugin_entries": plugin_entries,
+        "config_dirs": config_dirs,
+        "replace_config": replace_config,
+    }
+
+
+def parse_openmw_selection(cfg_path: Path) -> OpenMWConfigSelection:
+    """Parse one config source without applying its replacement directives."""
+    return _parse_openmw_source(cfg_path, parse_config_dirs=False)["selection"]
+
+
+def parse_openmw_selection_chain(
+    cfg_path: Path,
+    path_tokens: Mapping[str, Path | str] | None = None,
+) -> OpenMWConfigSelection:
+    """Parse the effective selection from an OpenMW ``config=`` chain.
+
+    Config sources are visited breadth-first in priority order. Replacement
+    directives apply to lower-priority sources as a whole, regardless of where
+    the directive occurs within their own file. ``path_tokens`` can provide
+    exact roots for OpenMW's platform-dependent path tokens.
+    """
+    root_cfg = cfg_path.expanduser().resolve(strict=False)
+    tokens = _openmw_path_tokens(root_cfg, path_tokens)
+    sources: list[tuple[Path, _OpenMWConfigSource]] = []
+    pending: deque[tuple[Path, frozenset[Path]]] = deque(
+        [(root_cfg, frozenset())]
+    )
+    discovered = {root_cfg}
+
+    while pending:
+        path, ancestors = pending.popleft()
+        if not path.is_file():
+            continue
+
+        source = _parse_openmw_source(path, parse_config_dirs=True)
+        if source["replace_config"] and path != root_cfg:
+            sources = sources[:1]
+            pending.clear()
+            discovered = {root_cfg, path}
+        sources.append((path, source))
+
+        next_ancestors = ancestors | {path}
+        for raw_directory in source["config_dirs"]:
+            directory = _resolve_openmw_config_dir(
+                raw_directory, path, tokens
+            )
+            child = (directory / "openmw.cfg").resolve(strict=False)
+            if child in next_ancestors:
+                raise ValueError(f"Cycle in OpenMW config chain at {child}")
+            if child in discovered:
+                raise ValueError(
+                    f"Ambiguous repeated OpenMW config source: {child}"
+                )
+            discovered.add(child)
+            pending.append((child, frozenset(next_ancestors)))
+
+    values = {key: [] for key in _SELECTION_KEYS}
+    seen = {key: set() for key in _SELECTION_KEYS}
+    present = {key: False for key in _SELECTION_KEYS}
+    replaced: list[str] = []
+    plugin_entries: list[tuple[str, str]] = []
+    for _, source in sources:
+        selection = source["selection"]
+        for key in selection["replaced_channels"]:
+            values[key].clear()
+            seen[key].clear()
+            plugin_entries = [
+                entry for entry in plugin_entries if entry[0] != key
+            ]
+            present[key] = True
+            if key not in replaced:
+                replaced.append(key)
+
+        added = {key: set() for key in _SELECTION_KEYS}
+        fields = (
+            ("content", selection["content"], selection["content_present"]),
+            (
+                "groundcover",
+                selection["groundcover"],
+                selection["groundcover_present"],
+            ),
+            (
+                "fallback-archive",
+                selection["fallback_archive"],
+                selection["fallback_archive_present"],
+            ),
+        )
+        for key, source_values, source_present in fields:
+            present[key] = present[key] or source_present
+            for value in source_values:
+                folded = value.casefold()
+                if folded in seen[key]:
+                    continue
+                seen[key].add(folded)
+                added[key].add(folded)
+                values[key].append(value)
+        for key, value in source["plugin_entries"]:
+            if value.casefold() in added[key]:
+                plugin_entries.append((key, value))
+
+    return {
+        "content": values["content"],
+        "groundcover": values["groundcover"],
+        "fallback_archive": values["fallback-archive"],
+        "content_present": present["content"],
+        "groundcover_present": present["groundcover"],
+        "fallback_archive_present": present["fallback-archive"],
+        "plugin_order": [value for _, value in plugin_entries],
+        "replaced_channels": replaced,
+    }
+
+
+def read_openmw_selection(cfg_path: Path) -> dict[str, list[str]]:
+    """Compatibility view of the effective OpenMW config chain selection."""
+    parsed = parse_openmw_selection_chain(cfg_path)
+    return {
+        "content": parsed["content"],
+        "groundcover": parsed["groundcover"],
+        "fallback-archive": parsed["fallback_archive"],
+    }
 
 
 def filter_selected_files(
@@ -176,17 +522,9 @@ def _unique_names(*groups: Iterable[str]) -> list[str]:
 
 
 def collapse_file_providers(available: Iterable[str]) -> list[str]:
-    """Deduplicate logical names while retaining highest-priority provider casing."""
-    result: list[str] = []
-    positions: dict[str, int] = {}
-    for name in available:
-        folded = name.casefold()
-        if folded in positions:
-            result[positions[folded]] = name
-        else:
-            positions[folded] = len(result)
-            result.append(name)
-    return result
+    """Retain the highest-priority usable provider for each logical identity."""
+    native_order, providers, _, _, _ = _inventory_providers(available)
+    return [providers[key] for key in native_order]
 
 
 def is_openmw_player_stub(name: str) -> bool:
@@ -197,11 +535,16 @@ def destub_plugin_name(name: str) -> str:
     return name[:-4] if is_openmw_player_stub(name) else name
 
 
+def canonical_plugin_name(name: str) -> str:
+    """Return the canonical logical identity for a native file or wrapper."""
+    return destub_plugin_name(name)
+
+
 def normalize_plugin_loadorder(names: Iterable[str]) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
     for raw in names:
-        name = destub_plugin_name(raw)
+        name = canonical_plugin_name(raw)
         folded = name.casefold()
         if folded not in seen:
             seen.add(folded)
@@ -255,6 +598,526 @@ def format_name_sample(names: Iterable[str], limit: int = 10) -> str:
     return f"{shown} (+{omitted} more)" if omitted > 0 else shown
 
 
+def _canonical_plugin_names(*groups: Iterable[str]) -> list[str]:
+    return normalize_plugin_loadorder(
+        name.strip() for group in groups for name in group if name.strip()
+    )
+
+
+def _copy_v3_state(state: OpenMWSelectionState) -> OpenMWSelectionState:
+    return {
+        "version": _SELECTION_STATE_VERSION,
+        "plugin_order": list(state["plugin_order"]),
+        "enabled_plugins": list(state["enabled_plugins"]),
+        "groundcover": list(state["groundcover"]),
+        "known_archives": list(state["known_archives"]),
+        "archives": list(state["archives"]),
+        "profile_config_entries": list(state["profile_config_entries"]),
+        "profile_config_entries_known": state["profile_config_entries_known"],
+        "profile_config_terminal": state["profile_config_terminal"],
+        "content_migration_source": state["content_migration_source"],
+        "groundcover_migration_source": state["groundcover_migration_source"],
+        "archive_migration_source": state["archive_migration_source"],
+        "order_migration_source": state["order_migration_source"],
+        "plugin_state_migrated": state["plugin_state_migrated"],
+    }
+
+
+def _validate_string_list(data: dict, key: str, *, nonempty: bool = False) -> bool:
+    value = data.get(key)
+    return isinstance(value, list) and all(
+        isinstance(item, str) and (not nonempty or bool(item)) for item in value
+    )
+
+
+def _validate_legacy_selection_state(data: object) -> dict:
+    if not isinstance(data, dict) or type(data.get("version")) is not int:
+        raise ValueError("Invalid OpenMW selection state")
+    version = data["version"]
+    if version not in (1, 2):
+        raise ValueError("Unsupported OpenMW selection state")
+    for key in (
+        "known_plugins",
+        "enabled_plugins",
+        "groundcover",
+        "known_archives",
+        "archives",
+    ):
+        if not _validate_string_list(data, key):
+            raise ValueError("Invalid OpenMW selection state")
+    if version == 2 and (
+        not _validate_string_list(data, "profile_config_entries")
+        or not isinstance(data.get("profile_config_entries_known"), bool)
+        or not isinstance(data.get("profile_config_terminal"), bool)
+    ):
+        raise ValueError("Invalid OpenMW selection state")
+    return data
+
+
+def validate_selection_state(state: object) -> OpenMWSelectionState:
+    """Strictly validate canonical serialized version-3 state."""
+    if (
+        not isinstance(state, dict)
+        or state.get("version") != _SELECTION_STATE_VERSION
+    ):
+        raise ValueError("Invalid OpenMW version-3 selection state")
+    if "known_plugins" in state:
+        raise ValueError("Version-3 state must not contain known_plugins")
+    for key in (
+        "plugin_order",
+        "enabled_plugins",
+        "groundcover",
+        "known_archives",
+        "archives",
+        "profile_config_entries",
+    ):
+        if not _validate_string_list(
+            state, key, nonempty=key != "profile_config_entries"
+        ):
+            raise ValueError(f"Invalid OpenMW version-3 field: {key}")
+    for key in (
+        "profile_config_entries_known",
+        "profile_config_terminal",
+        "plugin_state_migrated",
+    ):
+        if not isinstance(state.get(key), bool):
+            raise ValueError(f"Invalid OpenMW version-3 field: {key}")
+    for key in (
+        "content_migration_source",
+        "groundcover_migration_source",
+        "archive_migration_source",
+        "order_migration_source",
+    ):
+        if not isinstance(state.get(key), str) or not state[key]:
+            raise ValueError(f"Invalid OpenMW version-3 field: {key}")
+
+    order_keys: set[str] = set()
+    for name in state["plugin_order"]:
+        if name != name.strip():
+            raise ValueError("Version-3 plugin_order contains a noncanonical name")
+        if is_openmw_player_stub(name):
+            raise ValueError("Version-3 plugin_order contains a wrapper alias")
+        folded = name.casefold()
+        if folded in order_keys:
+            raise ValueError("Version-3 plugin_order contains duplicate identities")
+        order_keys.add(folded)
+    for field in ("enabled_plugins", "groundcover"):
+        seen: set[str] = set()
+        for name in state[field]:
+            if name != name.strip():
+                raise ValueError(f"Version-3 {field} contains a noncanonical name")
+            if is_openmw_player_stub(name):
+                raise ValueError(f"Version-3 {field} contains a wrapper alias")
+            folded = name.casefold()
+            if folded in seen:
+                raise ValueError(f"Version-3 {field} contains duplicate identities")
+            if folded not in order_keys:
+                raise ValueError(f"Version-3 {field} contains an unknown identity")
+            seen.add(folded)
+    return state
+
+
+def _inventory_providers(
+    rows: Iterable[str],
+) -> tuple[list[str], dict[str, str], dict[str, str], list[str], list[str]]:
+    native_order: list[str] = []
+    providers: dict[str, str] = {}
+    wrappers: dict[str, str] = {}
+    aliases: list[str] = []
+    duplicates: list[str] = []
+    for raw in rows:
+        name = raw.strip()
+        if not name:
+            continue
+        logical = canonical_plugin_name(name)
+        folded = logical.casefold()
+        if is_openmw_player_stub(name):
+            wrappers[folded] = logical
+            continue
+        if folded in providers:
+            duplicates.append(
+                f"Duplicate providers for {logical!r}; using {name!r}"
+            )
+            providers[folded] = name
+            continue
+        providers[folded] = name
+        native_order.append(folded)
+    for folded, wrapper in wrappers.items():
+        if folded in providers:
+            aliases.append(
+                f"Ignored wrapper alias {wrapper + '.esp'!r} for {providers[folded]!r}"
+            )
+        else:
+            aliases.append(
+                f"Wrapper-only identity {wrapper!r} is known but unavailable"
+            )
+    return native_order, providers, wrappers, aliases, duplicates
+
+
+def reconcile_plugin_inventory(
+    state: OpenMWSelectionState,
+    available_plugins: Iterable[str],
+    primary_plugins: Iterable[str] = (),
+) -> PluginInventoryReconciliation:
+    """Purely reconcile canonical state with the current physical inventory."""
+    validate_selection_state(state)
+    candidate = _copy_v3_state(state)
+    _, providers, wrappers, aliases, duplicates = _inventory_providers(
+        available_plugins
+    )
+    primary = _canonical_plugin_names(primary_plugins)
+    primary_keys = [name.casefold() for name in primary]
+    primary_by_key = dict(zip(primary_keys, primary))
+
+    old_order_keys = {name.casefold() for name in candidate["plugin_order"]}
+    inventory_names = dict(wrappers)
+    inventory_names.update(providers)
+    inventory_names.update(primary_by_key)
+    new_keys = [key for key in inventory_names if key not in old_order_keys]
+    new_keys.sort(key=lambda key: (key, inventory_names[key]))
+
+    def current_casing(name: str) -> str:
+        folded = name.casefold()
+        return providers.get(folded, primary_by_key.get(folded, name))
+
+    old_without_primary = [
+        current_casing(name)
+        for name in candidate["plugin_order"]
+        if name.casefold() not in primary_by_key
+    ]
+    primary_prefix = [current_casing(name) for name in primary]
+    new_non_primary = [
+        inventory_names[key] for key in new_keys if key not in primary_by_key
+    ]
+    candidate["plugin_order"] = primary_prefix + old_without_primary + new_non_primary
+    order_by_key = {name.casefold(): name for name in candidate["plugin_order"]}
+
+    enabled_keys = {name.casefold() for name in candidate["enabled_plugins"]}
+    enabled_keys.update(new_keys)
+    enabled_keys.update(primary_keys)
+    candidate["enabled_plugins"] = [
+        name for name in candidate["plugin_order"] if name.casefold() in enabled_keys
+    ]
+    candidate["groundcover"] = [
+        order_by_key[name.casefold()] for name in candidate["groundcover"]
+    ]
+    validate_selection_state(candidate)
+
+    available_order = [
+        name for name in candidate["plugin_order"]
+        if name.casefold() in providers
+    ]
+    available_keys = set(providers)
+    active_keys = {name.casefold() for name in candidate["enabled_plugins"]}
+    insertion_positions = {
+        order_by_key[key]: candidate["plugin_order"].index(order_by_key[key])
+        for key in new_keys
+    }
+    return {
+        "state": candidate,
+        "available_plugins": available_order,
+        "enabled_plugins": list(candidate["enabled_plugins"]),
+        "active_plugins": [
+            name for name in candidate["plugin_order"]
+            if name.casefold() in active_keys and name.casefold() in available_keys
+        ],
+        "unavailable_plugins": [
+            name for name in candidate["plugin_order"]
+            if name.casefold() not in available_keys
+        ],
+        "newly_discovered": [order_by_key[key] for key in new_keys],
+        "insertion_positions": insertion_positions,
+        "alias_diagnostics": aliases,
+        "duplicate_diagnostics": duplicates,
+    }
+
+
+def project_plugin_lists(
+    state: OpenMWSelectionState,
+    available_plugins: Iterable[str],
+    primary_plugins: Iterable[str] = (),
+) -> tuple[list[str], list[str]]:
+    """Return canonical ``plugins.txt`` and ``loadorder.txt`` projections."""
+    result = reconcile_plugin_inventory(state, available_plugins, primary_plugins)
+    return result["active_plugins"], result["state"]["plugin_order"]
+
+
+def read_morrowind_ini(ini_path: Path) -> MorrowindIniSelection:
+    """Read legacy plugin/archive channels without interpolation or comments."""
+    if not ini_path.is_file():
+        return {
+            "game_files": [],
+            "archives": [],
+            "game_files_present": False,
+            "archives_present": False,
+        }
+    raw = ini_path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252", errors="strict")
+
+    entries: dict[str, dict[int, str]] = {"game files": {}, "archives": {}}
+    present = {"game files": False, "archives": False}
+    section: str | None = None
+    patterns = {
+        "game files": re.compile(r"gamefile\s*(\d+)$", re.IGNORECASE),
+        "archives": re.compile(r"archive\s*(\d+)$", re.IGNORECASE),
+    }
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(("#", ";")):
+            continue
+        if stripped.startswith("[") and stripped.endswith("]"):
+            candidate = stripped[1:-1].strip().casefold()
+            section = candidate if candidate in entries else None
+            if section is not None:
+                present[section] = True
+            continue
+        if section is None or "=" not in raw_line:
+            continue
+        key, value = raw_line.split("=", 1)
+        match = patterns[section].fullmatch(key.strip())
+        if match is None:
+            continue
+        index = int(match.group(1))
+        value = value.strip()
+        previous = entries[section].get(index)
+        if previous is not None and previous != value:
+            raise ValueError(
+                f"Conflicting {section} index {index} in {ini_path}"
+            )
+        entries[section][index] = value
+
+    return {
+        "game_files": _canonical_plugin_names(
+            entries["game files"][index]
+            for index in sorted(entries["game files"])
+            if entries["game files"][index]
+        ),
+        "archives": _unique_names(
+            entries["archives"][index]
+            for index in sorted(entries["archives"])
+            if entries["archives"][index]
+        ),
+        "game_files_present": present["game files"],
+        "archives_present": present["archives"],
+    }
+
+
+def read_legacy_plugin_file(path: Path) -> list[str]:
+    """Read and canonicalize a MO2-style plugin list for migration only."""
+    if not path.is_file():
+        return []
+    return _canonical_plugin_names(
+        line.strip().lstrip("*").strip()
+        for line in path.read_text(encoding="utf-8-sig", errors="strict").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+def read_legacy_archive_file(path: Path) -> list[str]:
+    """Read a MO2-style archive list for migration only."""
+    if not path.is_file():
+        return []
+    return _unique_names(
+        line.strip().lstrip("*").strip()
+        for line in path.read_text(encoding="utf-8-sig", errors="strict").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+def _coerce_openmw_selection(
+    selection: OpenMWConfigSelection | dict[str, list[str]] | None,
+) -> OpenMWConfigSelection:
+    if selection is None:
+        return {
+            "content": [],
+            "groundcover": [],
+            "fallback_archive": [],
+            "content_present": False,
+            "groundcover_present": False,
+            "fallback_archive_present": False,
+            "plugin_order": [],
+            "replaced_channels": [],
+        }
+    if "fallback_archive" in selection:
+        return selection  # type: ignore[return-value]
+    content = list(selection.get("content", []))
+    groundcover = list(selection.get("groundcover", []))
+    archives = list(selection.get("fallback-archive", []))
+    return {
+        "content": content,
+        "groundcover": groundcover,
+        "fallback_archive": archives,
+        "content_present": bool(content),
+        "groundcover_present": bool(groundcover),
+        "fallback_archive_present": bool(archives),
+        "plugin_order": _unique_names(content, groundcover),
+        "replaced_channels": [],
+    }
+
+
+def migrate_selection_state(
+    state: (
+        OpenMWSelectionState
+        | OpenMWSelectionStateV1
+        | OpenMWSelectionStateV2
+        | None
+    ),
+    *,
+    available_plugins: Iterable[str],
+    available_archives: Iterable[str],
+    primary_plugins: Iterable[str] = (),
+    morrowind_ini: MorrowindIniSelection | None = None,
+    openmw_selection: OpenMWConfigSelection | dict[str, list[str]] | None = None,
+    legacy_plugins: Iterable[str] = (),
+    legacy_loadorder: Iterable[str] = (),
+    legacy_groundcover: Iterable[str] = (),
+    legacy_archives: Iterable[str] = (),
+) -> OpenMWSelectionState:
+    """Build v3 state using the plan's independent, fail-closed precedence."""
+    available_plugins = list(available_plugins)
+    available_archives = list(available_archives)
+    primary_plugins = list(primary_plugins)
+    parsed_cfg = _coerce_openmw_selection(openmw_selection)
+    ini = morrowind_ini or {
+        "game_files": [],
+        "archives": [],
+        "game_files_present": False,
+        "archives_present": False,
+    }
+    legacy_plugins = _canonical_plugin_names(legacy_plugins)
+    legacy_loadorder = _canonical_plugin_names(legacy_loadorder)
+    legacy_groundcover = _canonical_plugin_names(legacy_groundcover)
+    legacy_archives = _unique_names(legacy_archives)
+
+    version = state.get("version") if isinstance(state, dict) else None
+    if state is not None and version == _SELECTION_STATE_VERSION:
+        validate_selection_state(state)
+        candidate = _copy_v3_state(state)
+        if candidate["plugin_state_migrated"]:
+            return candidate
+        candidate["plugin_state_migrated"] = True
+        return candidate
+    legacy_state = (
+        _validate_legacy_selection_state(state) if state is not None else None
+    )
+    state_source = f"state-v{version}" if legacy_state is not None else None
+
+    if legacy_state is not None:
+        groundcover = _canonical_plugin_names(legacy_state["groundcover"])
+        ground_source = state_source
+    elif legacy_groundcover:
+        groundcover = legacy_groundcover
+        ground_source = "groundcover.txt"
+    elif parsed_cfg["groundcover_present"]:
+        groundcover = _canonical_plugin_names(parsed_cfg["groundcover"])
+        ground_source = "openmw.cfg"
+    else:
+        groundcover = []
+        ground_source = "none"
+    ground_keys = {name.casefold() for name in groundcover}
+
+    if legacy_state is not None:
+        content = _canonical_plugin_names(legacy_state["enabled_plugins"])
+        content_source = state_source
+    elif ini["game_files_present"]:
+        content = [
+            name for name in _canonical_plugin_names(ini["game_files"])
+            if name.casefold() not in ground_keys
+        ]
+        content_source = "Morrowind.ini"
+    elif parsed_cfg["content_present"]:
+        content = _canonical_plugin_names(parsed_cfg["content"])
+        content_source = "openmw.cfg"
+    elif legacy_plugins:
+        content = legacy_plugins
+        content_source = "plugins.txt"
+    else:
+        _, providers, wrappers, _, _ = _inventory_providers(available_plugins)
+        content = _canonical_plugin_names(
+            primary_plugins, providers.values(), wrappers.values()
+        )
+        content_source = "defaults"
+    enabled = _canonical_plugin_names(content, groundcover)
+
+    if legacy_state is not None:
+        archives = _unique_names(legacy_state["archives"])
+        archive_source = state_source
+    elif parsed_cfg["fallback_archive_present"]:
+        archives = _unique_names(parsed_cfg["fallback_archive"])
+        archive_source = "openmw.cfg"
+    else:
+        archives = _unique_names(legacy_archives, ini["archives"])
+        if legacy_archives and ini["archives"]:
+            archive_source = "archives.txt+Morrowind.ini"
+        elif legacy_archives:
+            archive_source = "archives.txt"
+        elif ini["archives"]:
+            archive_source = "Morrowind.ini"
+        else:
+            archives = _unique_names(available_archives)
+            archive_source = "defaults"
+
+    if legacy_state is not None:
+        base_order = _canonical_plugin_names(legacy_state["known_plugins"])
+        order_source = state_source
+    elif legacy_loadorder:
+        base_order = legacy_loadorder
+        order_source = "loadorder.txt"
+    elif parsed_cfg["content_present"] or parsed_cfg["groundcover_present"]:
+        base_order = _canonical_plugin_names(parsed_cfg["plugin_order"])
+        order_source = "openmw.cfg"
+    else:
+        base_order = []
+        order_source = "inventory"
+
+    _, providers, wrappers, _, _ = _inventory_providers(available_plugins)
+    inventory = sorted(
+        _canonical_plugin_names(providers.values(), wrappers.values()),
+        key=lambda name: (name.casefold(), name),
+    )
+    if order_source == "inventory":
+        base_order = inventory
+    completion = sorted(
+        _canonical_plugin_names(inventory, enabled, groundcover),
+        key=lambda name: (name.casefold(), name),
+    )
+    plugin_order = _canonical_plugin_names(
+        primary_plugins, base_order, completion
+    )
+    candidate: OpenMWSelectionState = {
+        "version": _SELECTION_STATE_VERSION,
+        "plugin_order": plugin_order,
+        "enabled_plugins": enabled,
+        "groundcover": groundcover,
+        "known_archives": _unique_names(available_archives, archives),
+        "archives": archives,
+        "profile_config_entries": (
+            list(legacy_state["profile_config_entries"])
+            if legacy_state is not None and version == 2 else []
+        ),
+        "profile_config_entries_known": (
+            legacy_state["profile_config_entries_known"]
+            if legacy_state is not None and version == 2 else legacy_state is None
+        ),
+        "profile_config_terminal": (
+            legacy_state["profile_config_terminal"]
+            if legacy_state is not None and version == 2 else False
+        ),
+        "content_migration_source": content_source,
+        "groundcover_migration_source": ground_source,
+        "archive_migration_source": archive_source,
+        "order_migration_source": order_source,
+        "plugin_state_migrated": True,
+    }
+    validate_selection_state(candidate)
+    return reconcile_plugin_inventory(
+        candidate, available_plugins, primary_plugins
+    )["state"]
+
+
 def create_selection_state(
     configured: dict[str, list[str]],
     loadorder: Iterable[str],
@@ -262,31 +1125,15 @@ def create_selection_state(
     available_archives: Iterable[str],
     supplemental_archives: Iterable[str] = (),
 ) -> OpenMWSelectionState:
-    """Capture durable activation state before replacing a legacy profile config."""
-    available_plugins = list(available_plugins)
-    available_archives = list(available_archives)
-    configured_plugins = _unique_names(
-        configured["content"], configured["groundcover"]
+    """Compatibility adapter for legacy launch migration into version 3."""
+    return migrate_selection_state(
+        None,
+        available_plugins=available_plugins,
+        available_archives=available_archives,
+        openmw_selection=configured,
+        legacy_loadorder=loadorder,
+        legacy_archives=supplemental_archives,
     )
-    enabled_plugins = configured_plugins or _unique_names(available_plugins)
-
-    configured_archives = _unique_names(
-        configured["fallback-archive"], supplemental_archives
-    )
-    if not configured["fallback-archive"]:
-        configured_archives = _unique_names(configured_archives, available_archives)
-
-    return {
-        "version": _SELECTION_STATE_VERSION,
-        "known_plugins": _unique_names(loadorder, available_plugins, enabled_plugins),
-        "enabled_plugins": enabled_plugins,
-        "groundcover": _unique_names(configured["groundcover"]),
-        "known_archives": _unique_names(available_archives, configured_archives),
-        "archives": configured_archives,
-        "profile_config_entries": [],
-        "profile_config_entries_known": True,
-        "profile_config_terminal": False,
-    }
 
 
 def update_selection_state(
@@ -295,89 +1142,88 @@ def update_selection_state(
     available_archives: Iterable[str],
     groundcover: Iterable[str],
 ) -> bool:
-    """Enable newly discovered files and persist explicit groundcover changes."""
+    """Compatibility in-place update backed by pure v3 reconciliation."""
     original = json.dumps(state, sort_keys=True)
-    known_plugin_keys = {name.casefold() for name in state["known_plugins"]}
-    enabled_plugin_keys = {name.casefold() for name in state["enabled_plugins"]}
-    for name in available_plugins:
-        folded = name.casefold()
-        if folded not in known_plugin_keys:
-            known_plugin_keys.add(folded)
-            state["known_plugins"].append(name)
-            enabled_plugin_keys.add(folded)
-            state["enabled_plugins"].append(name)
+    candidate = reconcile_plugin_inventory(state, available_plugins)["state"]
+    groundcover = _canonical_plugin_names(groundcover)
+    order_keys = {name.casefold() for name in candidate["plugin_order"]}
+    missing = [name for name in groundcover if name.casefold() not in order_keys]
+    candidate["plugin_order"].extend(missing)
+    casing = {name.casefold(): name for name in candidate["plugin_order"]}
+    candidate["groundcover"] = [casing[name.casefold()] for name in groundcover]
+    enabled_keys = {name.casefold() for name in candidate["enabled_plugins"]}
+    enabled_keys.update(name.casefold() for name in groundcover)
+    candidate["enabled_plugins"] = [
+        name for name in candidate["plugin_order"] if name.casefold() in enabled_keys
+    ]
 
-    groundcover = _unique_names(groundcover)
-    for name in groundcover:
-        folded = name.casefold()
-        if folded not in known_plugin_keys:
-            known_plugin_keys.add(folded)
-            state["known_plugins"].append(name)
-        if folded not in enabled_plugin_keys:
-            enabled_plugin_keys.add(folded)
-            state["enabled_plugins"].append(name)
-    state["groundcover"] = groundcover
-
-    known_archive_keys = {name.casefold() for name in state["known_archives"]}
-    archive_keys = {name.casefold() for name in state["archives"]}
+    available_archives = list(available_archives)
+    archive_provider = {name.casefold(): name for name in available_archives}
+    known_keys = {name.casefold() for name in candidate["known_archives"]}
+    selected_keys = {name.casefold() for name in candidate["archives"]}
+    candidate["known_archives"] = [
+        archive_provider.get(name.casefold(), name)
+        for name in candidate["known_archives"]
+    ]
+    candidate["archives"] = [
+        archive_provider.get(name.casefold(), name) for name in candidate["archives"]
+    ]
     for name in available_archives:
         folded = name.casefold()
-        if folded not in known_archive_keys:
-            known_archive_keys.add(folded)
-            state["known_archives"].append(name)
-            archive_keys.add(folded)
-            state["archives"].append(name)
+        if folded not in known_keys:
+            known_keys.add(folded)
+            candidate["known_archives"].append(name)
+            if folded not in selected_keys:
+                selected_keys.add(folded)
+                candidate["archives"].append(name)
+    validate_selection_state(candidate)
+    state.clear()
+    state.update(candidate)
     return original != json.dumps(state, sort_keys=True)
 
 
-def read_selection_state(state_path: Path) -> OpenMWSelectionState | None:
+def read_selection_state(
+    state_path: Path,
+) -> (
+    OpenMWSelectionState
+    | OpenMWSelectionStateV1
+    | OpenMWSelectionStateV2
+    | None
+):
     if not state_path.is_file():
         return None
-    data = json.loads(state_path.read_text(encoding="utf-8"))
-    keys = (
-        "known_plugins",
-        "enabled_plugins",
-        "groundcover",
-        "known_archives",
-        "archives",
-    )
-    if not isinstance(data, dict) or data.get("version") not in (
-        1,
-        _SELECTION_STATE_VERSION,
-    ):
-        raise ValueError(f"Unsupported OpenMW selection state: {state_path}")
-    if any(
-        not isinstance(data.get(key), list)
-        or any(not isinstance(value, str) for value in data[key])
-        for key in keys
-    ):
-        raise ValueError(f"Invalid OpenMW selection state: {state_path}")
-    if data["version"] == _SELECTION_STATE_VERSION and (
-        not isinstance(data.get("profile_config_entries"), list)
-        or any(
-            not isinstance(value, str)
-            for value in data["profile_config_entries"]
-        )
-        or not isinstance(data.get("profile_config_entries_known"), bool)
-        or not isinstance(data.get("profile_config_terminal"), bool)
-    ):
-        raise ValueError(f"Invalid OpenMW selection state: {state_path}")
-    return data
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if (
+            isinstance(data, dict)
+            and data.get("version") == _SELECTION_STATE_VERSION
+        ):
+            return validate_selection_state(data)
+        return _validate_legacy_selection_state(data)
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError(f"Invalid OpenMW selection state: {state_path}") from error
 
 
-def upgrade_selection_state(state: OpenMWSelectionState) -> bool:
-    if state["version"] == _SELECTION_STATE_VERSION:
+def upgrade_selection_state(state: dict) -> bool:
+    if state.get("version") == _SELECTION_STATE_VERSION:
+        validate_selection_state(state)
         return False
-    state["version"] = _SELECTION_STATE_VERSION
-    state["profile_config_entries"] = []
-    state["profile_config_entries_known"] = False
-    state["profile_config_terminal"] = False
+    upgraded = migrate_selection_state(
+        state,
+        available_plugins=[],
+        available_archives=_unique_names(
+            state.get("known_archives", []), state.get("archives", [])
+        ),
+    )
+    state.clear()
+    state.update(upgraded)
     return True
 
 
 def write_selection_state(
     state_path: Path, state: OpenMWSelectionState
 ) -> None:
+    validate_selection_state(state)
     with _atomic_text_writer(state_path) as stream:
         json.dump(state, stream, ensure_ascii=True, indent=2)
         stream.write("\n")
@@ -489,7 +1335,7 @@ def restore_profile_config_entries(
     return True
 
 
-def _parse_openmw_path(value: str) -> str:
+def parse_openmw_path(value: str) -> str:
     if not value.startswith('"'):
         return value.strip()
     result: list[str] = []
@@ -509,6 +1355,19 @@ def _parse_openmw_path(value: str) -> str:
     return "".join(result)
 
 
+def read_openmw_data_dirs(cfg_path: Path) -> list[str]:
+    """Read exact physical ``data=`` occurrence order from one config file."""
+    result: list[str] = []
+    for raw in _read_lines(cfg_path):
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip().casefold() == "data" and value.strip():
+            result.append(parse_openmw_path(value.strip()))
+    return result
+
+
 def read_profile_selector(cfg_path: Path) -> Path | None:
     """Read the profile path from Fluorine's owned root selector block."""
     _, blocks = _split_marked_blocks(
@@ -520,7 +1379,7 @@ def read_profile_selector(cfg_path: Path) -> Path | None:
             value = _option_value(line, "config")
             if value is None:
                 continue
-            path = Path(_parse_openmw_path(value)).expanduser()
+            path = Path(parse_openmw_path(value)).expanduser()
             if not path.is_absolute():
                 path = cfg_path.parent / path
             destinations.append(path.resolve(strict=False))
@@ -578,6 +1437,14 @@ class _FileSnapshot:
         self.target = target
         self.existed = existed
         self.backup = backup
+
+
+class TransactionCleanupError(RuntimeError):
+    """The transaction committed, but one or more rollback artifacts remain."""
+
+
+class TransactionRollbackError(RuntimeError):
+    """The transaction failed and at least one file could not be restored."""
 
 
 def _transaction_target(path: Path) -> Path:
@@ -660,7 +1527,7 @@ def rollback_file_changes(paths: Iterable[Path]) -> Iterator[None]:
             except BaseException as error:
                 rollback_errors.append(f"{snapshot.target}: {error}")
         if rollback_errors:
-            raise RuntimeError(
+            raise TransactionRollbackError(
                 "OpenMW export failed and rollback was incomplete: "
                 + "; ".join(rollback_errors)
             ) from original
@@ -675,7 +1542,7 @@ def rollback_file_changes(paths: Iterable[Path]) -> Iterator[None]:
                     cleanup_errors.append(f"{snapshot.backup}: {error}")
                 _fsync_directory(snapshot.target.parent)
         if cleanup_errors:
-            raise RuntimeError(
+            raise TransactionCleanupError(
                 "OpenMW export committed but rollback snapshot cleanup failed: "
                 + "; ".join(cleanup_errors)
             )
@@ -695,25 +1562,28 @@ def _preserve_non_managed(
     strip_replace: bool = False,
 ) -> list[str]:
     """Return existing cfg lines minus the keys we manage, trailing blanks trimmed."""
-    lines = _read_lines(cfg_path)
-    return _trim_trailing_blanks(
-        [
-            line
-            for line in lines
-            if not _is_managed(line)
-            and not (
-                strip_config
-                and "=" in line
-                and line.split("=", 1)[0].strip().lower() == "config"
-            )
-            and not (
-                strip_replace
-                and "=" in line
-                and line.split("=", 1)[0].strip().lower() == "replace"
-                and line.split("=", 1)[1].strip().lower() in _MANAGED_KEYS
-            )
-        ]
-    )
+    kept: list[str] = []
+    for line in _read_lines(cfg_path):
+        if _is_managed(line):
+            continue
+        if "=" not in line:
+            kept.append(line)
+            continue
+        key, value = line.split("=", 1)
+        folded_key = key.strip().casefold()
+        if strip_config and folded_key == "config":
+            continue
+        if strip_replace and folded_key == "replace":
+            remaining = [
+                target
+                for target in value.split()
+                if target.casefold() not in _MANAGED_KEYS
+            ]
+            if not remaining:
+                continue
+            line = f"{key.strip()}={' '.join(remaining)}"
+        kept.append(line)
+    return _trim_trailing_blanks(kept)
 
 
 def _write_marked_path(
@@ -970,6 +1840,45 @@ def write_openmw_launcher_cfg(
         f"  Wrote launcher.cfg content list: {len(data)} data dir(s) to "
         f"{cfg_path}."
     )
+
+
+def read_openmw_launcher_profile(
+    cfg_path: Path, profile_name: str = "Fluorine"
+) -> OpenMWLauncherProfile:
+    """Read one launcher's generated profile for exact write verification."""
+    result: OpenMWLauncherProfile = {
+        "current_profile": None,
+        "data": [],
+        "content": [],
+        "fallback_archive": [],
+    }
+    in_profiles = False
+    prefix = profile_name + "/"
+    for raw in _read_lines(cfg_path):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_profiles = line[1:-1].strip().casefold() == "profiles"
+            continue
+        if not in_profiles or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key.casefold() == "currentprofile":
+            result["current_profile"] = value
+            continue
+        if not key.startswith(prefix):
+            continue
+        option = key[len(prefix) :].casefold()
+        if option == "data":
+            result["data"].append(value)
+        elif option == "content":
+            result["content"].append(value)
+        elif option == "fallback-archive":
+            result["fallback_archive"].append(value)
+    return result
 
 
 def build_managed_block(
