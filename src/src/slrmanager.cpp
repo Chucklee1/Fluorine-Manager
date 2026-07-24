@@ -14,7 +14,11 @@
 
 namespace {
 
-const char* BASE_URL     = "https://repo.steampowered.com/steamrt4/images/latest-public-beta";
+// Pin SLR releases explicitly. Valve's latest-public-beta directory alias can
+// fail at the edge cache even while the corresponding versioned directory is
+// available. Update this URL deliberately when adopting a newer runtime.
+const char* BASE_URL =
+    "https://repo.steampowered.com/steamrt4/images/4.0.20260714.251823";
 const char* ARCHIVE_NAME = "SteamLinuxRuntime_4.tar.xz";
 const char* EXTRACTED_DIR = "SteamLinuxRuntime_4";
 
