@@ -232,11 +232,6 @@ void PluginList::refresh(const QString& profileName,
       gamePlugins ? gamePlugins->blueprintPluginsAreSupported() : false;
   const bool loadOrderMechanismNone =
       m_GamePlugin->loadOrderMechanism() == IPluginGame::LoadOrderMechanism::None;
-  // Skip the esptk header parse for self-managed games (usesVFS()==false,
-  // e.g. OpenMW): their load order is engine-managed and sorted natively, so
-  // the parsed header metadata is never used — skip the per-plugin I/O on
-  // startup and on every mod toggle. See ESPInfo(parseHeader).
-  const bool parsePluginHeaders = m_GamePlugin->usesVFS();
 
   // Plugin extensions (with leading dot, lowercase) are game-driven so games
   // with their own formats (e.g. OpenMW: .omwaddon/.omwgame/.omwscripts) are
@@ -253,9 +248,22 @@ void PluginList::refresh(const QString& profileName,
     }
     return false;
   };
+  const QStringList ignoredPluginSuffixes =
+      m_GamePlugin->ignoredPluginFileSuffixes();
+  const auto isIgnoredPlugin = [&](const QString& filename) {
+    for (const QString& suffix : ignoredPluginSuffixes) {
+      if (!suffix.isEmpty() && filename.endsWith(suffix, Qt::CaseInsensitive)) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   m_CurrentProfile = profileName;
 
+  // Logical plugin identity is case-insensitive. Collapse case-variant physical
+  // providers before creating rows and retain the provider with highest mod
+  // priority, matching the directory tree's normal conflict resolution.
   std::unordered_map<QString, FileEntryPtr> availablePlugins;
   QStringList archiveCandidates;
 
@@ -265,18 +273,37 @@ void PluginList::refresh(const QString& profileName,
     }
     const QString& filename = ToQString(current->getName());
 
-    if (hasPluginExtension(filename)) {
-      availablePlugins.insert(std::make_pair(filename, current));
+    if (hasPluginExtension(filename) && !isIgnoredPlugin(filename)) {
+      const QString identity = filename.toCaseFolded();
+      auto existing          = availablePlugins.find(identity);
+      if (existing == availablePlugins.end()) {
+        availablePlugins.emplace(identity, current);
+      } else {
+        const QString existingFilename = ToQString(existing->second->getName());
+        bool currentArchive             = false;
+        bool existingArchive = false;
+        const int currentPriority =
+            baseDirectory.getOriginByID(current->getOrigin(currentArchive)).getPriority();
+        const int existingPriority = baseDirectory
+                                         .getOriginByID(existing->second->getOrigin(
+                                             existingArchive))
+                                         .getPriority();
+        if (currentPriority > existingPriority) {
+          existing->second = current;
+        }
+        log::warn(
+            "duplicate case-insensitive plugin providers '{}' and '{}'; using '{}'",
+            existingFilename, filename, ToQString(existing->second->getName()));
+      }
     } else if (filename.endsWith(".bsa", Qt::CaseInsensitive) ||
                filename.endsWith("ba2", Qt::CaseInsensitive)) {
       archiveCandidates.append(filename);
     }
   }
 
-  for (const auto& [filename, current] : availablePlugins) {
-    if (m_ESPsByName.contains(filename)) {
-      continue;
-    }
+  for (const auto& entry : availablePlugins) {
+    const FileEntryPtr& current = entry.second;
+    const QString filename      = ToQString(current->getName());
 
     bool forceLoaded = Settings::instance().game().forceEnableCoreFiles() &&
                        primaryPlugins.contains(filename, Qt::CaseInsensitive);
@@ -302,18 +329,50 @@ void PluginList::refresh(const QString& profileName,
         }
       }
 
-      QString originName    = ToQString(origin.getName());
+      QString originName     = ToQString(origin.getName());
+      const QString fullPath = ToQString(current->getFullPath());
       unsigned int modIndex = ModInfo::getIndex(originName);
       if (modIndex != UINT_MAX) {
         ModInfo::Ptr modInfo = ModInfo::getByIndex(modIndex);
         originName           = modInfo->name();
       }
 
+      const auto existing = m_ESPsByName.find(filename);
+      if (existing != m_ESPsByName.end()) {
+        ESPInfo& info = m_ESPs[existing->second];
+        const bool pathChanged =
+            info.fullPath != fullPath &&
+            (QFileInfo::exists(fullPath) || !QFileInfo::exists(info.fullPath) ||
+             info.fullPath.compare(fullPath, Qt::CaseInsensitive) != 0);
+        const bool providerChanged = info.name != filename || pathChanged ||
+                                     info.originName != originName;
+        if (providerChanged) {
+          ESPInfo refreshed(filename, forceLoaded, forceEnabled, forceDisabled,
+                            originName, fullPath, hasIni, loadedArchives,
+                            lightPluginsAreSupported, mediumPluginsAreSupported,
+                            blueprintPluginsAreSupported,
+                            m_GamePlugin->parsePluginHeader(filename));
+          refreshed.enabled                  = info.enabled;
+          refreshed.priority                 = info.priority;
+          refreshed.modSelected              = info.modSelected;
+          refreshed.isMasterOfSelectedPlugin = info.isMasterOfSelectedPlugin;
+          info                               = std::move(refreshed);
+        } else {
+          info.forceLoaded   = forceLoaded;
+          info.forceEnabled  = forceEnabled;
+          info.forceDisabled = forceDisabled;
+          info.hasIni        = hasIni;
+          info.archives.clear();
+          info.archives.insert(loadedArchives.begin(), loadedArchives.end());
+        }
+        continue;
+      }
+
       m_ESPs.emplace_back(filename, forceLoaded, forceEnabled, forceDisabled,
-                          originName, ToQString(current->getFullPath()), hasIni,
-                          loadedArchives, lightPluginsAreSupported,
-                          mediumPluginsAreSupported, blueprintPluginsAreSupported,
-                          parsePluginHeaders);
+                          originName, fullPath, hasIni, loadedArchives,
+                          lightPluginsAreSupported, mediumPluginsAreSupported,
+                          blueprintPluginsAreSupported,
+                          m_GamePlugin->parsePluginHeader(filename));
       m_ESPs.rbegin()->priority = -1;
     } catch (const std::exception& e) {
       reportError(tr("failed to update esp info for file %1 (source id: %2), error: %3")
@@ -324,7 +383,7 @@ void PluginList::refresh(const QString& profileName,
   }
 
   for (const auto& espName : m_ESPsByName) {
-    if (!availablePlugins.contains(espName.first)) {
+    if (!availablePlugins.contains(espName.first.toCaseFolded())) {
       m_ESPs[espName.second].name = "";
     }
   }
@@ -346,13 +405,7 @@ void PluginList::refresh(const QString& profileName,
   }
 
   fixPrimaryPlugins();
-  // Bethesda engines hard-load master-flagged plugins before regular ones, so
-  // fixPluginRelationships() re-imposes that grouping after every refresh. Games
-  // that manage their own load order (usesVFS()==false, e.g. OpenMW) have no
-  // such rule — libloot's OpenMW sorter freely interleaves .esm/.esp — and
-  // enforcing it here would silently rewrite the freshly sorted-and-persisted
-  // order on the next refresh (every "Sort with LOOT" appeared to never stick).
-  if (m_GamePlugin->usesVFS()) {
+  if (m_GamePlugin->enforcePluginRelationships()) {
     fixPluginRelationships();
   }
 
@@ -1733,6 +1786,7 @@ Qt::ItemFlags PluginList::flags(const QModelIndex& modelIndex) const
 void PluginList::setPluginPriority(int row, int& newPriority, bool isForced)
 {
   int newPriorityTemp = newPriority;
+  const bool enforceRelationships = m_GamePlugin->enforcePluginRelationships();
 
   // enforce valid range
   if (newPriorityTemp < 0)
@@ -1749,22 +1803,21 @@ void PluginList::setPluginPriority(int row, int& newPriority, bool isForced)
 
   bool isBlueprint = m_ESPs[row].isBlueprintFlagged;
   int lowerLimit   = 0;
-  int upperLimit   = 0;
-  if (isBlueprint) {
+  int upperLimit   = static_cast<int>(m_ESPsByPriority.size() - 1);
+  if (enforceRelationships && isBlueprint) {
     if (newPriorityTemp < blueprintStartPos) {
       newPriorityTemp = blueprintStartPos;
     }
     lowerLimit = blueprintStartPos;
-    upperLimit = static_cast<int>(m_ESPsByPriority.size() - 1);
   }
-  if (!isBlueprint) {
+  if (enforceRelationships && !isBlueprint) {
     if (newPriorityTemp >= blueprintStartPos) {
       newPriorityTemp = blueprintStartPos - 1;
     }
     upperLimit = blueprintStartPos - 1;
   }
-  if (!m_ESPs[row].isMasterFlagged && !m_ESPs[row].hasLightExtension &&
-      !m_ESPs[row].hasMasterExtension) {
+  if (enforceRelationships && !m_ESPs[row].isMasterFlagged &&
+      !m_ESPs[row].hasLightExtension && !m_ESPs[row].hasMasterExtension) {
     // don't allow esps to be moved above esms
     while ((newPriorityTemp < upperLimit) &&
            (m_ESPs.at(m_ESPsByPriority.at(newPriorityTemp)).isMasterFlagged ||
@@ -1772,7 +1825,7 @@ void PluginList::setPluginPriority(int row, int& newPriority, bool isForced)
             m_ESPs.at(m_ESPsByPriority.at(newPriorityTemp)).hasMasterExtension)) {
       ++newPriorityTemp;
     }
-  } else {
+  } else if (enforceRelationships) {
     // don't allow esms to be moved below esps
     while ((newPriorityTemp > lowerLimit) &&
            !m_ESPs.at(m_ESPsByPriority.at(newPriorityTemp)).isMasterFlagged &&
@@ -1780,15 +1833,20 @@ void PluginList::setPluginPriority(int row, int& newPriority, bool isForced)
            !m_ESPs.at(m_ESPsByPriority.at(newPriorityTemp)).hasMasterExtension) {
       --newPriorityTemp;
     }
-    // also don't allow "regular" esms to be moved above primary plugins
+  }
+
+  int oldPriority = m_ESPs.at(row).priority;
+  if (!isForced && m_ESPs[row].forceLoaded) {
+    newPriorityTemp = oldPriority;
+  } else if (!isForced) {
+    // Don't allow movable plugins to be moved above fixed primary plugins.
     while ((newPriorityTemp < upperLimit) &&
            (m_ESPs.at(m_ESPsByPriority.at(newPriorityTemp)).forceLoaded)) {
       ++newPriorityTemp;
     }
   }
 
-  int oldPriority = m_ESPs.at(row).priority;
-  if (newPriorityTemp < oldPriority) {  // moving up
+  if (enforceRelationships && newPriorityTemp < oldPriority) {  // moving up
     // don't allow plugins to be moved above their masters
     for (auto master : m_ESPs[row].masters) {
       auto iter = m_ESPsByName.find(master);
@@ -1802,7 +1860,7 @@ void PluginList::setPluginPriority(int row, int& newPriority, bool isForced)
         }
       }
     }
-  } else if (newPriorityTemp > oldPriority) {  // moving down
+  } else if (enforceRelationships && newPriorityTemp > oldPriority) {  // moving down
     // don't allow masters to be moved below their children
     for (int i = oldPriority + 1; i <= newPriorityTemp; i++) {
       PluginList::ESPInfo* otherInfo = &m_ESPs.at(m_ESPsByPriority[i]);
@@ -1938,16 +1996,14 @@ PluginList::ESPInfo::ESPInfo(const QString& name, bool forceLoaded, bool forceEn
                              bool mediumSupported, bool blueprintSupported,
                              bool parseHeader)
     : name(name), fullPath(fullPath), enabled(forceLoaded), forceLoaded(forceLoaded),
-      forceEnabled(forceEnabled), forceDisabled(forceDisabled),  originName(originName), hasIni(hasIni),
+      forceEnabled(forceEnabled), forceDisabled(forceDisabled), originName(originName),
+      formVersion(0), headerVersion(0.0f), hasIni(hasIni),
       archives(archives.begin(), archives.end())
 
 {
   if (!parseHeader) {
-    // Self-managed game (usesVFS()==false, e.g. OpenMW): the header metadata
-    // is unused — the engine manages the load order and the native LOOT sort
-    // reads the files itself — so skip the esptk parse and mirror the
-    // parse-failure defaults (plus the numeric fields the catch branch leaves
-    // untouched), deriving master tiering from the extension alone.
+    // This format does not expose metadata through esptk. Mirror the
+    // parse-failure defaults, deriving master tiering from the extension alone.
     const auto extension = name.right(3).toLower();
     hasMasterExtension   = (extension == "esm");
     hasLightExtension    = (extension == "esl");
@@ -2019,6 +2075,8 @@ PluginList::ESPInfo::ESPInfo(const QString& name, bool forceLoaded, bool forceEn
     isMediumFlagged    = false;
     isBlueprintFlagged = false;
     hasNoRecords       = false;
+    formVersion        = 0;
+    headerVersion      = 0.0f;
   }
 }
 

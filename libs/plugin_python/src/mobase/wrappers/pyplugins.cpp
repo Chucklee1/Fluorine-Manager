@@ -56,6 +56,13 @@ namespace mo2::python {
             .def("usesVFS", &IPluginGame::usesVFS)
             .def("needsAutoCreateDirectories", &IPluginGame::needsAutoCreateDirectories)
             .def("pluginFileExtensions", &IPluginGame::pluginFileExtensions)
+            .def("ignoredPluginFileSuffixes",
+                 &IPluginGame::ignoredPluginFileSuffixes)
+            .def("genericPluginStateFollowsModState",
+                 &IPluginGame::genericPluginStateFollowsModState)
+            .def("parsePluginHeader", &IPluginGame::parsePluginHeader, "fileName"_a)
+            .def("enforcePluginRelationships",
+                 &IPluginGame::enforcePluginRelationships)
             .def("sortToolName", &IPluginGame::sortToolName)
             .def("gameIcon", &IPluginGame::gameIcon)
             .def("gameDirectory", &IPluginGame::gameDirectory)

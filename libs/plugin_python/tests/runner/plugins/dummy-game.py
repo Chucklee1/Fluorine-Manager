@@ -40,6 +40,22 @@ class DummyGame(mobase.IPluginGame):
     def _featureList(self) -> dict[type, object]:
         return self._features
 
+    def ignoredPluginFileSuffixes(self) -> list[str]:
+        return [".wrapper.esp"]
 
-def createPlugin() -> mobase.IPlugin:
-    return DummyGame()  # type: ignore
+    def genericPluginStateFollowsModState(self) -> bool:
+        return False
+
+    def parsePluginHeader(self, fileName: str) -> bool:
+        return fileName != "skip.omwscripts"
+
+    def enforcePluginRelationships(self) -> bool:
+        return False
+
+
+class DefaultPolicyGame(mobase.IPluginGame):
+    pass
+
+
+def createPlugins() -> list[mobase.IPlugin]:
+    return [DummyGame(), DefaultPolicyGame()]  # type: ignore
