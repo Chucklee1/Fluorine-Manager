@@ -678,14 +678,6 @@ NXMAccessManager::NXMAccessManager(QObject* parent, Settings* s,
     setCookieJar(new PersistentCookieJar(QDir::fromNativeSeparators(
         m_Settings->paths().cache() + "/nexus_cookies.dat")));
   }
-
-  // Migrate users who only have an OAuth token but no legacy API key — some
-  // plugins still read only the legacy field. Defer to the event loop so
-  // startup isn't blocked on the network.
-  if (m_Tokens && !m_Tokens->accessToken.isEmpty() && m_Tokens->apiKey.isEmpty()) {
-    QMetaObject::invokeMethod(
-        this, [this]() { fetchAndStoreLegacyApiKey(); }, Qt::QueuedConnection);
-  }
 }
 
 void NXMAccessManager::setTopLevelWidget(QWidget* w)
@@ -791,61 +783,6 @@ void NXMAccessManager::notifyTokens()
 
   startValidationCheck(tokens);
   emit authorizationEnded();
-
-  // OAuth alone doesn't populate the legacy `apiKey`. Some plugins still
-  // only read that field; fetch the user's personal key from v1/validate
-  // and persist it so they don't error with "User API Key is missing".
-  fetchAndStoreLegacyApiKey();
-}
-
-void NXMAccessManager::fetchAndStoreLegacyApiKey()
-{
-  if (!m_Tokens) {
-    return;
-  }
-  if (!m_Tokens->apiKey.isEmpty()) {
-    // already have one (manually entered or carried over)
-    return;
-  }
-  if (m_Tokens->accessToken.isEmpty()) {
-    return;
-  }
-
-  QNetworkRequest request(NexusV1BaseUrl + "users/validate.json");
-  request.setRawHeader("Authorization",
-                       ("Bearer " + m_Tokens->accessToken).toUtf8());
-  addAPIHeaders(request);
-  QNetworkReply* reply = get(request);
-  if (!reply) {
-    log::debug("nexus: cannot fetch legacy API key, request creation failed");
-    return;
-  }
-
-  QObject::connect(reply, &QNetworkReply::finished, this, [this, reply]() {
-    reply->deleteLater();
-
-    const auto code =
-        reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    if (code != 200) {
-      log::debug("nexus: legacy API key fetch returned HTTP {}", code);
-      return;
-    }
-
-    const auto doc        = QJsonDocument::fromJson(reply->readAll());
-    const QJsonObject obj = doc.object();
-    const QString key     = obj.value("key").toString();
-    if (key.isEmpty()) {
-      log::debug("nexus: legacy API key not present in validate response");
-      return;
-    }
-
-    if (GlobalSettings::setNexusApiKey(key)) {
-      if (m_Tokens) {
-        m_Tokens->apiKey = key;
-      }
-      log::info("nexus: stored legacy API key derived from OAuth session");
-    }
-  });
 }
 
 void NXMAccessManager::saveRefreshedTokens(const NexusOAuthTokens tokens)

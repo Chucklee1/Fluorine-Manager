@@ -29,7 +29,14 @@ __attribute__((visibility("default"))) QString findSteamPath();
 /// Find all Steam library root paths, including secondary libraries.
 __attribute__((visibility("default"))) QStringList findSteamLibraryPaths();
 
-/// Find all installed Proton versions (Proton 10+ only, sorted newest first).
+/// Find supported Proton versions in explicit Steam libraries and additional
+/// compatibility-tool directories. Exposed separately for deterministic tests.
+__attribute__((visibility("default"))) QVector<SteamProtonInfo>
+findProtonsForPaths(const QStringList& steamLibraries,
+                    const QStringList& compatibilityToolDirs);
+
+/// Find all installed Proton versions, including Steam, system, and Heroic
+/// installations (Proton 10+ only, sorted newest first).
 __attribute__((visibility("default"))) QVector<SteamProtonInfo> findSteamProtons();
 
 #endif // STEAMDETECTION_H

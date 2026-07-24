@@ -3,12 +3,15 @@
 
 #include <fuse3/fuse_lowlevel.h>
 
+#include "archiveindex.h"
 #include "inodetable.h"
 #include "overwritemanager.h"
+#include "runtimeindex.h"
 #include "trackedwrites.h"
 #include "vfstree.h"
 
 #include <atomic>
+#include <cstddef>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -19,10 +22,28 @@
 #include <unordered_set>
 #include <vector>
 
+struct Mo2OpenFileCleanupResult
+{
+  std::size_t logical_handles = 0;
+  std::size_t descriptors_closed = 0;
+  std::size_t writable_descriptors_closed = 0;
+  std::size_t close_errors = 0;
+};
+
 struct Mo2FsContext
 {
+  ~Mo2FsContext();
+
   std::shared_ptr<VfsTree> tree;
+  std::shared_ptr<const VfsArchiveMemberIndex> archive_members;
   mutable std::shared_mutex tree_mutex;
+
+  // The catalog-derived positive generation is immutable for its lifetime.
+  // Runtime creates/replacements/tombstones live in the index overlay.
+  std::shared_ptr<VfsRuntimeIndex> runtime_index;
+  mutable std::shared_mutex runtime_index_mutex;
+  // Serializes catalog generation replacement with runtime namespace writes.
+  mutable std::recursive_mutex namespace_mutation_mutex;
 
   std::unique_ptr<InodeTable> inodes;
   mutable std::shared_mutex inode_mutex;
@@ -159,6 +180,19 @@ struct Mo2FsContext
   std::atomic<uint64_t> lookup_cache_hits{0};
   std::atomic<uint64_t> lookup_cache_misses{0};
   std::atomic<uint64_t> lookup_cache_invalidations{0};
+  std::atomic<uint64_t> archive_lookup_candidates{0};
+  std::atomic<uint64_t> lookup_base_hits{0};
+  std::atomic<uint64_t> lookup_overlay_hits{0};
+  std::atomic<uint64_t> lookup_negative_hits{0};
+  std::atomic<uint64_t> lookup_negative_first{0};
+  std::atomic<uint64_t> lookup_tombstones{0};
+  std::atomic<uint64_t> lookup_index_invariant_misses{0};
+  std::atomic<uint64_t> node_index_hits{0};
+  std::atomic<uint64_t> node_index_misses{0};
+  std::atomic<uint64_t> dir_cache_invalidations{0};
+  std::atomic<uint64_t> dir_cache_entries_erased{0};
+  std::atomic<uint64_t> opendir_count{0};
+  std::atomic<uint64_t> releasedir_count{0};
   std::atomic<uint64_t> attr_cache_hits{0};
   std::atomic<uint64_t> attr_cache_misses{0};
   std::atomic<uint64_t> dir_cache_hits{0};
@@ -217,6 +251,10 @@ struct Mo2FsContext
   // Not meant to stay on by default — see the June 2026 shader-cache/INI-
   // clobber fix for why keep_cache=1 exists normally.
   bool cache_disabled = false;
+  bool no_opendir_supported = false;
+  bool disable_no_opendir = false;
+  bool readdirplus_enabled = false;
+  bool zero_file_flags = false;
 
   // When true, mo2_lookup inserts phantom directories for missing path
   // components that look like directories (no dot).  Needed by Starfield
@@ -232,6 +270,10 @@ std::size_t mo2PrewarmLookupIndex(Mo2FsContext* ctx);
 // Lifecycle for the dedicated kernel page-cache invalidation worker.
 void mo2RunKernelInvalidations(Mo2FsContext* ctx);
 void mo2StopKernelInvalidations(Mo2FsContext* ctx);
+
+// Close and forget every open file handle after FUSE request workers stop.
+// Safe to call repeatedly; the context destructor calls it as a fallback.
+Mo2OpenFileCleanupResult mo2CloseOpenFiles(Mo2FsContext* ctx) noexcept;
 
 void mo2_init(void* userdata, struct fuse_conn_info* conn);
 void mo2_lookup(fuse_req_t req, fuse_ino_t parent, const char* name);

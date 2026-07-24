@@ -1,12 +1,13 @@
 #ifndef VFS_VFSCATALOG_H
 #define VFS_VFSCATALOG_H
 
+#include "archiveindex.h"
 #include "vfstree.h"
 
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,14 +18,17 @@ struct VfsCatalogProgress
   uint64_t files_hashed = 0;
   uint64_t bytes_hashed = 0;
   uint64_t provider_roots_changed = 0;
+  uint64_t archives_discovered = 0;
+  uint64_t archives_indexed = 0;
+  uint64_t archives_reused = 0;
+  uint64_t archive_members = 0;
+  uint64_t archive_errors = 0;
   uint64_t current_file_size = 0;
   uint64_t elapsed_ms = 0;
   double hash_mib_per_second = 0.0;
   std::string current_root;
   std::string current_file;
 };
-
-using VfsDigest = std::array<unsigned char, 32>;
 
 struct VfsProviderRoot
 {
@@ -68,6 +72,7 @@ struct VfsCatalogResult
   std::vector<VfsProviderRoot> provider_roots;
   VfsDigest profile_root{};
   std::vector<VfsCatalogDuplicate> overwrite_duplicates;
+  std::shared_ptr<const VfsArchiveMemberIndex> archive_member_index;
 };
 
 // Persistent per-machine inventory of all VFS providers. The SQLite database
