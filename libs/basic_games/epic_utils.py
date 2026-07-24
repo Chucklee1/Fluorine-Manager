@@ -7,6 +7,7 @@ import os
 import sys
 from collections.abc import Iterable
 from pathlib import Path
+from typing import cast
 
 try:
     import winreg
@@ -70,8 +71,103 @@ def find_legendary_games(
         try:
             with open(installed_path, encoding="utf-8") as installed_file:
                 installed_games = json.load(installed_file)
+            primary_app_names: set[str] = set()
+            namespace_paths: dict[str, set[Path]] = {}
+            game_namespace_paths: dict[str, set[Path]] = {}
+            presence_namespace_paths: dict[str, set[Path]] = {}
             for game in installed_games.values():
-                yield game["app_name"], Path(game["install_path"])
+                app_name = game["app_name"]
+                install_path = Path(game["install_path"])
+                yield app_name, install_path
+
+                # Plugins normally use Epic's namespace as GameEpicId, while
+                # Legendary records installed games by their launch app name.
+                # They are often identical, but games such as Cyberpunk 2077
+                # use different values (77f2... and "Ginger", respectively).
+                if not isinstance(app_name, str):
+                    continue
+                primary_app_names.add(app_name)
+                if game.get("is_dlc"):
+                    continue
+                if Path(app_name).name != app_name:
+                    continue
+
+                metadata_path = legendary_config_path / "metadata" / f"{app_name}.json"
+                if not metadata_path.is_file():
+                    continue
+
+                try:
+                    with open(metadata_path, encoding="utf-8") as metadata_file:
+                        game_metadata = json.load(metadata_file)
+
+                    namespaces: set[str] = set()
+                    is_game = False
+                    presence_id: str | None = None
+                    asset_infos: object = game_metadata.get("asset_infos")
+                    if isinstance(asset_infos, dict):
+                        for asset_info in cast(
+                            dict[object, object], asset_infos
+                        ).values():
+                            if isinstance(asset_info, dict):
+                                namespace = cast(dict[object, object], asset_info).get(
+                                    "namespace"
+                                )
+                                if isinstance(namespace, str) and namespace:
+                                    namespaces.add(namespace)
+
+                    metadata: object = game_metadata.get("metadata")
+                    if isinstance(metadata, dict):
+                        metadata_dict = cast(dict[object, object], metadata)
+                        namespace = metadata_dict.get("namespace")
+                        if isinstance(namespace, str) and namespace:
+                            namespaces.add(namespace)
+                        categories = metadata_dict.get("categories")
+                        if isinstance(categories, list):
+                            is_game = any(
+                                isinstance(category, dict)
+                                and cast(dict[object, object], category).get("path")
+                                == "games"
+                                for category in cast(list[object], categories)
+                            )
+                        custom_attributes = metadata_dict.get("customAttributes")
+                        if isinstance(custom_attributes, dict):
+                            presence = cast(
+                                dict[object, object], custom_attributes
+                            ).get("PresenceId")
+                            if isinstance(presence, dict):
+                                value = cast(dict[object, object], presence).get(
+                                    "value"
+                                )
+                                if isinstance(value, str) and value:
+                                    presence_id = value
+
+                    for namespace in namespaces:
+                        namespace_paths.setdefault(namespace, set()).add(install_path)
+                        if is_game:
+                            game_namespace_paths.setdefault(namespace, set()).add(
+                                install_path
+                            )
+                        if presence_id == namespace:
+                            presence_namespace_paths.setdefault(namespace, set()).add(
+                                install_path
+                            )
+                except (json.JSONDecodeError, AttributeError, OSError):
+                    # The app-name mapping is still valid when optional cached
+                    # metadata is missing or stale.
+                    pass
+
+            for namespace, install_paths in namespace_paths.items():
+                # Never let a derived alias replace Legendary's authoritative
+                # app-name mapping. PresenceId identifies the canonical entry
+                # when extras share its namespace; the game category and unique
+                # path remain fallbacks for metadata without that attribute.
+                candidate_paths = presence_namespace_paths.get(
+                    namespace,
+                    game_namespace_paths.get(namespace, install_paths),
+                )
+                if namespace in primary_app_names or len(candidate_paths) != 1:
+                    continue
+                yield namespace, next(iter(candidate_paths))
         except (json.JSONDecodeError, AttributeError, KeyError) as e:
             error_message = (
                 f'Unable to parse installed games from Legendary/Heroic launcher: "{installed_path}"\n'

@@ -10,7 +10,7 @@ pkg_check_modules(TEST_FUSE3 REQUIRED IMPORTED_TARGET fuse3)
 include(${CMAKE_CURRENT_SOURCE_DIR}/prefix_safety_tests.cmake)
 
 # ---------------------------------------------------------------------------
-# OpenMW native config generation tests
+# Python regression tests
 # ---------------------------------------------------------------------------
 add_test(
     NAME test_openmw_cfg
@@ -19,6 +19,10 @@ add_test(
 add_test(
     NAME test_flatpak_access
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_flatpak_access.py
+)
+add_test(
+    NAME test_epic_utils
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_epic_utils.py
 )
 
 # ---------------------------------------------------------------------------
