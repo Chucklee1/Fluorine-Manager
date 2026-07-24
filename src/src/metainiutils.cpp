@@ -177,7 +177,12 @@ bool normalizeMetaIniCase(const QString& path)
       if (newVal.isEmpty() && !prevVal.isEmpty()) {
         // Keep the existing non-empty value; drop the empty duplicate.
       } else {
-        prev = std::move(e);
+        // Keep the first spelling for unknown/plugin-defined keys while the
+        // later duplicate supplies the winning value. Known keys already use
+        // the same canonical spelling on every occurrence.
+        const QByteArray preservedKey =
+            prevEq >= 0 ? prev.fullKeyLine.left(prevEq) : canonicalKey;
+        prev.fullKeyLine = preservedKey + valuePart;
       }
       changed = true;
     } else {

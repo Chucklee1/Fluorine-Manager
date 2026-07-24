@@ -265,6 +265,7 @@ target_link_libraries(test_vfs_index PRIVATE
     Qt6::Core
     SQLite::SQLite3
     BLAKE3::blake3
+    utf8proc
     GTest::gtest
     GTest::gtest_main
 )

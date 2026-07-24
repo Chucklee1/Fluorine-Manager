@@ -497,7 +497,8 @@ std::shared_ptr<const VfsArchiveMemberIndex> reconcileArchiveManifests(
     ++archiveCount;
   }
 
-  auto index = std::make_shared<VfsArchiveMemberIndex>(memberCount, archiveCount);
+  auto index = std::make_shared<VfsArchiveMemberIndex>(
+      memberCount, archiveCount, archiveCount == visibleDigests.size());
   auto members = prepare(db,
       "SELECT normalized_path FROM archive_members WHERE digest=?1;");
   for (const VfsDigest& digest : visibleDigests) {

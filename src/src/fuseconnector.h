@@ -87,6 +87,8 @@ private:
   StagingPromotionResult flushStaging();
   VfsIndexPublicationResult publishIndex(
       VfsTree& tree, const VfsCatalogResult& catalog_result);
+  bool deployIndexRootLocator(VfsIndexPublicationResult& publication);
+  void clearIndexRootLocator();
   void deployExternalMappings(const MappingType& mapping, const QString& dataDir);
   void cleanupExternalMappings();
 

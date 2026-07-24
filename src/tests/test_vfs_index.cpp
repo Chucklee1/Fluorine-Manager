@@ -26,7 +26,7 @@ public:
   TemporaryDirectory()
   {
     fs::path pattern =
-        fs::temp_directory_path() / "fluorine-vfs-index-XXXXXX";
+        fs::temp_directory_path() / "vfs-index-XXXXXX";
     std::string writable = pattern.string();
     writable.push_back('\0');
     char* created = ::mkdtemp(writable.data());
@@ -73,6 +73,8 @@ struct Sample
   VfsTree tree;
   std::vector<VfsProviderRoot> providers;
   VfsDigest profile_digest = digest(90);
+  std::shared_ptr<VfsArchiveMemberIndex> archive_members =
+      std::make_shared<VfsArchiveMemberIndex>(2, 1);
 
   Sample()
   {
@@ -121,19 +123,28 @@ struct Sample
                          "Example", false, 0644, digest(5));
     // Neither a stale/mod-provided locator nor output artifacts may be
     // included in the database.
-    tree.root.insertFile({"SKSE", "Plugins", "Fluorine",
+    tree.root.insertFile({"SKSE", "Plugins", "VFSIndexer",
                           kVfsIndexLocatorName},
                          (mod / "fake-locator.json").string(), 1, {},
                          "Example", false, 0644, digest(6));
+    tree.root.insertFile({"SKSE", "Plugins", "Fluorine",
+                          kLegacyVfsIndexLocatorName},
+                         (mod / "legacy-locator.json").string(), 1, {},
+                         "Example", false, 0644, digest(6));
+    tree.root.insertFile({".vfs-indexer", "index", "old.sqlite3"},
+                         (data / ".vfs-indexer/index/old.sqlite3").string(), 1,
+                         {}, "_base_game", false, 0644, digest(7));
     tree.root.insertFile({".fluorine", "index", "old.sqlite3"},
                          (data / ".fluorine/index/old.sqlite3").string(), 1,
                          {}, "_base_game", false, 0644, digest(7));
-    tree.file_count = 9;
+    tree.file_count = 11;
 
     providers = {
         {data.string(), "_base_game", true, 2, digest(21)},
         {mod.string(), "Example", false, 3, digest(22)},
         {overwrite.string(), "Overwrite", false, 1, digest(23)}};
+    archive_members->add("textures/archive-only.dds");
+    archive_members->add("sound/archive-only.wav");
   }
 
   VfsIndexPublicationContext context() const
@@ -148,7 +159,8 @@ struct Sample
   VfsIndexPublicationResult publish()
   {
     VfsIndexPublisher publisher;
-    return publisher.publish(tree, providers, profile_digest, data, context());
+    return publisher.publish(tree, providers, profile_digest, data, context(),
+                             archive_members);
   }
 };
 
@@ -206,16 +218,30 @@ TEST(VfsIndex, PublishesAndValidatesCompleteWineGeneration)
   EXPECT_TRUE(fs::exists(publication.locator_path));
 
   const QJsonObject json = readJson(publication.locator_path);
+  EXPECT_EQ(json.value("format").toString(), QStringLiteral("vfs-index"));
   EXPECT_EQ(json.value("format_version").toInt(), 1);
   EXPECT_EQ(json.value("schema_version").toInt(), 1);
   EXPECT_EQ(json.value("state").toString(), QStringLiteral("complete"));
-  EXPECT_TRUE(json.value("database_path").toString().startsWith(
+  EXPECT_EQ(json.value("path_normalization").toString(),
+            QStringLiteral("utf8-nfc-casefold-v1"));
+  EXPECT_EQ(json.value("host_path_style").toString(),
+            QStringLiteral("posix"));
+  EXPECT_TRUE(json.value("host_database_path").toString().startsWith(
+      QStringLiteral("/")));
+  EXPECT_TRUE(json.value("consumer_database_path").toString().startsWith(
       QStringLiteral("Z:\\")));
 
   const auto validation =
       VfsIndexValidator::validate(publication.locator_path);
   ASSERT_TRUE(validation) << validation.error;
   ASSERT_EQ(validation.index->files.size(), 6u);
+  ASSERT_NE(validation.index->archive_members, nullptr);
+  EXPECT_EQ(validation.index->archive_members->archiveCount(), 1u);
+  EXPECT_EQ(validation.index->archive_members->memberCount(), 2u);
+  EXPECT_TRUE(validation.index->archive_members->mightContain(
+      "textures/archive-only.dds"));
+  EXPECT_FALSE(validation.index->archive_members->mightContain(
+      "textures/not-present.dds"));
   EXPECT_EQ(validation.index->locator.generation, publication.generation);
   EXPECT_EQ(validation.index->locator.instance_name, "Test Instance Ω");
   EXPECT_EQ(validation.index->locator.profile_name, "Default 日本語");
@@ -227,7 +253,9 @@ TEST(VfsIndex, PublishesAndValidatesCompleteWineGeneration)
       });
   ASSERT_NE(stone, validation.index->files.end());
   EXPECT_EQ(stone->origin, "Example");
-  EXPECT_EQ(stone->real_path,
+  EXPECT_EQ(stone->host_path,
+            (sample.mod / "textures" / "stone.dds").string());
+  EXPECT_EQ(stone->consumer_path,
             VfsIndexPublisher::toConsumerPath(
                 sample.mod / "textures" / "stone.dds",
                 VfsIndexConsumerPathStyle::Wine));
@@ -241,7 +269,9 @@ TEST(VfsIndex, PublishesAndValidatesCompleteWineGeneration)
       });
   ASSERT_NE(backing, validation.index->files.end());
   EXPECT_TRUE(backing->is_backing);
-  EXPECT_EQ(backing->real_path,
+  EXPECT_EQ(backing->host_path,
+            (sample.data / "Skyrim.esm").string());
+  EXPECT_EQ(backing->consumer_path,
             VfsIndexPublisher::toConsumerPath(
                 sample.data / "Skyrim.esm",
                 VfsIndexConsumerPathStyle::Wine));
@@ -264,7 +294,8 @@ TEST(VfsIndex, PublishesAndValidatesCompleteWineGeneration)
   EXPECT_EQ(scalarInt(
                 publication.database_path,
                 "SELECT COUNT(*) FROM resolved WHERE normalized_path LIKE "
-                "'%fluorine-vfs-index%' OR normalized_path LIKE "
+                "'%vfs-index%' OR normalized_path LIKE "
+                "'.vfs-indexer/index/%' OR normalized_path LIKE "
                 "'.fluorine/index/%';"),
             0);
   EXPECT_EQ(scalarInt(publication.database_path,
@@ -273,6 +304,9 @@ TEST(VfsIndex, PublishesAndValidatesCompleteWineGeneration)
                       " (priority=1 AND role='mod') OR"
                       " (priority=2 AND role='overwrite');"),
             3);
+  EXPECT_EQ(scalarInt(publication.database_path,
+                      "SELECT COUNT(*) FROM archive_membership;"),
+            1);
   EXPECT_EQ(scalarInt(publication.database_path, "PRAGMA application_id;"),
             kVfsIndexApplicationId);
   EXPECT_EQ(scalarInt(publication.database_path, "PRAGMA user_version;"),
@@ -322,7 +356,7 @@ TEST(VfsIndex, RejectsMalformedIncompleteAndUnsupportedLocators)
   EXPECT_FALSE(VfsIndexValidator::validate(publication.locator_path));
 
   json.insert("format_version", 1);
-  json.insert("database_path", "relative.sqlite3");
+  json.insert("consumer_database_path", "relative.sqlite3");
   writeJson(publication.locator_path, json);
   EXPECT_FALSE(VfsIndexValidator::validate(publication.locator_path));
 }
@@ -385,6 +419,19 @@ TEST(VfsIndex, RejectsGenerationDigestCountSchemaAndCompletionMismatch)
     EXPECT_FALSE(validation);
     EXPECT_NE(validation.error.find("digest"), std::string::npos);
   }
+  {
+    Sample sample;
+    const auto publication = sample.publish();
+    ASSERT_TRUE(publication.success) << publication.error;
+    execDatabase(publication.database_path,
+                 "UPDATE archive_membership"
+                 " SET bits=zeroblob(length(bits));");
+    const auto validation =
+        VfsIndexValidator::validate(publication.locator_path);
+    EXPECT_FALSE(validation);
+    EXPECT_NE(validation.error.find("archive membership proof digest"),
+              std::string::npos);
+  }
 }
 
 TEST(VfsIndex, RejectsCorruptDatabase)
@@ -428,6 +475,27 @@ TEST(VfsIndex, InterruptedArtifactsDoNotReplaceActiveLocator)
   EXPECT_EQ(validation.index->locator.generation, active.generation);
 }
 
+TEST(VfsIndex, OmitsIncompleteArchiveMembershipProof)
+{
+  Sample sample;
+  auto incomplete =
+      std::make_shared<VfsArchiveMemberIndex>(1, 0, false);
+  incomplete->add("textures/unknown-archive.dds");
+  VfsIndexPublisher publisher;
+  const auto publication = publisher.publish(
+      sample.tree, sample.providers, sample.profile_digest, sample.data,
+      sample.context(), incomplete);
+  ASSERT_TRUE(publication.success) << publication.error;
+  EXPECT_EQ(scalarInt(publication.database_path,
+                      "SELECT COUNT(*) FROM archive_membership;"),
+            0);
+
+  const auto validation =
+      VfsIndexValidator::validate(publication.locator_path);
+  ASSERT_TRUE(validation) << validation.error;
+  EXPECT_EQ(validation.index->archive_members, nullptr);
+}
+
 TEST(VfsIndex, PublicationFailureRemovesVirtualLocatorAndFailsOpen)
 {
   Sample sample;
@@ -442,7 +510,11 @@ TEST(VfsIndex, PublicationFailureRemovesVirtualLocatorAndFailsOpen)
       context);
   EXPECT_FALSE(result.success);
   EXPECT_EQ(sample.tree.root.resolve(
-                {"SKSE", "Plugins", "Fluorine", kVfsIndexLocatorName}),
+                {"SKSE", "Plugins", "VFSIndexer", kVfsIndexLocatorName}),
+            nullptr);
+  EXPECT_EQ(sample.tree.root.resolve(
+                {"SKSE", "Plugins", "Fluorine",
+                 kLegacyVfsIndexLocatorName}),
             nullptr);
   // Ordinary resolved files remain available to the normal VFS.
   EXPECT_NE(sample.tree.root.resolve({"Root.esm"}), nullptr);
@@ -458,7 +530,7 @@ TEST(VfsIndex, RetainsOnlyCurrentAndPreviousCompleteGenerations)
     previous = publication.generation;
   }
 
-  const fs::path directory = sample.base / ".fluorine" / "index";
+  const fs::path directory = sample.base / ".vfs-indexer" / "index";
   std::size_t databases = 0;
   for (const auto& entry : fs::directory_iterator(directory)) {
     if (entry.path().filename().string().starts_with("vfs-index-") &&

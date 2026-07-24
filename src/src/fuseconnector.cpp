@@ -13,6 +13,7 @@
 #include <QFileInfo>
 #include <QProcess>
 #include <QProgressDialog>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -822,6 +823,7 @@ bool FuseConnector::mount(
 void FuseConnector::unmount()
 {
   if (!m_mounted) {
+    clearIndexRootLocator();
     return;
   }
 
@@ -979,6 +981,10 @@ void FuseConnector::unmount()
   // Clean up symlinks created for non-data-dir mappings.
   cleanupExternalMappings();
 
+  // The game-root index locator is session-scoped. The immutable database and
+  // instance locator remain available for the next publication.
+  clearIndexRootLocator();
+
   // VFS Root Builder: remove deployed root files and restore backups.
   if (m_rootBuilderEnabled) {
     clearRootFiles();
@@ -1027,6 +1033,10 @@ std::shared_ptr<TrackedWrites> FuseConnector::trackedWrites() const
 VfsIndexPublicationResult FuseConnector::publishIndex(
     VfsTree& tree, const VfsCatalogResult& catalogResult)
 {
+  // Remove a previous session's root locator before producing a replacement.
+  // The mapped Data locator is injected into the new tree only on success.
+  clearIndexRootLocator();
+
   VfsIndexPublisher publisher;
   if (m_indexPublicationContext.output_base.empty()) {
     VfsIndexPublisher::removePublicationArtifacts(tree);
@@ -1036,19 +1046,211 @@ VfsIndexPublicationResult FuseConnector::publishIndex(
 
   VfsIndexPublicationResult publication = publisher.publish(
       tree, catalogResult.provider_roots, catalogResult.profile_root,
-      fs::path(m_dataDirPath), m_indexPublicationContext);
+      fs::path(m_dataDirPath), m_indexPublicationContext,
+      catalogResult.archive_member_index);
   if (!publication.success) {
     log::warn("VFS index publication failed; continuing without an index "
               "locator: {}",
               publication.error);
     return publication;
   }
+  if (catalogResult.archive_member_index &&
+      !catalogResult.archive_member_index->complete()) {
+    log::warn("VFS index archive proof omitted because one or more visible "
+              "archives could not be cataloged; guarded consumer "
+              "canonicalization will remain disabled");
+  }
 
   injectExtraFiles(
       tree, {{kVfsIndexVirtualLocator, publication.locator_path.string()}});
+  if (!deployIndexRootLocator(publication)) {
+    log::warn("VFS index generation {} is available through Data, but the "
+              "temporary game-root locator could not be deployed",
+              publication.generation);
+  }
   log::info("Published VFS index generation {} with {} resolved files",
             publication.generation, publication.file_count);
   return publication;
+}
+
+bool FuseConnector::deployIndexRootLocator(
+    VfsIndexPublicationResult& publication)
+{
+  if (m_gameDir.empty() || m_indexPublicationContext.output_base.empty() ||
+      publication.locator_path.empty()) {
+    return false;
+  }
+
+  namespace fs = std::filesystem;
+  const fs::path storage =
+      m_indexPublicationContext.output_base / ".vfs-indexer";
+  const fs::path manifest = storage / "root-deployment.json";
+  const fs::path target = fs::path(m_gameDir) / kVfsIndexLocatorName;
+  if (target.lexically_normal() ==
+      publication.locator_path.lexically_normal()) {
+    // A portable instance may already publish directly into the game root.
+    // That persistent instance locator must not be treated as a temporary
+    // deployment and removed on unmount.
+    publication.root_locator_path = target;
+    publication.root_locator_deployed = true;
+    return true;
+  }
+  const fs::path backup =
+      storage / ("root-locator-backup-" + publication.generation);
+  const fs::path temporary =
+      target.parent_path() /
+      (std::string(".vfs-index-") + publication.generation + ".tmp");
+  std::error_code error;
+
+  try {
+    fs::create_directories(storage, error);
+    if (error) throw std::runtime_error(error.message());
+
+    bool hadBackup = false;
+    if (fs::is_regular_file(target, error)) {
+      error.clear();
+      fs::copy_file(target, backup, fs::copy_options::overwrite_existing,
+                    error);
+      if (error) throw std::runtime_error(error.message());
+      hadBackup = true;
+    }
+
+    const auto saveManifest = [&](const QString& state) {
+      QJsonObject json;
+      json.insert(QStringLiteral("state"), state);
+      json.insert(QStringLiteral("generation"),
+                  QString::fromStdString(publication.generation));
+      json.insert(QStringLiteral("target"),
+                  QString::fromStdString(target.string()));
+      json.insert(QStringLiteral("source"),
+                  QString::fromStdString(publication.locator_path.string()));
+      json.insert(QStringLiteral("temporary"),
+                  QString::fromStdString(temporary.string()));
+      json.insert(QStringLiteral("backup"),
+                  QString::fromStdString(backup.string()));
+      json.insert(QStringLiteral("had_backup"), hadBackup);
+      QSaveFile output(QString::fromStdString(manifest.string()));
+      if (!output.open(QIODevice::WriteOnly) ||
+          output.write(QJsonDocument(json).toJson(QJsonDocument::Compact)) < 0 ||
+          !output.commit()) {
+        throw std::runtime_error("unable to save root locator manifest");
+      }
+    };
+
+    saveManifest(QStringLiteral("deploying"));
+    fs::copy_file(publication.locator_path, temporary,
+                  fs::copy_options::overwrite_existing, error);
+    if (error) throw std::runtime_error(error.message());
+    if (fs::exists(target, error) || fs::is_symlink(target, error)) {
+      error.clear();
+      fs::remove(target, error);
+      if (error) throw std::runtime_error(error.message());
+    }
+    fs::rename(temporary, target, error);
+    if (error) throw std::runtime_error(error.message());
+    saveManifest(QStringLiteral("complete"));
+
+    publication.root_locator_path = target;
+    publication.root_locator_deployed = true;
+    return true;
+  } catch (const std::exception& exception) {
+    log::warn("Unable to deploy VFS index root locator '{}': {}",
+              QString::fromStdString(target.string()), exception.what());
+    clearIndexRootLocator();
+    return false;
+  }
+}
+
+void FuseConnector::clearIndexRootLocator()
+{
+  if (m_indexPublicationContext.output_base.empty()) return;
+
+  namespace fs = std::filesystem;
+  const fs::path storage =
+      m_indexPublicationContext.output_base / ".vfs-indexer";
+  const fs::path manifest = storage / "root-deployment.json";
+  QFile input(QString::fromStdString(manifest.string()));
+  if (!input.open(QIODevice::ReadOnly)) return;
+  const QJsonDocument document = QJsonDocument::fromJson(input.readAll());
+  input.close();
+  if (!document.isObject()) {
+    log::warn("Leaving malformed VFS index root deployment manifest at '{}'",
+              QString::fromStdString(manifest.string()));
+    return;
+  }
+
+  const QJsonObject json = document.object();
+  const QString state = json.value(QStringLiteral("state")).toString();
+  const fs::path target =
+      json.value(QStringLiteral("target")).toString().toStdString();
+  const fs::path source =
+      json.value(QStringLiteral("source")).toString().toStdString();
+  const fs::path temporary =
+      json.value(QStringLiteral("temporary")).toString().toStdString();
+  const fs::path backup =
+      json.value(QStringLiteral("backup")).toString().toStdString();
+  const bool hadBackup =
+      json.value(QStringLiteral("had_backup")).toBool(false);
+
+  std::error_code error;
+  fs::remove(temporary, error);
+  error.clear();
+
+  const auto filesEqual = [](const fs::path& leftPath,
+                             const fs::path& rightPath) {
+    std::error_code compareError;
+    if (!fs::is_regular_file(leftPath, compareError) ||
+        !fs::is_regular_file(rightPath, compareError) ||
+        fs::file_size(leftPath, compareError) !=
+            fs::file_size(rightPath, compareError) ||
+        compareError) {
+      return false;
+    }
+    std::ifstream left(leftPath, std::ios::binary);
+    std::ifstream right(rightPath, std::ios::binary);
+    return std::equal(std::istreambuf_iterator<char>(left),
+                      std::istreambuf_iterator<char>(),
+                      std::istreambuf_iterator<char>(right));
+  };
+
+  // A failure before replacement leaves the original target and its byte-for-
+  // byte backup in place. This is safe to collapse without mistaking the
+  // original file for a user modification made during a completed session.
+  if (state == QStringLiteral("deploying") && hadBackup &&
+      filesEqual(target, backup)) {
+    fs::remove(backup, error);
+    fs::remove(manifest, error);
+    return;
+  }
+
+  bool generatedUnchanged = !fs::exists(target, error);
+  if (!generatedUnchanged && fs::is_regular_file(target, error) &&
+      fs::is_regular_file(source, error)) {
+    generatedUnchanged = filesEqual(target, source);
+  }
+
+  if (!generatedUnchanged) {
+    log::warn("VFS index root locator '{}' changed during the session; "
+              "leaving it and its recoverable backup untouched",
+              QString::fromStdString(target.string()));
+    return;
+  }
+
+  fs::remove(target, error);
+  error.clear();
+  if (hadBackup && fs::exists(backup, error)) {
+    error.clear();
+    fs::rename(backup, target, error);
+    if (error) {
+      log::warn("Unable to restore root locator backup '{}' to '{}': {}",
+                QString::fromStdString(backup.string()),
+                QString::fromStdString(target.string()), error.message());
+      return;
+    }
+  } else {
+    fs::remove(backup, error);
+  }
+  fs::remove(manifest, error);
 }
 
 void FuseConnector::rebuild(

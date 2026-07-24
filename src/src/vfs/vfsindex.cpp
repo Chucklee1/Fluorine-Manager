@@ -8,12 +8,14 @@
 
 #include <blake3.h>
 #include <sqlite3.h>
+#include <utf8proc.h>
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
@@ -34,6 +36,10 @@
 namespace
 {
 namespace fs = std::filesystem;
+
+constexpr std::string_view kArchiveMembershipAlgorithm =
+    "fnv1a64-double-bloom-v1";
+constexpr std::size_t kMaximumArchiveProofBytes = 256 * 1024 * 1024;
 
 struct DbCloser
 {
@@ -179,16 +185,40 @@ bool validGeneration(const std::string& generation)
 
 std::string normalizeIndexPath(const std::string& path)
 {
-  QString value = QString::fromUtf8(path);
-  value.replace('\\', '/');
-  while (value.startsWith('/')) value.remove(0, 1);
-  while (value.contains(QStringLiteral("//"))) {
-    value.replace(QStringLiteral("//"), QStringLiteral("/"));
+  std::string separators = path;
+  std::replace(separators.begin(), separators.end(), '\\', '/');
+  while (!separators.empty() && separators.front() == '/') {
+    separators.erase(separators.begin());
   }
-  return value.normalized(QString::NormalizationForm_C)
-      .toCaseFolded()
-      .toUtf8()
-      .toStdString();
+  std::string collapsed;
+  collapsed.reserve(separators.size());
+  bool previousSlash = false;
+  for (char value : separators) {
+    if (value == '/') {
+      if (previousSlash) continue;
+      previousSlash = true;
+    } else {
+      previousSlash = false;
+    }
+    collapsed.push_back(value);
+  }
+
+  utf8proc_uint8_t* mapped = nullptr;
+  const auto size = utf8proc_map(
+      reinterpret_cast<const utf8proc_uint8_t*>(collapsed.data()),
+      static_cast<utf8proc_ssize_t>(collapsed.size()), &mapped,
+      static_cast<utf8proc_option_t>(
+          UTF8PROC_STABLE | UTF8PROC_COMPOSE | UTF8PROC_CASEFOLD));
+  if (size < 0 || mapped == nullptr) {
+    std::free(mapped);
+    throw std::runtime_error(
+        std::string("Invalid UTF-8 virtual path: ") +
+        utf8proc_errmsg(size));
+  }
+  std::string normalized(reinterpret_cast<char*>(mapped),
+                         static_cast<std::size_t>(size));
+  std::free(mapped);
+  return normalized;
 }
 
 std::string joinVirtual(const std::string& base, const std::string& name)
@@ -212,8 +242,13 @@ struct ExportedFile
 bool isReservedVirtualPath(const std::string& normalized)
 {
   const std::string locator = normalizeIndexPath(kVfsIndexVirtualLocator);
-  return normalized == locator ||
-         normalized == "fluorine-vfs-index.json" ||
+  const std::string legacy =
+      normalizeIndexPath(kLegacyVfsIndexVirtualLocator);
+  return normalized == locator || normalized == legacy ||
+         normalized == kVfsIndexLocatorName ||
+         normalized == kLegacyVfsIndexLocatorName ||
+         normalized == ".vfs-indexer/index" ||
+         normalized.starts_with(".vfs-indexer/index/") ||
          normalized == ".fluorine/index" ||
          normalized.starts_with(".fluorine/index/");
 }
@@ -255,7 +290,8 @@ std::vector<ExportedFile> flattenTree(
       exported.host_path = hostPath;
       exported.file.normalized_path = normalized;
       exported.file.display_path = virtualPath;
-      exported.file.real_path =
+      exported.file.host_path = hostPath.string();
+      exported.file.consumer_path =
           VfsIndexPublisher::toConsumerPath(hostPath, pathStyle);
       exported.file.origin = childPointer->file_info.origin;
       exported.file.size = childPointer->file_info.size;
@@ -308,13 +344,14 @@ VfsDigest resolvedDigest(const std::vector<ExportedFile>& files)
 {
   blake3_hasher hasher;
   blake3_hasher_init(&hasher);
-  constexpr char kDomain[] = "fluorine.vfs.resolved-snapshot.v1";
+  constexpr char kDomain[] = "vfs-index.resolved-snapshot.v1";
   hashBytes(hasher, kDomain, sizeof(kDomain) - 1);
   for (const auto& exported : files) {
     const auto& file = exported.file;
     hashString(hasher, file.normalized_path);
     hashString(hasher, file.display_path);
-    hashString(hasher, file.real_path);
+    hashString(hasher, file.host_path);
+    hashString(hasher, file.consumer_path);
     hashString(hasher, file.origin);
     hashUint64(hasher, file.size);
     hashUint64(hasher, file.mode);
@@ -332,10 +369,40 @@ VfsDigest resolvedDigest(const std::vector<ExportedFile>& files)
   return digest;
 }
 
+VfsDigest archiveMembershipDigest(
+    uint64_t probeCount, uint64_t bitCount, uint64_t archiveCount,
+    uint64_t memberCount, const std::vector<unsigned char>& bits)
+{
+  blake3_hasher hasher;
+  blake3_hasher_init(&hasher);
+  constexpr char kDomain[] = "vfs-index.archive-membership.v1";
+  hashBytes(hasher, kDomain, sizeof(kDomain) - 1);
+  hashString(hasher, std::string(kArchiveMembershipAlgorithm));
+  hashUint64(hasher, probeCount);
+  hashUint64(hasher, bitCount);
+  hashUint64(hasher, archiveCount);
+  hashUint64(hasher, memberCount);
+  hashUint64(hasher, bits.size());
+  hashBytes(hasher, bits.data(), bits.size());
+  VfsDigest digest{};
+  blake3_hasher_finalize(&hasher, digest.data(), digest.size());
+  return digest;
+}
+
+bool tableExists(sqlite3* database, const char* name)
+{
+  auto query = prepare(
+      database,
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1;");
+  bindText(database, query.get(), 1, name);
+  return sqlite3_step(query.get()) == SQLITE_ROW;
+}
+
 QJsonObject locatorJson(const VfsIndexLocator& locator)
 {
   QJsonObject json;
-  json.insert(QStringLiteral("format"), QStringLiteral("fluorine-vfs-index"));
+  json.insert(QStringLiteral("format"),
+              QString::fromStdString(locator.format));
   json.insert(QStringLiteral("format_version"), locator.format_version);
   json.insert(QStringLiteral("schema_version"), locator.schema_version);
   json.insert(QStringLiteral("state"), QString::fromStdString(locator.state));
@@ -347,13 +414,25 @@ QJsonObject locatorJson(const VfsIndexLocator& locator)
               QString::fromStdString(locator.instance_name));
   json.insert(QStringLiteral("profile"),
               QString::fromStdString(locator.profile_name));
-  json.insert(QStringLiteral("profile_digest"),
-              QString::fromStdString(digestHex(locator.profile_digest)));
+  if (locator.profile_digest) {
+    json.insert(QStringLiteral("profile_digest"),
+                QString::fromStdString(digestHex(*locator.profile_digest)));
+  } else {
+    json.insert(QStringLiteral("profile_digest"), QJsonValue::Null);
+  }
   json.insert(QStringLiteral("resolved_snapshot_digest"),
               QString::fromStdString(
                   digestHex(locator.resolved_snapshot_digest)));
-  json.insert(QStringLiteral("database_path"),
-              QString::fromStdString(locator.database_path));
+  json.insert(QStringLiteral("path_normalization"),
+              QString::fromStdString(locator.path_normalization));
+  json.insert(QStringLiteral("host_path_style"),
+              QString::fromStdString(locator.host_path_style));
+  json.insert(QStringLiteral("host_database_path"),
+              QString::fromStdString(locator.host_database_path));
+  json.insert(QStringLiteral("consumer_database_path"),
+              QString::fromStdString(locator.consumer_database_path));
+  json.insert(QStringLiteral("published_utc_ms"),
+              static_cast<qint64>(locator.published_utc_ms));
   return json;
 }
 
@@ -547,7 +626,11 @@ bool exactJsonKeys(const QJsonObject& json)
       QStringLiteral("profile"),
       QStringLiteral("profile_digest"),
       QStringLiteral("resolved_snapshot_digest"),
-      QStringLiteral("database_path")};
+      QStringLiteral("path_normalization"),
+      QStringLiteral("host_path_style"),
+      QStringLiteral("host_database_path"),
+      QStringLiteral("consumer_database_path"),
+      QStringLiteral("published_utc_ms")};
   for (const QString& key : required) {
     if (!json.contains(key)) return false;
   }
@@ -574,21 +657,28 @@ std::optional<VfsIndexLocator> VfsIndexValidator::parseLocator(
   const QJsonObject json = document.object();
   if (!exactJsonKeys(json) ||
       json.value(QStringLiteral("format")).toString() !=
-          QStringLiteral("fluorine-vfs-index")) {
+          QString::fromLatin1(kVfsIndexFormatName)) {
     error = "locator format identifier or fields are invalid";
     return std::nullopt;
   }
 
+  const bool profileIsNull =
+      json.value(QStringLiteral("profile_digest")).isNull();
   const auto profile =
-      parseDigest(json.value(QStringLiteral("profile_digest")).toString());
+      profileIsNull
+          ? std::optional<VfsDigest>{}
+          : parseDigest(
+                json.value(QStringLiteral("profile_digest")).toString());
   const auto resolved = parseDigest(
       json.value(QStringLiteral("resolved_snapshot_digest")).toString());
-  if (!profile || !resolved) {
+  if ((!profileIsNull && !profile) || !resolved) {
     error = "locator contains an invalid digest";
     return std::nullopt;
   }
 
   VfsIndexLocator locator;
+  locator.format =
+      json.value(QStringLiteral("format")).toString().toStdString();
   locator.format_version =
       json.value(QStringLiteral("format_version")).toInt(-1);
   locator.schema_version =
@@ -603,10 +693,20 @@ std::optional<VfsIndexLocator> VfsIndexValidator::parseLocator(
       json.value(QStringLiteral("instance")).toString().toStdString();
   locator.profile_name =
       json.value(QStringLiteral("profile")).toString().toStdString();
-  locator.profile_digest = *profile;
+  locator.profile_digest = profile;
   locator.resolved_snapshot_digest = *resolved;
-  locator.database_path =
-      json.value(QStringLiteral("database_path")).toString().toStdString();
+  locator.path_normalization =
+      json.value(QStringLiteral("path_normalization")).toString().toStdString();
+  locator.host_path_style =
+      json.value(QStringLiteral("host_path_style")).toString().toStdString();
+  locator.host_database_path =
+      json.value(QStringLiteral("host_database_path")).toString().toStdString();
+  locator.consumer_database_path =
+      json.value(QStringLiteral("consumer_database_path"))
+          .toString()
+          .toStdString();
+  locator.published_utc_ms =
+      json.value(QStringLiteral("published_utc_ms")).toInteger(-1);
 
   if (locator.format_version != kVfsIndexFormatVersion) {
     error = "unsupported locator format version";
@@ -624,8 +724,26 @@ std::optional<VfsIndexLocator> VfsIndexValidator::parseLocator(
     error = "locator generation UUID is invalid";
     return std::nullopt;
   }
-  if (!isAbsoluteConsumerPath(locator.database_path)) {
+  if (locator.path_normalization != kVfsIndexNormalization) {
+    error = "unsupported locator path normalization";
+    return std::nullopt;
+  }
+  if (locator.host_path_style != "posix" &&
+      locator.host_path_style != "windows") {
+    error = "unsupported locator host path style";
+    return std::nullopt;
+  }
+  if (!isAbsoluteHostPath(locator.host_database_path,
+                          locator.host_path_style)) {
+    error = "locator database host path is not absolute";
+    return std::nullopt;
+  }
+  if (!isAbsoluteConsumerPath(locator.consumer_database_path)) {
     error = "locator database path is not an absolute Windows/Wine path";
+    return std::nullopt;
+  }
+  if (locator.published_utc_ms <= 0) {
+    error = "locator publication timestamp is invalid";
     return std::nullopt;
   }
   return locator;
@@ -645,6 +763,13 @@ bool VfsIndexValidator::isAbsoluteConsumerPath(const std::string& path)
            serverEnd + 1 < path.size();
   }
   return false;
+}
+
+bool VfsIndexValidator::isAbsoluteHostPath(const std::string& path,
+                                           const std::string& style)
+{
+  if (style == "windows") return isAbsoluteConsumerPath(path);
+  return style == "posix" && !path.empty() && path.front() == '/';
 }
 
 std::optional<fs::path> VfsIndexValidator::resolveWinePathOnHost(
@@ -672,8 +797,8 @@ VfsIndexValidationResult VfsIndexValidator::validate(
   if (!locator) return invalid(std::move(error));
 
   std::optional<fs::path> databasePath =
-      resolver ? resolver(locator->database_path)
-               : resolveWinePathOnHost(locator->database_path);
+      resolver ? resolver(locator->consumer_database_path)
+               : resolveWinePathOnHost(locator->consumer_database_path);
   if (!databasePath) {
     return invalid("consumer database path cannot be resolved on this host");
   }
@@ -699,7 +824,7 @@ VfsIndexValidationResult VfsIndexValidator::validateDatabase(
     if (sqlite3_step(applicationId.get()) != SQLITE_ROW ||
         sqlite3_column_int(applicationId.get(), 0) !=
             kVfsIndexApplicationId) {
-      return invalid("database application ID is not FLVI");
+      return invalid("database application ID is not VFSI");
     }
     auto schemaVersion = prepare(database.get(), "PRAGMA user_version;");
     if (sqlite3_step(schemaVersion.get()) != SQLITE_ROW ||
@@ -717,15 +842,22 @@ VfsIndexValidationResult VfsIndexValidator::validateDatabase(
     auto snapshot = prepare(
         database.get(),
         "SELECT state,generation,producer,instance_name,profile_name,"
-        "profile_digest,resolved_snapshot_digest,expected_file_count"
+        "profile_digest,resolved_snapshot_digest,path_normalization,"
+        "host_path_style,published_utc_ms,expected_file_count"
         " FROM snapshot WHERE id=1;");
     if (sqlite3_step(snapshot.get()) != SQLITE_ROW) {
       return invalid("database snapshot row is missing");
     }
-    VfsDigest profileDigest{};
+    std::optional<VfsDigest> profileDigest;
     VfsDigest resolvedSnapshotDigest{};
-    if (!sqliteDigest(snapshot.get(), 5, profileDigest) ||
-        !sqliteDigest(snapshot.get(), 6, resolvedSnapshotDigest)) {
+    if (sqlite3_column_type(snapshot.get(), 5) != SQLITE_NULL) {
+      VfsDigest digest{};
+      if (!sqliteDigest(snapshot.get(), 5, digest)) {
+        return invalid("database snapshot digest has the wrong size");
+      }
+      profileDigest = digest;
+    }
+    if (!sqliteDigest(snapshot.get(), 6, resolvedSnapshotDigest)) {
       return invalid("database snapshot digest has the wrong size");
     }
     if (sqliteText(snapshot.get(), 0) != "complete") {
@@ -747,7 +879,14 @@ VfsIndexValidationResult VfsIndexValidator::validateDatabase(
       return invalid(
           "database resolved snapshot digest does not match locator");
     }
-    const sqlite3_int64 expectedCount = sqlite3_column_int64(snapshot.get(), 7);
+    if (sqliteText(snapshot.get(), 7) != locator.path_normalization ||
+        sqliteText(snapshot.get(), 8) != locator.host_path_style ||
+        sqlite3_column_int64(snapshot.get(), 9) != locator.published_utc_ms) {
+      return invalid(
+          "database normalization, path style, or timestamp does not match "
+          "locator");
+    }
+    const sqlite3_int64 expectedCount = sqlite3_column_int64(snapshot.get(), 10);
     if (expectedCount < 0) {
       return invalid("database expected file count is invalid");
     }
@@ -755,10 +894,36 @@ VfsIndexValidationResult VfsIndexValidator::validateDatabase(
       return invalid("database contains multiple snapshot rows");
     }
 
+    auto providers = prepare(
+        database.get(),
+        "SELECT priority,host_root,consumer_root,merkle_digest,file_count"
+        " FROM providers ORDER BY priority;");
+    sqlite3_int64 expectedPriority = 0;
+    while (sqlite3_step(providers.get()) == SQLITE_ROW) {
+      if (sqlite3_column_int64(providers.get(), 0) != expectedPriority++) {
+        return invalid("database provider priorities are not contiguous");
+      }
+      if (!isAbsoluteHostPath(sqliteText(providers.get(), 1),
+                              locator.host_path_style) ||
+          !isAbsoluteConsumerPath(sqliteText(providers.get(), 2))) {
+        return invalid("database provider root path is not absolute");
+      }
+      if (sqlite3_column_type(providers.get(), 3) != SQLITE_NULL) {
+        VfsDigest providerDigest{};
+        if (!sqliteDigest(providers.get(), 3, providerDigest)) {
+          return invalid("database provider digest has the wrong size");
+        }
+      }
+      if (sqlite3_column_int64(providers.get(), 4) < 0) {
+        return invalid("database provider file count is invalid");
+      }
+    }
+
     auto rows = prepare(
         database.get(),
-        "SELECT normalized_path,display_path,real_path,origin,size,mode,"
-        "mtime_ns,is_backing,blake3 FROM resolved ORDER BY normalized_path;");
+        "SELECT normalized_path,display_path,host_path,consumer_path,origin,"
+        "size,mode,mtime_ns,is_backing,blake3"
+        " FROM resolved ORDER BY normalized_path;");
     std::vector<VfsIndexResolvedFile> files;
     files.reserve(static_cast<std::size_t>(expectedCount));
     std::string previous;
@@ -766,13 +931,17 @@ VfsIndexValidationResult VfsIndexValidator::validateDatabase(
       VfsIndexResolvedFile file;
       file.normalized_path = sqliteText(rows.get(), 0);
       file.display_path = sqliteText(rows.get(), 1);
-      file.real_path = sqliteText(rows.get(), 2);
-      file.origin = sqliteText(rows.get(), 3);
-      file.size = static_cast<uint64_t>(sqlite3_column_int64(rows.get(), 4));
-      file.mode = static_cast<uint32_t>(sqlite3_column_int64(rows.get(), 5));
-      file.mtime_ns = sqlite3_column_int64(rows.get(), 6);
-      file.is_backing = sqlite3_column_int(rows.get(), 7) != 0;
-      if (!isAbsoluteConsumerPath(file.real_path)) {
+      file.host_path = sqliteText(rows.get(), 2);
+      file.consumer_path = sqliteText(rows.get(), 3);
+      file.origin = sqliteText(rows.get(), 4);
+      file.size = static_cast<uint64_t>(sqlite3_column_int64(rows.get(), 5));
+      file.mode = static_cast<uint32_t>(sqlite3_column_int64(rows.get(), 6));
+      file.mtime_ns = sqlite3_column_int64(rows.get(), 7);
+      file.is_backing = sqlite3_column_int(rows.get(), 8) != 0;
+      if (!isAbsoluteHostPath(file.host_path, locator.host_path_style)) {
+        return invalid("resolved row contains a non-absolute host path");
+      }
+      if (!isAbsoluteConsumerPath(file.consumer_path)) {
         return invalid("resolved row contains a non-absolute real path");
       }
       if (file.normalized_path.empty() ||
@@ -784,9 +953,9 @@ VfsIndexValidationResult VfsIndexValidator::validateDatabase(
       }
       previous = file.normalized_path;
 
-      if (sqlite3_column_type(rows.get(), 8) != SQLITE_NULL) {
+      if (sqlite3_column_type(rows.get(), 9) != SQLITE_NULL) {
         VfsDigest digest{};
-        if (!sqliteDigest(rows.get(), 8, digest)) {
+        if (!sqliteDigest(rows.get(), 9, digest)) {
           return invalid("resolved row BLAKE3 has the wrong size");
         }
         file.blake3 = digest;
@@ -805,7 +974,92 @@ VfsIndexValidationResult VfsIndexValidator::validateDatabase(
       return invalid("loaded resolved rows do not match snapshot digest");
     }
 
-    return {.index=VfsIndexValidated{locator, std::move(files)}, .error={}};
+    std::shared_ptr<const VfsArchiveMemberIndex> archiveMembers;
+    if (tableExists(database.get(), "archive_membership")) {
+      auto proof = prepare(
+          database.get(),
+          "SELECT algorithm,probe_count,bit_count,archive_count,"
+          "member_count,bits,bits_digest"
+          " FROM archive_membership WHERE id=1;");
+      const int proofResult = sqlite3_step(proof.get());
+      if (proofResult == SQLITE_ROW) {
+        const std::string algorithm = sqliteText(proof.get(), 0);
+        const sqlite3_int64 probeCount = sqlite3_column_int64(proof.get(), 1);
+        const sqlite3_int64 bitCount = sqlite3_column_int64(proof.get(), 2);
+        const sqlite3_int64 archiveCount =
+            sqlite3_column_int64(proof.get(), 3);
+        const sqlite3_int64 memberCount =
+            sqlite3_column_int64(proof.get(), 4);
+        const int byteCount = sqlite3_column_bytes(proof.get(), 5);
+        VfsDigest storedDigest{};
+        if (algorithm != kArchiveMembershipAlgorithm ||
+            probeCount != static_cast<sqlite3_int64>(
+                              VfsArchiveMemberIndex::probeCount()) ||
+            bitCount < 64 || archiveCount < 0 || memberCount < 0 ||
+            bitCount > static_cast<sqlite3_int64>(
+                           kMaximumArchiveProofBytes * 8) ||
+            byteCount <= 0 ||
+            static_cast<std::size_t>(byteCount) >
+                kMaximumArchiveProofBytes ||
+            static_cast<uint64_t>(byteCount) !=
+                ((static_cast<uint64_t>(bitCount) + 63) / 64) *
+                    sizeof(uint64_t) ||
+            !sqliteDigest(proof.get(), 6, storedDigest)) {
+          return invalid("database archive membership proof is invalid");
+        }
+        const auto* rawBits = static_cast<const unsigned char*>(
+            sqlite3_column_blob(proof.get(), 5));
+        if (rawBits == nullptr) {
+          return invalid("database archive membership bits are missing");
+        }
+        std::vector<unsigned char> bits(
+            rawBits, rawBits + static_cast<std::size_t>(byteCount));
+        const VfsDigest computedDigest = archiveMembershipDigest(
+            static_cast<uint64_t>(probeCount),
+            static_cast<uint64_t>(bitCount),
+            static_cast<uint64_t>(archiveCount),
+            static_cast<uint64_t>(memberCount), bits);
+        if (computedDigest != storedDigest) {
+          return invalid(
+              "database archive membership proof digest does not match");
+        }
+        archiveMembers = VfsArchiveMemberIndex::fromSerialized(
+            static_cast<std::size_t>(bitCount),
+            static_cast<std::size_t>(archiveCount),
+            static_cast<std::size_t>(memberCount), bits);
+        if (!archiveMembers) {
+          return invalid(
+              "database archive membership bitset is malformed");
+        }
+        if (sqlite3_step(proof.get()) != SQLITE_DONE) {
+          return invalid(
+              "database contains multiple archive membership proofs");
+        }
+        auto count = prepare(
+            database.get(),
+            "SELECT COUNT(*) FROM archive_membership;");
+        if (sqlite3_step(count.get()) != SQLITE_ROW ||
+            sqlite3_column_int64(count.get(), 0) != 1) {
+          return invalid(
+              "database contains unexpected archive membership rows");
+        }
+      } else if (proofResult != SQLITE_DONE) {
+        return invalid("reading database archive membership proof failed");
+      } else {
+        auto count = prepare(
+            database.get(),
+            "SELECT COUNT(*) FROM archive_membership;");
+        if (sqlite3_step(count.get()) != SQLITE_ROW ||
+            sqlite3_column_int64(count.get(), 0) != 0) {
+          return invalid(
+              "database contains an unrecognized archive membership row");
+        }
+      }
+    }
+
+    return {.index=VfsIndexValidated{
+                locator, std::move(files), std::move(archiveMembers)},
+            .error={}};
   } catch (const std::exception& exception) {
     return invalid(std::string("database validation failed: ") +
                    exception.what());
@@ -839,15 +1093,20 @@ std::string VfsIndexPublisher::toConsumerPath(
 void VfsIndexPublisher::removePublicationArtifacts(VfsTree& tree)
 {
   tree.root.removeFromTree(
-      {"SKSE", "Plugins", "Fluorine", kVfsIndexLocatorName});
-  tree.root.removeFromTree({"fluorine-vfs-index.json"});
+      {"SKSE", "Plugins", "VFSIndexer", kVfsIndexLocatorName});
+  tree.root.removeFromTree(
+      {"SKSE", "Plugins", "Fluorine", kLegacyVfsIndexLocatorName});
+  tree.root.removeFromTree({kVfsIndexLocatorName});
+  tree.root.removeFromTree({kLegacyVfsIndexLocatorName});
+  tree.root.removeFromTree({".vfs-indexer", "index"});
   tree.root.removeFromTree({".fluorine", "index"});
 }
 
 VfsIndexPublicationResult VfsIndexPublisher::publish(
     VfsTree& tree, const std::vector<VfsProviderRoot>& providerRoots,
     const VfsDigest& profileDigest, const fs::path& dataDirectory,
-    const VfsIndexPublicationContext& context) noexcept
+    const VfsIndexPublicationContext& context,
+    std::shared_ptr<const VfsArchiveMemberIndex> archiveMembers) noexcept
 {
   VfsIndexPublicationResult result;
   fs::path temporaryDatabase;
@@ -863,7 +1122,7 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
 
     const std::string generation = newGeneration();
     const fs::path indexDirectory =
-        context.output_base / ".fluorine" / "index";
+        context.output_base / ".vfs-indexer" / "index";
     const fs::path locatorPath =
         context.output_base / kVfsIndexLocatorName;
     const fs::path databasePath =
@@ -898,7 +1157,7 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
     execSql(database.get(), "PRAGMA synchronous=FULL;");
     execSql(database.get(), "PRAGMA foreign_keys=ON;");
     execSql(database.get(), "PRAGMA locking_mode=EXCLUSIVE;");
-    execSql(database.get(), "PRAGMA application_id=1179407945;");
+    execSql(database.get(), "PRAGMA application_id=1447449417;");
     execSql(database.get(), "PRAGMA user_version=1;");
     execSql(database.get(),
             "CREATE TABLE snapshot("
@@ -906,43 +1165,66 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
             " state TEXT NOT NULL CHECK(state IN('building','complete')),"
             " generation TEXT NOT NULL,producer TEXT NOT NULL,"
             " instance_name TEXT NOT NULL,profile_name TEXT NOT NULL,"
-            " profile_digest BLOB NOT NULL CHECK(length(profile_digest)=32),"
+            " profile_digest BLOB NULL"
+            " CHECK(profile_digest IS NULL OR length(profile_digest)=32),"
             " resolved_snapshot_digest BLOB NOT NULL"
             " CHECK(length(resolved_snapshot_digest)=32),"
-            " created_utc_ms INTEGER NOT NULL,"
+            " path_normalization TEXT NOT NULL,"
+            " host_path_style TEXT NOT NULL,"
+            " published_utc_ms INTEGER NOT NULL,"
             " expected_file_count INTEGER NOT NULL CHECK(expected_file_count>=0));"
             "CREATE TABLE providers("
             " priority INTEGER PRIMARY KEY,root_key TEXT NOT NULL,"
             " origin TEXT NOT NULL,role TEXT NOT NULL,"
-            " consumer_root TEXT NOT NULL,merkle_digest BLOB NOT NULL"
-            " CHECK(length(merkle_digest)=32),"
+            " host_root TEXT NOT NULL,consumer_root TEXT NOT NULL,"
+            " merkle_digest BLOB NULL"
+            " CHECK(merkle_digest IS NULL OR length(merkle_digest)=32),"
             " file_count INTEGER NOT NULL CHECK(file_count>=0));"
             "CREATE TABLE resolved("
             " normalized_path TEXT PRIMARY KEY,display_path TEXT NOT NULL,"
-            " real_path TEXT NOT NULL,origin TEXT NOT NULL,"
+            " host_path TEXT NOT NULL,consumer_path TEXT NOT NULL,"
+            " origin TEXT NOT NULL,"
             " size INTEGER NOT NULL CHECK(size>=0),mode INTEGER NOT NULL,"
             " mtime_ns INTEGER NOT NULL,is_backing INTEGER NOT NULL"
             " CHECK(is_backing IN(0,1)),"
             " blake3 BLOB NULL CHECK(blake3 IS NULL OR length(blake3)=32))"
-            " WITHOUT ROWID;");
+            " WITHOUT ROWID;"
+            "CREATE TABLE archive_membership("
+            " id INTEGER PRIMARY KEY CHECK(id=1),"
+            " algorithm TEXT NOT NULL,"
+            " probe_count INTEGER NOT NULL CHECK(probe_count>0),"
+            " bit_count INTEGER NOT NULL CHECK(bit_count>=64),"
+            " archive_count INTEGER NOT NULL CHECK(archive_count>=0),"
+            " member_count INTEGER NOT NULL CHECK(member_count>=0),"
+            " bits BLOB NOT NULL,"
+            " bits_digest BLOB NOT NULL CHECK(length(bits_digest)=32));");
     execSql(database.get(), "BEGIN IMMEDIATE;");
 
     auto snapshot = prepare(
         database.get(),
         "INSERT INTO snapshot(id,state,generation,producer,instance_name,"
-        "profile_name,profile_digest,resolved_snapshot_digest,created_utc_ms,"
-        "expected_file_count) VALUES(1,'building',?1,?2,?3,?4,?5,?6,?7,?8);");
+        "profile_name,profile_digest,resolved_snapshot_digest,"
+        "path_normalization,host_path_style,published_utc_ms,"
+        "expected_file_count)"
+        " VALUES(1,'building',?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
     bindText(database.get(), snapshot.get(), 1, generation);
     bindText(database.get(), snapshot.get(), 2, context.producer);
     bindText(database.get(), snapshot.get(), 3, context.instance_name);
     bindText(database.get(), snapshot.get(), 4, context.profile_name);
     bindDigest(database.get(), snapshot.get(), 5, profileDigest);
     bindDigest(database.get(), snapshot.get(), 6, snapshotDigest);
+#ifdef _WIN32
+    const std::string hostPathStyle = "windows";
+#else
+    const std::string hostPathStyle = "posix";
+#endif
+    bindText(database.get(), snapshot.get(), 7, kVfsIndexNormalization);
+    bindText(database.get(), snapshot.get(), 8, hostPathStyle);
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
-    sqlite3_bind_int64(snapshot.get(), 7, now);
-    sqlite3_bind_int64(snapshot.get(), 8,
+    sqlite3_bind_int64(snapshot.get(), 9, now);
+    sqlite3_bind_int64(snapshot.get(), 10,
                        static_cast<sqlite3_int64>(files.size()));
     if (sqlite3_step(snapshot.get()) != SQLITE_DONE) {
       throwDb(database.get(), "Writing VFS index snapshot");
@@ -950,8 +1232,9 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
 
     auto provider = prepare(
         database.get(),
-        "INSERT INTO providers(priority,root_key,origin,role,consumer_root,"
-        "merkle_digest,file_count) VALUES(?1,?2,?3,?4,?5,?6,?7);");
+        "INSERT INTO providers(priority,root_key,origin,role,host_root,"
+        "consumer_root,merkle_digest,file_count)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8);");
     for (std::size_t priority = 0; priority < providerRoots.size();
          ++priority) {
       const auto& root = providerRoots[priority];
@@ -967,10 +1250,12 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
               : (root.origin == "Overwrite" ? "overwrite" : "mod");
       bindText(database.get(), provider.get(), 4, role);
       bindText(database.get(), provider.get(), 5,
+               fs::path(root.root_key).lexically_normal().string());
+      bindText(database.get(), provider.get(), 6,
                toConsumerPath(fs::path(root.root_key),
                               context.consumer_path_style));
-      bindDigest(database.get(), provider.get(), 6, root.digest);
-      sqlite3_bind_int64(provider.get(), 7,
+      bindDigest(database.get(), provider.get(), 7, root.digest);
+      sqlite3_bind_int64(provider.get(), 8,
                          static_cast<sqlite3_int64>(root.file_count));
       if (sqlite3_step(provider.get()) != SQLITE_DONE) {
         throwDb(database.get(), "Writing VFS index provider");
@@ -979,29 +1264,68 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
 
     auto resolved = prepare(
         database.get(),
-        "INSERT INTO resolved(normalized_path,display_path,real_path,origin,"
-        "size,mode,mtime_ns,is_backing,blake3)"
-        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9);");
+        "INSERT INTO resolved(normalized_path,display_path,host_path,"
+        "consumer_path,origin,size,mode,mtime_ns,is_backing,blake3)"
+        " VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10);");
     for (const auto& exported : files) {
       const auto& file = exported.file;
       sqlite3_reset(resolved.get());
       sqlite3_clear_bindings(resolved.get());
       bindText(database.get(), resolved.get(), 1, file.normalized_path);
       bindText(database.get(), resolved.get(), 2, file.display_path);
-      bindText(database.get(), resolved.get(), 3, file.real_path);
-      bindText(database.get(), resolved.get(), 4, file.origin);
-      sqlite3_bind_int64(resolved.get(), 5,
+      bindText(database.get(), resolved.get(), 3, file.host_path);
+      bindText(database.get(), resolved.get(), 4, file.consumer_path);
+      bindText(database.get(), resolved.get(), 5, file.origin);
+      sqlite3_bind_int64(resolved.get(), 6,
                          static_cast<sqlite3_int64>(file.size));
-      sqlite3_bind_int64(resolved.get(), 6, file.mode);
-      sqlite3_bind_int64(resolved.get(), 7, file.mtime_ns);
-      sqlite3_bind_int(resolved.get(), 8, file.is_backing ? 1 : 0);
+      sqlite3_bind_int64(resolved.get(), 7, file.mode);
+      sqlite3_bind_int64(resolved.get(), 8, file.mtime_ns);
+      sqlite3_bind_int(resolved.get(), 9, file.is_backing ? 1 : 0);
       if (file.blake3) {
-        bindDigest(database.get(), resolved.get(), 9, *file.blake3);
+        bindDigest(database.get(), resolved.get(), 10, *file.blake3);
       } else {
-        sqlite3_bind_null(resolved.get(), 9);
+        sqlite3_bind_null(resolved.get(), 10);
       }
       if (sqlite3_step(resolved.get()) != SQLITE_DONE) {
         throwDb(database.get(), "Writing VFS index resolved row");
+      }
+    }
+
+    if (archiveMembers && archiveMembers->complete()) {
+      const std::vector<unsigned char> bits =
+          archiveMembers->serializedBits();
+      const VfsDigest proofDigest = archiveMembershipDigest(
+          VfsArchiveMemberIndex::probeCount(),
+          archiveMembers->bitCount(), archiveMembers->archiveCount(),
+          archiveMembers->memberCount(), bits);
+      auto proof = prepare(
+          database.get(),
+          "INSERT INTO archive_membership("
+          "id,algorithm,probe_count,bit_count,archive_count,member_count,"
+          "bits,bits_digest) VALUES(1,?1,?2,?3,?4,?5,?6,?7);");
+      bindText(database.get(), proof.get(), 1,
+               std::string(kArchiveMembershipAlgorithm));
+      sqlite3_bind_int64(
+          proof.get(), 2,
+          static_cast<sqlite3_int64>(
+              VfsArchiveMemberIndex::probeCount()));
+      sqlite3_bind_int64(
+          proof.get(), 3,
+          static_cast<sqlite3_int64>(archiveMembers->bitCount()));
+      sqlite3_bind_int64(
+          proof.get(), 4,
+          static_cast<sqlite3_int64>(archiveMembers->archiveCount()));
+      sqlite3_bind_int64(
+          proof.get(), 5,
+          static_cast<sqlite3_int64>(archiveMembers->memberCount()));
+      if (sqlite3_bind_blob(
+              proof.get(), 6, bits.data(),
+              static_cast<int>(bits.size()), SQLITE_TRANSIENT) != SQLITE_OK) {
+        throwDb(database.get(), "Binding archive membership bits");
+      }
+      bindDigest(database.get(), proof.get(), 7, proofDigest);
+      if (sqlite3_step(proof.get()) != SQLITE_DONE) {
+        throwDb(database.get(), "Writing archive membership proof");
       }
     }
 
@@ -1015,6 +1339,7 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
     database.reset();
 
     VfsIndexLocator locator;
+    locator.format = kVfsIndexFormatName;
     locator.format_version = kVfsIndexFormatVersion;
     locator.schema_version = kVfsIndexSchemaVersion;
     locator.state = "complete";
@@ -1024,8 +1349,12 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
     locator.profile_name = context.profile_name;
     locator.profile_digest = profileDigest;
     locator.resolved_snapshot_digest = snapshotDigest;
-    locator.database_path =
+    locator.path_normalization = kVfsIndexNormalization;
+    locator.host_path_style = hostPathStyle;
+    locator.host_database_path = databasePath.lexically_normal().string();
+    locator.consumer_database_path =
         toConsumerPath(databasePath, context.consumer_path_style);
+    locator.published_utc_ms = now;
 
     const auto validation =
         VfsIndexValidator::validateDatabase(temporaryDatabase, locator);

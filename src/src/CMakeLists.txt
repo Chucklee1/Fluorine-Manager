@@ -27,6 +27,15 @@ FetchContent_Declare(blake3_upstream
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     SOURCE_SUBDIR c)
 FetchContent_MakeAvailable(blake3_upstream)
+
+# Producer-independent Unicode normalization for the public VFS index wire
+# format. The Windows consumer pins the same upstream revision.
+FetchContent_Declare(utf8proc_upstream
+    GIT_REPOSITORY https://github.com/JuliaStrings/utf8proc.git
+    GIT_TAG a1b99daa2a3393884220264c927a48ba1251a9c6
+    GIT_SHALLOW TRUE)
+set(UTF8PROC_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(utf8proc_upstream)
 set(BUILD_TESTING ${BUILD_TESTING_SAVED} CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED} CACHE BOOL "" FORCE)
 
@@ -138,6 +147,7 @@ target_link_libraries(organizer PRIVATE
     PkgConfig::FUSE3
     SQLite::SQLite3
     BLAKE3::blake3
+    utf8proc
     # Linux system libs
     dl)
 

@@ -8,6 +8,7 @@ set -euo pipefail
 #   ./build.sh tarball      # Build portable .tar.gz only
 #   ./build.sh installer    # Build self-extracting .bin installer only
 #   ./build.sh all          # Build tarball + installer
+#   ./build.sh test         # Build and run the standalone test suite
 #   ./build.sh shell        # Drop into the build container for debugging
 #
 # Prerequisites: Docker or Podman
@@ -33,13 +34,14 @@ cd "${SCRIPT_DIR}"
 # Determine build mode from first argument
 BUILD_MODE="${1:-tarball}"
 case "${BUILD_MODE}" in
-    tarball|installer|all|shell) ;;
+    tarball|installer|all|test|shell) ;;
     *)
         echo "Usage: ./build.sh [tarball|installer|all|shell]"
         echo ""
         echo "  tarball    Build portable .tar.gz"
         echo "  installer  Build self-extracting .bin installer"
         echo "  all        Build tarball + installer"
+        echo "  test       Build and run the standalone test suite"
         echo "  shell      Drop into build container"
         exit 1
         ;;

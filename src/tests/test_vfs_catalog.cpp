@@ -290,6 +290,7 @@ TEST(VfsCatalog, CatalogsBsaAndBa2MembersAndReusesContentManifests)
   EXPECT_EQ(firstProgress.archives_reused, 0u);
   EXPECT_EQ(firstProgress.archive_errors, 0u);
   ASSERT_NE(first.archive_member_index, nullptr);
+  EXPECT_TRUE(first.archive_member_index->complete());
   EXPECT_EQ(first.archive_member_index->archiveCount(), 2u);
   EXPECT_GE(first.archive_member_index->memberCount(), 2u);
   EXPECT_TRUE(first.archive_member_index->mightContain("textures/grass/test.dds"));
@@ -305,6 +306,7 @@ TEST(VfsCatalog, CatalogsBsaAndBa2MembersAndReusesContentManifests)
   EXPECT_EQ(secondProgress.archives_reused, 2u);
   EXPECT_EQ(secondProgress.archive_errors, 0u);
   ASSERT_NE(second.archive_member_index, nullptr);
+  EXPECT_TRUE(second.archive_member_index->complete());
   EXPECT_TRUE(second.archive_member_index->mightContain("textures/grass/test.dds"));
 }
 #endif

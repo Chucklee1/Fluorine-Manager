@@ -7,6 +7,9 @@ BUILD_PY="${BUILD_PYTHON:-$(command -v python3)}"
 PYBIND11_DIR="$("${BUILD_PY}" -c 'import pybind11; print(pybind11.get_cmake_dir())' 2>/dev/null || true)"
 
 CMAKE_EXTRA_ARGS=()
+if [ "${BUILD_MODE:-tarball}" = "test" ]; then
+    CMAKE_EXTRA_ARGS+=("-DBUILD_TESTING=OFF" "-DBUILD_FLUORINE_TESTING=ON")
+fi
 
 # Enable ccache if available and not explicitly overridden.
 if [ -z "${CMAKE_C_COMPILER_LAUNCHER:-}" ] && command -v ccache >/dev/null 2>&1; then
@@ -38,6 +41,16 @@ cmake -S . -B build -G Ninja \
     -DFLUORINE_BUILD_TIMESTAMP="${FLUORINE_BUILD_TIMESTAMP}" \
     -DFLUORINE_BUILD_COMMIT="${FLUORINE_BUILD_COMMIT}" \
     "${CMAKE_EXTRA_ARGS[@]}"
+
+if [ "${BUILD_MODE:-tarball}" = "test" ]; then
+    if [ -n "${BUILD_JOBS:-}" ]; then
+        cmake --build build --target organizer fluorine-tests --parallel "${BUILD_JOBS}"
+    else
+        cmake --build build --target organizer fluorine-tests --parallel
+    fi
+    ctest --test-dir build --output-on-failure
+    exit 0
+fi
 
 if [ -n "${BUILD_JOBS:-}" ]; then
     cmake --build build --parallel "${BUILD_JOBS}"
