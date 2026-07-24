@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 from PyQt6.QtCore import QDir, QFileInfo, qInfo, qWarning
@@ -37,22 +38,18 @@ from .openmw_support.flatpak_access import (
     probe_flatpak_access,
 )
 from .openmw_support.openmw_cfg import (
-    create_selection_state,
+    VANILLA_BSAS,
     find_openmw_cfg,
-    format_name_sample,
-    filter_selected_files,
     is_openmw_player_stub,
-    normalize_plugin_loadorder,
-    order_plugins_by_loadorder,
     order_selected_files,
-    read_openmw_selection,
+    parse_openmw_selection_chain,
+    read_openmw_data_dirs,
+    read_openmw_launcher_profile,
     read_profile_selector,
     read_selection_state,
     restore_profile_config_entries,
     rollback_file_changes,
     suspend_profile_config_entries,
-    update_selection_state,
-    unranked_native_plugins,
     upgrade_selection_state,
     validate_file_roles,
     write_local_saves,
@@ -60,6 +57,8 @@ from .openmw_support.openmw_cfg import (
     write_openmw_launcher_cfg,
     write_profile_selector,
     write_selection_state,
+    TransactionCleanupError,
+    TransactionRollbackError,
 )
 from .openmw_support.game_plugins import OpenMWGamePlugins
 
@@ -78,7 +77,20 @@ def _native_cfg() -> Path:
 
 
 def _flatpak_installed() -> bool:
-    return (Path.home() / ".var" / "app" / _FLATPAK_ID).is_dir()
+    flatpak = shutil.which("flatpak")
+    if flatpak is None:
+        return False
+    try:
+        result = subprocess.run(
+            [flatpak, "info", "--show-location", _FLATPAK_ID],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _detect_openmw_cfg(prefer_flatpak: bool) -> Path | None:
@@ -136,7 +148,8 @@ class OpenMWGame(BasicGame):
     def init(self, organizer: mobase.IOrganizer) -> bool:
         super().init(organizer)
         self._register_feature(OpenMWModDataChecker())
-        self._register_feature(OpenMWGamePlugins(organizer))
+        self._openmw_game_plugins = OpenMWGamePlugins(organizer)
+        self._register_feature(self._openmw_game_plugins)
         organizer.onAboutToRun(self._export_openmw_cfg)
         return True
 
@@ -170,11 +183,24 @@ class OpenMWGame(BasicGame):
 
     # Extend the plugin list to OpenMW-native formats so they appear in the tab.
     def pluginFileExtensions(self) -> list[str]:
-        return ["esp", "esm", "esl", "omwgame", "omwaddon", "omwscripts"]
+        return ["esp", "esm", "omwgame", "omwaddon", "omwscripts"]
+
+    def ignoredPluginFileSuffixes(self) -> list[str]:
+        return [".omwaddon.esp", ".omwscripts.esp", ".omwgame.esp"]
+
+    def genericPluginStateFollowsModState(self) -> bool:
+        return False
+
+    def parsePluginHeader(self, fileName: str) -> bool:
+        return Path(fileName).suffix.lower() in {
+            ".esm", ".esp", ".omwgame", ".omwaddon"
+        }
+
+    def enforcePluginRelationships(self) -> bool:
+        return False
 
     # OpenMW manages its own VFS via data= dirs, so Fluorine must NOT FUSE-mount
-    # over Data Files for this game. Honoured by the C++ core once usesVFS() is
-    # wired there; defining it here makes the plugin forward-compatible.
+    # over Data Files for this game.
     def usesVFS(self) -> bool:
         return False
 
@@ -213,118 +239,45 @@ class OpenMWGame(BasicGame):
         # 'flatpak' here is our OpenMW launcher (we only register it for OpenMW).
         return base in {"openmw", "openmw-launcher", "flatpak"}
 
-    def _content_from_plugin_list(self, plugin_list) -> list[str]:
-        """Active plugins, in load order, from the Plugins tab.
-
-        Returns ``[]`` when the tab has no usable active plugins so the caller
-        can fall back to directory scanning. Plugins are ordered by the tab's
-        priority (the canonical drag-order the tab renders) and stub esps are
-        dropped.
-        """
-        try:
-            names = list(plugin_list.pluginNames())
-        except Exception:
-            return []
-
-        def _is_active(name: str) -> bool:
-            try:
-                return plugin_list.state(name) == mobase.PluginState.ACTIVE
-            except Exception:
-                return False
-
-        active = [
-            n
-            for n in names
-            if _is_active(n) and not is_openmw_player_stub(n)
-        ]
-
-        # Order by priority(), NOT loadOrder(): the core's setLoadOrder() (used by
-        # "Sort with LOOT") refreshes priority() immediately but leaves loadOrder()
-        # stale until a later resync, so reading loadOrder() here would export the
-        # pre-sort order. For active plugins, sorting by priority gives the same
-        # relative order the tab renders, so this is correct in every case.
-        def _order_key(name: str):
-            try:
-                return plugin_list.priority(name)
-            except Exception:
-                return 0
-
-        active.sort(key=_order_key)
-        return active
-
-    def _read_groundcover_txt(self, fallback: list[str]) -> list[str]:
-        """Plugins flagged as groundcover, from <profile>/groundcover.txt,
-        falling back to the durable profile selection when the file is absent."""
-        try:
-            profile_dir = Path(self._organizer.profile().absolutePath())
-        except Exception:
-            return []
-
-        # Primary source: Fluorine-native groundcover.txt (user-controlled).
-        # Takes precedence over Kezyma's list so a user who creates this file
-        # stays in control of what loads as groundcover.
-        gc_file = profile_dir / "groundcover.txt"
-        if gc_file.is_file():
-            out: list[str] = []
-            for raw in gc_file.read_text(encoding="utf-8", errors="replace").splitlines():
-                line = raw.strip().lstrip("*").strip()
-                if line and not line.startswith("#"):
-                    out.append(line)
-            return out
-        return list(fallback)
-
-    def _read_loadorder_txt(self) -> list[str]:
-        """Plugin load order from <profile>/loadorder.txt (MO2 right-pane order).
-
-        loadorder.txt records Kezyma stub names for OpenMW-native plugins (e.g.
-        ``Sun's Dusk.omwaddon.esp``), but we emit the real files (the stubs are
-        skipped in _scan_mod). Map each entry through _destub_plugin_name so the
-        returned names match the content= plugins we sort against — otherwise
-        every .omwaddon/.omwscripts/.omwgame plugin is unranked and the sort
-        falls back to scan order, ignoring master-before-dependent ordering
-        (e.g. SDServiceRefusal.omwaddon before its parent Sun's Dusk.omwaddon,
-        which makes OpenMW abort on launch).
-        """
-        try:
-            profile_dir = Path(self._organizer.profile().absolutePath())
-        except Exception:
-            return []
-        lo_file = profile_dir / "loadorder.txt"
-        if not lo_file.is_file():
-            return []
-        out: list[str] = []
-        for raw in lo_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = raw.strip()
-            if line and not line.startswith("#"):
-                out.append(line)
-        return normalize_plugin_loadorder(out)
-
-    def _read_archives_txt(self) -> list[str]:
-        """Read additional enabled archives from the active MO2 profile."""
-        try:
-            profile_dir = Path(self._organizer.profile().absolutePath())
-        except Exception:
-            return []
-        archives_file = profile_dir / "archives.txt"
-        if not archives_file.is_file():
-            return []
-        out: list[str] = []
-        for raw in archives_file.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines():
-            line = raw.strip().lstrip("*").strip().lstrip("\ufeff")
-            if line and not line.startswith("#"):
-                out.append(line)
-        return out
-
     def _export_openmw_cfg(self, app_name: str) -> bool:
         # onAboutToRun fires for every launched program; only act for OpenMW.
         if not self._is_openmw_binary(app_name):
             return True
+        state: dict | None = None
         try:
             organizer = self._organizer
             profile = organizer.profile()
             profile_dir = Path(profile.absolutePath())
+            export_snapshot = self._openmw_game_plugins.exportSnapshot(
+                organizer.pluginList()
+            )
+            state = export_snapshot["state"]
+            available_keys = {
+                name.casefold() for name in export_snapshot["available_plugins"]
+            }
+            enabled_keys = {
+                name.casefold() for name in state["enabled_plugins"]
+            }
+            groundcover_keys = {
+                name.casefold() for name in state["groundcover"]
+            }
+            enabled_available = [
+                name
+                for name in state["plugin_order"]
+                if name.casefold() in available_keys
+                and name.casefold() in enabled_keys
+            ]
+            content = [
+                name
+                for name in enabled_available
+                if name.casefold() not in groundcover_keys
+            ]
+            active_groundcover = [
+                name
+                for name in state["groundcover"]
+                if name.casefold() in available_keys
+                and name.casefold() in enabled_keys
+            ]
             local_settings = profile.localSettingsEnabled()
             local_saves = profile.localSavesEnabled()
             game_dir = Path(self.gameDirectory().absolutePath())
@@ -366,13 +319,6 @@ class OpenMWGame(BasicGame):
                         f"that is not a known profile: {previous_profile_dir}"
                     )
                     previous_profile_dir = None
-            selection_cfg = (
-                profile_cfg
-                if chained_profile and profile_cfg.is_file()
-                else root_cfg
-            )
-            configured = read_openmw_selection(selection_cfg)
-
             modlist = organizer.modList()
 
             # data=: vanilla Data Files first (lowest prio), then each active mod
@@ -395,19 +341,11 @@ class OpenMWGame(BasicGame):
             # Data Files may contain enabled archives that are not one of the
             # canonical vanilla BSAs, such as Morrowind - Invalidation.bsa.
             _scan_archives(data_files)
-            # The content= load order comes from the Plugins tab (the user's
-            # persistent, LOOT-sortable order — see OpenMWGamePlugins). We still
-            # scan each active mod's directory here to build data_dirs and collect
-            # BSAs, and to keep a scan-based tiering as a FALLBACK for the very
-            # first launch (before the UI has populated the tab) or any edge where
-            # the tab is empty — so a launch never silently loses its mods. The
-            # fallback tiers follow OpenMW convention: masters (.esm/.omwgame)
-            # before plugins (.esp/.omwaddon), and .omwscripts (Lua manifests, no
-            # records) last; mod-priority order within a tier, reordered by
-            # <profile>/loadorder.txt via order_plugins_by_loadorder.
+            # Plugin scanning is discovery-only here. Version-3 state already owns
+            # activation and order; scans only build data paths, collect archives,
+            # and provide non-destructive groundcover hints.
             masters: list[str] = []         # .esm / .omwgame
             normal_plugins: list[str] = []  # .esp / .omwaddon
-            omw_scripts: list[str] = []     # .omwscripts
 
             def _scan_mod(path: Path) -> None:
                 data_dirs.append(path)
@@ -431,8 +369,6 @@ class OpenMWGame(BasicGame):
                         masters.append(f.name)
                     elif ext in {".esp", ".omwaddon"}:
                         normal_plugins.append(f.name)
-                    elif ext == ".omwscripts":
-                        omw_scripts.append(f.name)
                     elif ext == ".bsa":
                         bsa_archives.append(f.name)
 
@@ -460,13 +396,14 @@ class OpenMWGame(BasicGame):
             except Exception:
                 pass
 
-            if Path(app_name).name.casefold() == "flatpak":
-                flatpak = (
+            is_flatpak_launch = Path(app_name).name.casefold() == "flatpak"
+            if is_flatpak_launch:
+                flatpak_executable = (
                     app_name
                     if Path(app_name).is_file()
                     else shutil.which("flatpak")
                 )
-                if not flatpak:
+                if not flatpak_executable:
                     raise RuntimeError("Flatpak executable is unavailable")
                 requirements = [
                     PathRequirement(path, False) for path in data_dirs
@@ -478,7 +415,7 @@ class OpenMWGame(BasicGame):
                     requirements.append(PathRequirement(profile_dir, True))
                 requirements = merge_requirements(requirements)
                 failures = probe_flatpak_access(
-                    flatpak, _FLATPAK_ID, requirements
+                    flatpak_executable, _FLATPAK_ID, requirements
                 )
                 if failures:
                     qWarning(
@@ -493,56 +430,8 @@ class OpenMWGame(BasicGame):
                     f"{len(requirements)} path(s)."
                 )
 
-            # content= load order: prefer the Plugins tab (the user's persistent,
-            # LOOT-sortable order) as the source of truth. When the tab is
-            # empty/unavailable, fall back to the scan-based tiering reordered by
-            # <profile>/loadorder.txt (order_plugins_by_loadorder keeps unranked
-            # plugins after the ranked ones, in tier order). Either way
-            # build_managed_block prepends the vanilla masters and dedups
-            # case-insensitively, so a mod re-shipping a vanilla esm (or two mods
-            # sharing a plugin name) won't produce duplicate content= lines.
-            loadorder = self._read_loadorder_txt()
-            tab_order = self._content_from_plugin_list(organizer.pluginList())
-            if tab_order:
-                all_plugins = tab_order
-            else:
-                all_plugins = order_plugins_by_loadorder(
-                    masters + normal_plugins + omw_scripts, loadorder
-                )
-            plugin_lower = {p.lower() for p in all_plugins}
-
             state_path = profile_dir / _SELECTION_STATE_FILE
-            state = read_selection_state(state_path)
             state_dirty = False
-            state_upgraded = False
-            if state is None:
-                state = create_selection_state(
-                    configured,
-                    loadorder,
-                    all_plugins,
-                    bsa_archives,
-                    self._read_archives_txt(),
-                )
-                state_dirty = True
-            else:
-                state_upgraded = upgrade_selection_state(state)
-                state_dirty = state_upgraded
-            if (
-                state_upgraded
-                and previous_profile_dir == profile_dir.resolve(strict=False)
-            ):
-                state["profile_config_terminal"] = True
-                qWarning(
-                    "OpenMW: migrated a previously terminal profile without a "
-                    "nested config backup; selectors removed by an older "
-                    "Fluorine version cannot be recovered automatically."
-                )
-
-            groundcover = self._read_groundcover_txt(state["groundcover"])
-            if update_selection_state(
-                state, all_plugins, bsa_archives, groundcover
-            ):
-                state_dirty = True
             if chained_profile and suspend_profile_config_entries(
                 state, profile_cfg
             ):
@@ -586,38 +475,6 @@ class OpenMWGame(BasicGame):
                     if restore_previous_profile:
                         previous_state["profile_config_terminal"] = False
                         previous_state_dirty = True
-            gc_lower = {g.lower() for g in groundcover}
-
-            # Activation source: when the Plugins tab populated all_plugins it
-            # already contains exactly the user's checked plugins, in order —
-            # the tab (persisted to plugins.txt by OpenMWGamePlugins) is the
-            # source of truth, so don't second-guess it with the durable
-            # selection. On the scan fallback, loadorder.txt contains disabled
-            # plugins too, so preserve activation from the durable profile
-            # selection captured before the first export.
-            if tab_order:
-                enabled_plugins = all_plugins
-            else:
-                enabled_plugins = filter_selected_files(
-                    all_plugins, state["enabled_plugins"]
-                )
-            content = [p for p in enabled_plugins if p.lower() not in gc_lower]
-            unranked = unranked_native_plugins(content, loadorder)
-            if unranked:
-                qWarning(
-                    f"OpenMW: {len(unranked)} enabled native content file(s) "
-                    "have no loadorder.txt rank and will use fallback order: "
-                    f"{format_name_sample(unranked)}"
-                )
-            # Only emit groundcover= for plugins that are actually present/active.
-            enabled_lower = {p.lower() for p in enabled_plugins}
-            active_groundcover = [
-                g
-                for g in groundcover
-                if g.lower() in plugin_lower
-                and g.lower() in enabled_lower
-            ]
-
             selected_archives = order_selected_files(
                 bsa_archives, state["archives"]
             )
@@ -625,8 +482,10 @@ class OpenMWGame(BasicGame):
             # Helpful, non-destructive nudge: flag likely groundcover plugins the
             # user hasn't listed yet (we never reroute automatically).
             for p in masters + normal_plugins:
-                low = p.lower()
-                if low not in gc_lower and ("grass" in low or "groundcover" in low):
+                low = p.casefold()
+                if low not in groundcover_keys and (
+                    "grass" in low or "groundcover" in low
+                ):
                     qInfo(
                         f"OpenMW: '{p}' looks like a groundcover plugin. If it is, "
                         f"add it to {Path(self._organizer.profile().absolutePath()) / 'groundcover.txt'} "
@@ -637,6 +496,8 @@ class OpenMWGame(BasicGame):
             launcher_cfg = cfg.parent / "launcher.cfg"
             file_roles = {
                 "selection state": state_path,
+                "active plugin projection": profile_dir / "plugins.txt",
+                "plugin order projection": profile_dir / "loadorder.txt",
                 "launcher config": launcher_cfg,
                 "root config": root_cfg,
             }
@@ -725,11 +586,78 @@ class OpenMWGame(BasicGame):
                     and previous_state is not None
                 ):
                     write_selection_state(previous_state_path, previous_state)
+                persisted_selection = parse_openmw_selection_chain(
+                    cfg,
+                    self._openmw_game_plugins.pathTokensForLaunch(
+                        is_flatpak_launch, app_name
+                    ),
+                )
+                expected_content = []
+                seen_content: set[str] = set()
+                for name in [*self.primaryPlugins(), *content]:
+                    folded = name.casefold()
+                    if folded not in seen_content:
+                        seen_content.add(folded)
+                        expected_content.append(name)
+                expected_archives = []
+                seen_archives: set[str] = set()
+                for name in [*VANILLA_BSAS, *selected_archives]:
+                    folded = name.casefold()
+                    if folded not in seen_archives:
+                        seen_archives.add(folded)
+                        expected_archives.append(name)
+                if (
+                    persisted_selection["content"] != expected_content
+                    or persisted_selection["groundcover"] != active_groundcover
+                    or persisted_selection["fallback_archive"]
+                    != expected_archives
+                    or read_openmw_data_dirs(cfg)
+                    != [str(path) for path in data_dirs]
+                ):
+                    raise RuntimeError(
+                        "OpenMW config read-back differs from canonical plugin state"
+                    )
+                launcher_profile = read_openmw_launcher_profile(launcher_cfg)
+                launcher_data = []
+                seen_data: set[str] = set()
+                for path in data_dirs:
+                    value = str(path)
+                    if value not in seen_data:
+                        seen_data.add(value)
+                        launcher_data.append(value)
+                if launcher_profile != {
+                    "current_profile": "Fluorine",
+                    "data": launcher_data,
+                    "content": expected_content,
+                    "fallback_archive": expected_archives,
+                }:
+                    raise RuntimeError(
+                        "OpenMW launcher config read-back differs from export"
+                    )
+                self._openmw_game_plugins.stageExportState(
+                    organizer.pluginList(), state
+                )
+            self._openmw_game_plugins.commitExportState(
+                organizer.pluginList(), state
+            )
             qInfo(
                 f"OpenMW: wrote {len(data_dirs)} data dir(s) and "
                 f"{len(content)} content plugin(s) to {cfg}."
             )
         except Exception as e:
+            if isinstance(e, TransactionRollbackError):
+                self._openmw_game_plugins.blockPersistence(e)
+            if isinstance(e, TransactionCleanupError):
+                if state is not None:
+                    try:
+                        self._openmw_game_plugins.commitExportState(
+                            organizer.pluginList(), state
+                        )
+                    except Exception as sync_error:
+                        qWarning(
+                            "OpenMW: committed export state could not be synchronized "
+                            f"after cleanup failure: {sync_error}"
+                        )
             qWarning(f"OpenMW: openmw.cfg export failed: {e}")
             # The profile selector, openmw.cfg, and launcher.cfg form one
             # configuration. Launching after a partial update can select stale
