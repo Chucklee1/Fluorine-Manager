@@ -617,20 +617,29 @@ bool FuseConnector::mount(
   if (catalogProgress) catalogProgress->close();
   std::fprintf(stderr,
                "[VFS] [catalog] complete scanned=%llu hashed=%llu bytes=%llu "
-               "elapsed_ms=%llu mib_s=%.1f roots_changed=%llu "
+               "elapsed_ms=%llu mib_s=%.1f hash_workers=%llu "
+               "roots_changed=%llu "
+               "catalog_loaded=%llu catalog_written=%llu catalog_deleted=%llu "
+               "merkle_reused=%llu "
                "archives=%llu indexed=%llu reused=%llu members=%llu errors=%llu "
-               "profile=%s\n",
+               "archive_workers=%llu profile=%s\n",
                static_cast<unsigned long long>(finalProgress.files_scanned),
                static_cast<unsigned long long>(finalProgress.files_hashed),
                static_cast<unsigned long long>(finalProgress.bytes_hashed),
                static_cast<unsigned long long>(finalProgress.elapsed_ms),
                finalProgress.hash_mib_per_second,
+               static_cast<unsigned long long>(finalProgress.hash_workers),
                static_cast<unsigned long long>(finalProgress.provider_roots_changed),
+               static_cast<unsigned long long>(finalProgress.catalog_rows_loaded),
+               static_cast<unsigned long long>(finalProgress.catalog_rows_written),
+               static_cast<unsigned long long>(finalProgress.catalog_rows_deleted),
+               static_cast<unsigned long long>(finalProgress.merkle_roots_reused),
                static_cast<unsigned long long>(finalProgress.archives_discovered),
                static_cast<unsigned long long>(finalProgress.archives_indexed),
                static_cast<unsigned long long>(finalProgress.archives_reused),
                static_cast<unsigned long long>(finalProgress.archive_members),
                static_cast<unsigned long long>(finalProgress.archive_errors),
+               static_cast<unsigned long long>(finalProgress.archive_workers),
                digestPrefix(catalogResult.profile_root).c_str());
   m_baseFileCache = catalog.loadBaseSnapshot(m_dataDirPath);
   m_cachedDataDirPath = m_dataDirPath;
@@ -645,7 +654,20 @@ bool FuseConnector::mount(
     stampPluginTimestamps(*tree, m_pluginLoadOrder);
   }
 
-  publishIndex(*tree, catalogResult);
+  const auto publicationStart = std::chrono::steady_clock::now();
+  const VfsIndexPublicationResult publication =
+      publishIndex(*tree, catalogResult);
+  const auto publicationMs =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - publicationStart)
+          .count();
+  std::fprintf(
+      stderr,
+      "[VFS] index publication success=%d reused=%d files=%zu elapsed_ms=%lld\n",
+      publication.success ? 1 : 0,
+      publication.reused_existing ? 1 : 0,
+      publication.file_count,
+      static_cast<long long>(publicationMs));
 
   {
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1068,7 +1090,8 @@ VfsIndexPublicationResult FuseConnector::publishIndex(
               "temporary game-root locator could not be deployed",
               publication.generation);
   }
-  log::info("Published VFS index generation {} with {} resolved files",
+  log::info("{} VFS index generation {} with {} resolved files",
+            publication.reused_existing ? "Reused" : "Published",
             publication.generation, publication.file_count);
   return publication;
 }

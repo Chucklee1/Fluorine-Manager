@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -26,6 +27,8 @@
 #include <stdexcept>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <unistd.h>
 
 namespace
@@ -188,6 +191,139 @@ struct ArchiveCandidate
   std::string real_path;
   VfsDigest digest{};
 };
+
+struct PendingCatalogFile
+{
+  fs::path path;
+  std::string full;
+  std::string relative;
+  std::string normalized;
+  struct stat metadata {};
+  VfsDigest digest{};
+  bool reuse_hash = false;
+};
+
+struct CachedCatalogFile
+{
+  int64_t device = 0;
+  int64_t inode = 0;
+  int64_t size = 0;
+  int64_t mode = 0;
+  int64_t mtime_ns = 0;
+  int64_t ctime_ns = 0;
+  VfsDigest digest{};
+  bool has_digest = false;
+};
+
+using HashCompletion =
+    std::function<void(const PendingCatalogFile&)>;
+
+std::size_t hashChangedFiles(
+    std::vector<PendingCatalogFile>& files,
+    const HashCompletion& completion)
+{
+  std::vector<std::size_t> changed;
+  changed.reserve(files.size());
+  for (std::size_t index = 0; index < files.size(); ++index) {
+    if (!files[index].reuse_hash) changed.push_back(index);
+  }
+  if (changed.empty()) return 0;
+
+  const unsigned int hardware =
+      std::max(1u, std::thread::hardware_concurrency());
+  const std::size_t workerCount =
+      std::min<std::size_t>(changed.size(), hardware);
+  std::atomic<std::size_t> next{0};
+  std::atomic<bool> stop{false};
+  std::mutex stateMutex;
+  std::condition_variable completedCondition;
+  std::vector<std::size_t> completed;
+  completed.reserve(changed.size());
+  std::exception_ptr workerError;
+
+  std::vector<std::thread> workers;
+  workers.reserve(workerCount);
+  for (std::size_t worker = 0; worker < workerCount; ++worker) {
+    workers.emplace_back([&]() {
+      while (!stop.load(std::memory_order_relaxed)) {
+        const std::size_t work =
+            next.fetch_add(1, std::memory_order_relaxed);
+        if (work >= changed.size()) return;
+        const std::size_t fileIndex = changed[work];
+        PendingCatalogFile& file = files[fileIndex];
+        try {
+          bool stable = false;
+          for (int attempt = 0; attempt < 3; ++attempt) {
+            const struct stat before = file.metadata;
+            file.digest = hashFile(file.path);
+            struct stat after {};
+            if (::lstat(file.full.c_str(), &after) != 0) {
+              throw std::runtime_error(
+                  "File disappeared while hashing: " + file.full);
+            }
+            file.metadata = after;
+            if (sameContentFingerprint(before, after)) {
+              stable = true;
+              break;
+            }
+          }
+          if (!stable) {
+            throw std::runtime_error(
+                "File kept changing while hashing: " + file.full);
+          }
+          {
+            std::scoped_lock lock(stateMutex);
+            completed.push_back(fileIndex);
+          }
+          completedCondition.notify_one();
+        } catch (...) {
+          stop.store(true, std::memory_order_relaxed);
+          {
+            std::scoped_lock lock(stateMutex);
+            if (workerError == nullptr) {
+              workerError = std::current_exception();
+            }
+          }
+          completedCondition.notify_one();
+          return;
+        }
+      }
+    });
+  }
+
+  std::size_t reported = 0;
+  std::exception_ptr completionError;
+  try {
+    while (reported < changed.size()) {
+      std::vector<std::size_t> ready;
+      {
+        std::unique_lock lock(stateMutex);
+        completedCondition.wait_for(
+            lock, std::chrono::milliseconds(100), [&]() {
+              return !completed.empty() || workerError != nullptr;
+            });
+        ready.swap(completed);
+        if (ready.empty() && workerError != nullptr) break;
+      }
+      for (const std::size_t index : ready) {
+        completion(files[index]);
+        ++reported;
+      }
+    }
+  } catch (...) {
+    stop.store(true, std::memory_order_relaxed);
+    completionError = std::current_exception();
+  }
+
+  for (auto& worker : workers) worker.join();
+  if (completionError != nullptr) std::rethrow_exception(completionError);
+  if (workerError != nullptr) std::rethrow_exception(workerError);
+  if (reported != changed.size()) {
+    throw std::runtime_error(
+        "Parallel file hashing stopped before all files completed");
+  }
+  return workerCount;
+}
 
 struct Root
 {
@@ -398,9 +534,13 @@ std::shared_ptr<const VfsArchiveMemberIndex> reconcileArchiveManifests(
     std::exception_ptr workerError;
     std::atomic<bool> stop{false};
 
-    const unsigned int hardware = std::max(1u, std::thread::hardware_concurrency());
+    const unsigned int hardware =
+        std::max(1u, std::thread::hardware_concurrency());
     const std::size_t workerCount =
-        std::min<std::size_t>(uncached.size(), hardware);
+        std::min<std::size_t>(
+            uncached.size(), std::min<unsigned int>(hardware, 4u));
+    state.archive_workers =
+        std::max<uint64_t>(state.archive_workers, workerCount);
     std::vector<std::thread> workers;
     workers.reserve(workerCount);
     for (std::size_t worker = 0; worker < workerCount; ++worker) {
@@ -611,9 +751,9 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
       }
     }
 
-    auto find = prepare(db.get(),
-        "SELECT device,inode,size,mode,mtime_ns,ctime_ns,blake3"
-        " FROM catalog_files WHERE root_key=?1 AND normalized_path=?2;");
+    auto loadRootFiles = prepare(db.get(),
+        "SELECT normalized_path,device,inode,size,mode,mtime_ns,ctime_ns,blake3"
+        " FROM catalog_files WHERE root_key=?1;");
     auto upsert = prepare(db.get(),
         "INSERT INTO catalog_files(root_key,relative_path,normalized_path,origin,"
         "is_backing,device,inode,size,mode,mtime_ns,ctime_ns,blake3,seen_generation)"
@@ -624,17 +764,14 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
         " size=excluded.size,mode=excluded.mode,mtime_ns=excluded.mtime_ns,"
         " ctime_ns=excluded.ctime_ns,blake3=excluded.blake3,"
         " seen_generation=excluded.seen_generation;");
-    auto markSeen = prepare(db.get(),
-        "INSERT OR IGNORE INTO catalog_seen(root_key,normalized_path) VALUES(?1,?2);");
-    auto refreshOrigin = prepare(db.get(),
-        "UPDATE catalog_files SET origin=?3,is_backing=?4"
-        " WHERE root_key=?1 AND normalized_path=?2"
-        " AND (origin<>?3 OR is_backing<>?4);");
-    auto prune = prepare(db.get(),
-        "DELETE FROM catalog_files WHERE root_key=?1 AND normalized_path NOT IN"
-        " (SELECT normalized_path FROM catalog_seen WHERE root_key=?1);");
+    auto refreshRootOrigin = prepare(db.get(),
+        "UPDATE catalog_files SET origin=?2,is_backing=?3"
+        " WHERE root_key=?1 AND (origin<>?2 OR is_backing<>?3);");
+    auto deleteFile = prepare(db.get(),
+        "DELETE FROM catalog_files"
+        " WHERE root_key=?1 AND normalized_path=?2;");
     auto findRoot = prepare(db.get(),
-        "SELECT merkle_root FROM catalog_roots WHERE root_key=?1;");
+        "SELECT merkle_root,file_count FROM catalog_roots WHERE root_key=?1;");
     auto upsertRoot = prepare(db.get(),
         "INSERT INTO catalog_roots(root_key,merkle_root,file_count,generation)"
         " VALUES(?1,?2,?3,?4) ON CONFLICT(root_key) DO UPDATE SET"
@@ -644,8 +781,30 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
     std::vector<VfsProviderRoot> providerRoots;
     providerRoots.reserve(roots.size() + (scan_base ? 0 : 1));
     if (!scan_base) {
-      providerRoots.push_back(calculateProviderRoot(
-          db.get(), Root{data_dir, data_dir, "_base_game", true}));
+      sqlite3_reset(findRoot.get());
+      sqlite3_clear_bindings(findRoot.get());
+      bindText(db.get(), findRoot.get(), 1, data_dir);
+      VfsProviderRoot baseRoot{
+          data_dir, "_base_game", true, 0, {}};
+      if (sqlite3_step(findRoot.get()) == SQLITE_ROW) {
+        const void* digest = sqlite3_column_blob(findRoot.get(), 0);
+        const int bytes = sqlite3_column_bytes(findRoot.get(), 0);
+        if (digest != nullptr &&
+            bytes == static_cast<int>(baseRoot.digest.size())) {
+          std::memcpy(
+              baseRoot.digest.data(), digest, baseRoot.digest.size());
+          baseRoot.file_count = static_cast<uint64_t>(
+              sqlite3_column_int64(findRoot.get(), 1));
+          ++state.merkle_roots_reused;
+        } else {
+          baseRoot = calculateProviderRoot(
+              db.get(), Root{data_dir, data_dir, "_base_game", true});
+        }
+      } else {
+        baseRoot = calculateProviderRoot(
+            db.get(), Root{data_dir, data_dir, "_base_game", true});
+      }
+      providerRoots.push_back(std::move(baseRoot));
     }
     const auto reportProgress = [&]() {
       state.elapsed_ms = static_cast<uint64_t>(
@@ -659,6 +818,57 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
     for (const Root& root : roots) {
       state.current_root = root.path;
       const std::string rootPrefix = fs::path(root.path).string();
+      std::vector<PendingCatalogFile> pendingFiles;
+      std::unordered_map<std::string, CachedCatalogFile> cachedFiles;
+      std::unordered_set<std::string> seenFiles;
+
+      sqlite3_reset(loadRootFiles.get());
+      sqlite3_clear_bindings(loadRootFiles.get());
+      bindText(db.get(), loadRootFiles.get(), 1, root.key);
+      while (sqlite3_step(loadRootFiles.get()) == SQLITE_ROW) {
+        const auto* normalized = reinterpret_cast<const char*>(
+            sqlite3_column_text(loadRootFiles.get(), 0));
+        if (normalized == nullptr) continue;
+        CachedCatalogFile cached;
+        cached.device = sqlite3_column_int64(loadRootFiles.get(), 1);
+        cached.inode = sqlite3_column_int64(loadRootFiles.get(), 2);
+        cached.size = sqlite3_column_int64(loadRootFiles.get(), 3);
+        cached.mode = sqlite3_column_int64(loadRootFiles.get(), 4);
+        cached.mtime_ns = sqlite3_column_int64(loadRootFiles.get(), 5);
+        cached.ctime_ns = sqlite3_column_int64(loadRootFiles.get(), 6);
+        const void* digest = sqlite3_column_blob(loadRootFiles.get(), 7);
+        const int bytes = sqlite3_column_bytes(loadRootFiles.get(), 7);
+        cached.has_digest =
+            digest != nullptr &&
+            bytes == static_cast<int>(cached.digest.size());
+        if (cached.has_digest) {
+          std::memcpy(cached.digest.data(), digest, cached.digest.size());
+        }
+        cachedFiles.emplace(normalized, cached);
+        ++state.catalog_rows_loaded;
+      }
+      seenFiles.reserve(cachedFiles.size());
+      pendingFiles.reserve(cachedFiles.size());
+
+      sqlite3_reset(findRoot.get());
+      sqlite3_clear_bindings(findRoot.get());
+      bindText(db.get(), findRoot.get(), 1, root.key);
+      VfsDigest previousRootDigest{};
+      uint64_t previousRootFileCount = 0;
+      bool hasPreviousRoot = false;
+      if (sqlite3_step(findRoot.get()) == SQLITE_ROW) {
+        const void* digest = sqlite3_column_blob(findRoot.get(), 0);
+        const int bytes = sqlite3_column_bytes(findRoot.get(), 0);
+        hasPreviousRoot =
+            digest != nullptr &&
+            bytes == static_cast<int>(previousRootDigest.size());
+        if (hasPreviousRoot) {
+          std::memcpy(
+              previousRootDigest.data(), digest, previousRootDigest.size());
+          previousRootFileCount = static_cast<uint64_t>(
+              sqlite3_column_int64(findRoot.get(), 1));
+        }
+      }
 
       const bool rootExists = fs::exists(root.path, ec);
       if (ec) {
@@ -669,84 +879,89 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
         for (auto it = fs::recursive_directory_iterator(
                root.path, fs::directory_options::skip_permission_denied, ec);
            !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        const fs::directory_entry& entry = *it;
-        const std::string full = entry.path().string();
-        const std::string relative = fastRelative(full, rootPrefix);
-        if (relative.empty() || relative == "meta.ini") continue;
+          const fs::directory_entry& entry = *it;
+          const std::string full = entry.path().string();
+          const std::string relative = fastRelative(full, rootPrefix);
+          if (relative.empty() || relative == "meta.ini") continue;
 
-        struct stat st {};
-        if (::lstat(full.c_str(), &st) != 0) continue;
-        const auto components = splitPath(relative);
-        if (S_ISDIR(st.st_mode)) {
-          tree.root.insertDirectory(components);
-          visibleArchives.erase(normalizeForLookup(relative));
-          ++tree.dir_count;
-          continue;
-        }
-        if (!S_ISREG(st.st_mode)) continue;
+          struct stat st {};
+          if (::lstat(full.c_str(), &st) != 0) continue;
+          const auto components = splitPath(relative);
+          if (S_ISDIR(st.st_mode)) {
+            tree.root.insertDirectory(components);
+            visibleArchives.erase(normalizeForLookup(relative));
+            ++tree.dir_count;
+            continue;
+          }
+          if (!S_ISREG(st.st_mode)) continue;
 
-        ++state.files_scanned;
-        const std::string normalized = normalizeForLookup(relative);
-        sqlite3_reset(markSeen.get());
-        sqlite3_clear_bindings(markSeen.get());
-        bindText(db.get(), markSeen.get(), 1, root.key);
-        bindText(db.get(), markSeen.get(), 2, normalized);
-        if (sqlite3_step(markSeen.get()) != SQLITE_DONE) throwDb(db.get(), "Marking catalog file seen");
-        int64_t mtimeNs = timespecNs(st.st_mtim);
-        int64_t ctimeNs = timespecNs(st.st_ctim);
-        std::array<unsigned char, BLAKE3_OUT_LEN> digest{};
-        bool reuseHash = false;
+          ++state.files_scanned;
+          const std::string normalized = normalizeForLookup(relative);
+          seenFiles.insert(normalized);
+          const int64_t mtimeNs = timespecNs(st.st_mtim);
+          const int64_t ctimeNs = timespecNs(st.st_ctim);
+          VfsDigest digest{};
+          bool reuseHash = false;
 
-        sqlite3_reset(find.get());
-        sqlite3_clear_bindings(find.get());
-        bindText(db.get(), find.get(), 1, root.key);
-        bindText(db.get(), find.get(), 2, normalized);
-        if (sqlite3_step(find.get()) == SQLITE_ROW) {
-          const void* blob = sqlite3_column_blob(find.get(), 6);
-          const int bytes = sqlite3_column_bytes(find.get(), 6);
-          reuseHash = sqlite3_column_int64(find.get(), 0) == st.st_dev &&
-                      sqlite3_column_int64(find.get(), 1) == st.st_ino &&
-                      sqlite3_column_int64(find.get(), 2) == st.st_size &&
-                      sqlite3_column_int64(find.get(), 3) == (st.st_mode & 07777) &&
-                      sqlite3_column_int64(find.get(), 4) == mtimeNs &&
-                      sqlite3_column_int64(find.get(), 5) == ctimeNs &&
-                      blob != nullptr && bytes == BLAKE3_OUT_LEN;
-          if (reuseHash) std::memcpy(digest.data(), blob, digest.size());
-        }
-        if (!reuseHash) {
-          state.current_file = full;
-          state.current_file_size = static_cast<uint64_t>(st.st_size);
-          reportProgress();  // show the file before a long hash
-          bool stable = false;
-          for (int attempt = 0; attempt < 3; ++attempt) {
-            const struct stat before = st;
-            digest = hashFile(entry.path());
-            struct stat after {};
-            if (::lstat(full.c_str(), &after) != 0) {
-              throw std::runtime_error("File disappeared while hashing: " + full);
-            }
-            st = after;
-            mtimeNs = timespecNs(st.st_mtim);
-            ctimeNs = timespecNs(st.st_ctim);
-            if (sameContentFingerprint(before, after)) {
-              stable = true;
-              break;
+          const auto cached = cachedFiles.find(normalized);
+          if (cached != cachedFiles.end()) {
+            const CachedCatalogFile& old = cached->second;
+            reuseHash =
+                old.device == st.st_dev &&
+                old.inode == st.st_ino &&
+                old.size == st.st_size &&
+                old.mode == (st.st_mode & 07777) &&
+                old.mtime_ns == mtimeNs &&
+                old.ctime_ns == ctimeNs &&
+                old.has_digest;
+            if (reuseHash) {
+              digest = old.digest;
             }
           }
-          if (!stable) {
-            throw std::runtime_error("File kept changing while hashing: " + full);
-          }
-          ++state.files_hashed;
-          state.bytes_hashed += static_cast<uint64_t>(st.st_size);
-          reportProgress();
-        }
 
-        if (!reuseHash) {
+          pendingFiles.push_back({
+              entry.path(), full, relative, normalized, st, digest, reuseHash});
+          if (progress && (state.files_scanned % 2048 == 0)) {
+            reportProgress();
+          }
+        }
+      }
+      ec.clear();
+
+      const auto firstChanged = std::find_if(
+          pendingFiles.begin(), pendingFiles.end(),
+          [](const PendingCatalogFile& file) {
+            return !file.reuse_hash;
+          });
+      if (firstChanged != pendingFiles.end()) {
+        state.current_file = firstChanged->full;
+        state.current_file_size =
+            static_cast<uint64_t>(firstChanged->metadata.st_size);
+        reportProgress();
+      }
+      const std::size_t hashWorkers = hashChangedFiles(
+          pendingFiles, [&](const PendingCatalogFile& file) {
+            ++state.files_hashed;
+            state.bytes_hashed +=
+                static_cast<uint64_t>(file.metadata.st_size);
+            state.current_file = file.full;
+            state.current_file_size =
+                static_cast<uint64_t>(file.metadata.st_size);
+            reportProgress();
+          });
+      state.hash_workers =
+          std::max<uint64_t>(state.hash_workers, hashWorkers);
+
+      for (const PendingCatalogFile& file : pendingFiles) {
+        const struct stat& st = file.metadata;
+        const int64_t mtimeNs = timespecNs(st.st_mtim);
+        const int64_t ctimeNs = timespecNs(st.st_ctim);
+        if (!file.reuse_hash) {
           sqlite3_reset(upsert.get());
           sqlite3_clear_bindings(upsert.get());
           bindText(db.get(), upsert.get(), 1, root.key);
-          bindText(db.get(), upsert.get(), 2, relative);
-          bindText(db.get(), upsert.get(), 3, normalized);
+          bindText(db.get(), upsert.get(), 2, file.relative);
+          bindText(db.get(), upsert.get(), 3, file.normalized);
           bindText(db.get(), upsert.get(), 4, root.origin);
           sqlite3_bind_int(upsert.get(), 5, root.backing ? 1 : 0);
           sqlite3_bind_int64(upsert.get(), 6, st.st_dev);
@@ -755,54 +970,72 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
           sqlite3_bind_int64(upsert.get(), 9, st.st_mode & 07777);
           sqlite3_bind_int64(upsert.get(), 10, mtimeNs);
           sqlite3_bind_int64(upsert.get(), 11, ctimeNs);
-          sqlite3_bind_blob(upsert.get(), 12, digest.data(), digest.size(), SQLITE_TRANSIENT);
+          sqlite3_bind_blob(upsert.get(), 12, file.digest.data(),
+                            file.digest.size(), SQLITE_TRANSIENT);
           sqlite3_bind_int64(upsert.get(), 13, generation);
           if (sqlite3_step(upsert.get()) != SQLITE_DONE) throwDb(db.get(), "Updating catalog file");
-        } else {
-          sqlite3_reset(refreshOrigin.get());
-          sqlite3_clear_bindings(refreshOrigin.get());
-          bindText(db.get(), refreshOrigin.get(), 1, root.key);
-          bindText(db.get(), refreshOrigin.get(), 2, normalized);
-          bindText(db.get(), refreshOrigin.get(), 3, root.origin);
-          sqlite3_bind_int(refreshOrigin.get(), 4, root.backing ? 1 : 0);
-          if (sqlite3_step(refreshOrigin.get()) != SQLITE_DONE) throwDb(db.get(), "Refreshing catalog origin");
+          ++state.catalog_rows_written;
         }
 
-        const std::string storedPath = root.backing ? relative : full;
-        tree.root.insertFile(components, storedPath,
+        const std::string storedPath =
+            root.backing ? file.relative : file.full;
+        tree.root.insertFile(splitPath(file.relative), storedPath,
                              static_cast<uint64_t>(st.st_size),
                              timePoint(st.st_mtim), root.origin, root.backing,
-                             st.st_mode & 07777, digest);
+                             st.st_mode & 07777, file.digest);
         ++tree.file_count;
-        if (isBethesdaArchive(relative)) {
-          archiveCandidates.insert_or_assign(digest, full);
-          visibleArchives.insert_or_assign(normalized, digest);
+        if (isBethesdaArchive(file.relative)) {
+          archiveCandidates.insert_or_assign(file.digest, file.full);
+          visibleArchives.insert_or_assign(file.normalized, file.digest);
           ++state.archives_discovered;
         }
-        state.current_file.clear();
-        state.current_file_size = 0;
+      }
+      state.current_file.clear();
+      state.current_file_size = 0;
 
-        if (progress && (state.files_scanned % 2048 == 0)) reportProgress();
+      uint64_t rootRowsDeleted = 0;
+      for (const auto& [normalized, cached] : cachedFiles) {
+        (void)cached;
+        if (seenFiles.contains(normalized)) continue;
+        sqlite3_reset(deleteFile.get());
+        sqlite3_clear_bindings(deleteFile.get());
+        bindText(db.get(), deleteFile.get(), 1, root.key);
+        bindText(db.get(), deleteFile.get(), 2, normalized);
+        if (sqlite3_step(deleteFile.get()) != SQLITE_DONE) {
+          throwDb(db.get(), "Pruning catalog file");
         }
+        ++state.catalog_rows_deleted;
+        ++rootRowsDeleted;
       }
-      ec.clear();
 
-      sqlite3_reset(prune.get());
-      sqlite3_clear_bindings(prune.get());
-      bindText(db.get(), prune.get(), 1, root.key);
-      if (sqlite3_step(prune.get()) != SQLITE_DONE) throwDb(db.get(), "Pruning catalog root");
-
-      VfsProviderRoot providerRoot = calculateProviderRoot(db.get(), root);
-      sqlite3_reset(findRoot.get());
-      sqlite3_clear_bindings(findRoot.get());
-      bindText(db.get(), findRoot.get(), 1, root.key);
-      bool rootChanged = true;
-      if (sqlite3_step(findRoot.get()) == SQLITE_ROW) {
-        const void* old = sqlite3_column_blob(findRoot.get(), 0);
-        const int bytes = sqlite3_column_bytes(findRoot.get(), 0);
-        rootChanged = old == nullptr || bytes != static_cast<int>(providerRoot.digest.size()) ||
-                      std::memcmp(old, providerRoot.digest.data(), providerRoot.digest.size()) != 0;
+      sqlite3_reset(refreshRootOrigin.get());
+      sqlite3_clear_bindings(refreshRootOrigin.get());
+      bindText(db.get(), refreshRootOrigin.get(), 1, root.key);
+      bindText(db.get(), refreshRootOrigin.get(), 2, root.origin);
+      sqlite3_bind_int(refreshRootOrigin.get(), 3, root.backing ? 1 : 0);
+      if (sqlite3_step(refreshRootOrigin.get()) != SQLITE_DONE) {
+        throwDb(db.get(), "Refreshing catalog root origin");
       }
+
+      const bool catalogContentChanged =
+          std::any_of(
+              pendingFiles.begin(), pendingFiles.end(),
+              [](const PendingCatalogFile& file) {
+                return !file.reuse_hash;
+              }) ||
+          rootRowsDeleted != 0;
+      VfsProviderRoot providerRoot;
+      if (!catalogContentChanged && hasPreviousRoot &&
+          previousRootFileCount == pendingFiles.size()) {
+        providerRoot = {
+            root.key, root.origin, root.backing,
+            previousRootFileCount, previousRootDigest};
+        ++state.merkle_roots_reused;
+      } else {
+        providerRoot = calculateProviderRoot(db.get(), root);
+      }
+      const bool rootChanged =
+          !hasPreviousRoot || previousRootDigest != providerRoot.digest;
       if (rootChanged) ++state.provider_roots_changed;
 
       sqlite3_reset(upsertRoot.get());

@@ -47,6 +47,16 @@ Fluorine Manager is built inside a Docker/Podman container — no host toolchain
 
 The default output is `build/fluorine-manager.tar.gz` — extract anywhere and run `./fluorine-manager`.
 
+Fluorine hashes changed catalog files concurrently using the available CPU
+threads while retaining cached BLAKE3 digests for unchanged files. Uncached
+BSA/BA2 member catalogs use at most four parsing workers to avoid excessive
+storage contention. Warm reconciliation bulk-loads cached fingerprints,
+writes only changed/deleted catalog rows, and reuses unchanged provider
+Merkle roots. An unchanged immutable VFS Index generation is reused only
+after full validation confirms the profile, resolved snapshot, provider
+rows, consumer paths, and archive proof are identical. SQLite mutation and
+new-generation publication remain serialized and crash-safe.
+
 ### Runtime Requirements (Mainly NixOS)
 
 - Steam must be installed so that Proton is available.

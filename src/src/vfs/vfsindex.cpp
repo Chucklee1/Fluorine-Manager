@@ -519,6 +519,56 @@ std::optional<std::string> locatorGeneration(const fs::path& locatorPath)
   return locator->generation;
 }
 
+bool providerRowsMatch(
+    const fs::path& databasePath,
+    const std::vector<VfsProviderRoot>& providerRoots,
+    VfsIndexConsumerPathStyle pathStyle)
+{
+  sqlite3* raw = nullptr;
+  if (sqlite3_open_v2(
+          databasePath.c_str(), &raw, SQLITE_OPEN_READONLY, nullptr) !=
+      SQLITE_OK) {
+    DbPtr failed(raw);
+    return false;
+  }
+  DbPtr database(raw);
+  auto rows = prepare(
+      database.get(),
+      "SELECT priority,root_key,origin,role,host_root,consumer_root,"
+      "merkle_digest,file_count FROM providers ORDER BY priority;");
+  std::size_t index = 0;
+  while (sqlite3_step(rows.get()) == SQLITE_ROW) {
+    if (index >= providerRoots.size() ||
+        sqlite3_column_int64(rows.get(), 0) !=
+            static_cast<sqlite3_int64>(index)) {
+      return false;
+    }
+    const VfsProviderRoot& root = providerRoots[index];
+    const std::string role =
+        root.is_backing
+            ? "base_game"
+            : (root.origin == "Overwrite" ? "overwrite" : "mod");
+    const std::string hostRoot =
+        fs::path(root.root_key).lexically_normal().string();
+    VfsDigest digest{};
+    if (sqliteText(rows.get(), 1) != root.root_key ||
+        sqliteText(rows.get(), 2) != root.origin ||
+        sqliteText(rows.get(), 3) != role ||
+        sqliteText(rows.get(), 4) != hostRoot ||
+        sqliteText(rows.get(), 5) !=
+            VfsIndexPublisher::toConsumerPath(
+                fs::path(root.root_key), pathStyle) ||
+        !sqliteDigest(rows.get(), 6, digest) ||
+        digest != root.digest ||
+        sqlite3_column_int64(rows.get(), 7) !=
+            static_cast<sqlite3_int64>(root.file_count)) {
+      return false;
+    }
+    ++index;
+  }
+  return index == providerRoots.size();
+}
+
 bool generationFile(const fs::path& path, std::string& generation)
 {
   const std::string name = path.filename().string();
@@ -1120,16 +1170,10 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
       throw std::runtime_error("VFS Data directory is not an absolute path");
     }
 
-    const std::string generation = newGeneration();
     const fs::path indexDirectory =
         context.output_base / ".vfs-indexer" / "index";
     const fs::path locatorPath =
         context.output_base / kVfsIndexLocatorName;
-    const fs::path databasePath =
-        indexDirectory / ("vfs-index-" + generation + ".sqlite3");
-    temporaryDatabase =
-        indexDirectory / (".vfs-index-" + generation + ".tmp.sqlite3");
-
     std::error_code error;
     fs::create_directories(indexDirectory, error);
     if (error) {
@@ -1142,6 +1186,76 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
     const std::vector<ExportedFile> files =
         flattenTree(tree, dataDirectory, context.consumer_path_style);
     const VfsDigest snapshotDigest = resolvedDigest(files);
+#ifdef _WIN32
+    const std::string hostPathStyle = "windows";
+#else
+    const std::string hostPathStyle = "posix";
+#endif
+
+    std::string locatorError;
+    const auto existing =
+        VfsIndexValidator::parseLocator(locatorPath, locatorError);
+    if (existing &&
+        existing->producer == context.producer &&
+        existing->instance_name == context.instance_name &&
+        existing->profile_name == context.profile_name &&
+        existing->profile_digest ==
+            std::optional<VfsDigest>{profileDigest} &&
+        existing->resolved_snapshot_digest == snapshotDigest &&
+        existing->host_path_style == hostPathStyle) {
+      const fs::path existingDatabase =
+          fs::path(existing->host_database_path).lexically_normal();
+      const fs::path expectedDatabase =
+          indexDirectory /
+          ("vfs-index-" + existing->generation + ".sqlite3");
+      bool proofMatches = false;
+      if (existingDatabase == expectedDatabase.lexically_normal() &&
+          existing->consumer_database_path ==
+              toConsumerPath(
+                  existingDatabase, context.consumer_path_style)) {
+        const auto validation =
+            VfsIndexValidator::validateDatabase(
+                existingDatabase, *existing);
+        if (validation &&
+            providerRowsMatch(
+                existingDatabase, providerRoots,
+                context.consumer_path_style)) {
+          const auto& oldProof =
+              validation.index->archive_members;
+          const bool newHasProof =
+              archiveMembers && archiveMembers->complete();
+          proofMatches =
+              newHasProof == static_cast<bool>(oldProof);
+          if (proofMatches && newHasProof) {
+            proofMatches =
+                archiveMembers->archiveCount() ==
+                    oldProof->archiveCount() &&
+                archiveMembers->memberCount() ==
+                    oldProof->memberCount() &&
+                archiveMembers->serializedBits() ==
+                    oldProof->serializedBits();
+          }
+        }
+      }
+      if (proofMatches) {
+        result.success = true;
+        result.generation = existing->generation;
+        result.resolved_snapshot_digest = snapshotDigest;
+        result.database_path = existingDatabase;
+        result.locator_path = locatorPath;
+        result.reused_existing = true;
+        result.file_count = files.size();
+        retainGenerations(
+            indexDirectory, existing->generation, std::nullopt);
+        return result;
+      }
+    }
+
+    const std::string generation = newGeneration();
+    const fs::path databasePath =
+        indexDirectory / ("vfs-index-" + generation + ".sqlite3");
+    temporaryDatabase =
+        indexDirectory / (".vfs-index-" + generation + ".tmp.sqlite3");
 
     sqlite3* raw = nullptr;
     if (sqlite3_open_v2(
@@ -1213,11 +1327,6 @@ VfsIndexPublicationResult VfsIndexPublisher::publish(
     bindText(database.get(), snapshot.get(), 4, context.profile_name);
     bindDigest(database.get(), snapshot.get(), 5, profileDigest);
     bindDigest(database.get(), snapshot.get(), 6, snapshotDigest);
-#ifdef _WIN32
-    const std::string hostPathStyle = "windows";
-#else
-    const std::string hostPathStyle = "posix";
-#endif
     bindText(database.get(), snapshot.get(), 7, kVfsIndexNormalization);
     bindText(database.get(), snapshot.get(), 8, hostPathStyle);
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(

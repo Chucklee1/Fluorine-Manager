@@ -50,6 +50,7 @@ struct VfsIndexPublicationResult
   std::filesystem::path locator_path;
   std::filesystem::path root_locator_path;
   bool root_locator_deployed = false;
+  bool reused_existing = false;
   std::size_t file_count = 0;
 };
 

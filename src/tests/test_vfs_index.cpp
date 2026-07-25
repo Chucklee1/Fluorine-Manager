@@ -216,6 +216,13 @@ TEST(VfsIndex, PublishesAndValidatesCompleteWineGeneration)
   EXPECT_EQ(publication.file_count, 6u);
   EXPECT_TRUE(fs::exists(publication.database_path));
   EXPECT_TRUE(fs::exists(publication.locator_path));
+  EXPECT_FALSE(publication.reused_existing);
+
+  const auto reused = sample.publish();
+  ASSERT_TRUE(reused.success) << reused.error;
+  EXPECT_TRUE(reused.reused_existing);
+  EXPECT_EQ(reused.generation, publication.generation);
+  EXPECT_EQ(reused.database_path, publication.database_path);
 
   const QJsonObject json = readJson(publication.locator_path);
   EXPECT_EQ(json.value("format").toString(), QStringLiteral("vfs-index"));
@@ -525,6 +532,8 @@ TEST(VfsIndex, RetainsOnlyCurrentAndPreviousCompleteGenerations)
   Sample sample;
   std::string previous;
   for (int generation = 0; generation < 4; ++generation) {
+    sample.profile_digest =
+        digest(static_cast<unsigned char>(30 + generation));
     const auto publication = sample.publish();
     ASSERT_TRUE(publication.success) << publication.error;
     previous = publication.generation;

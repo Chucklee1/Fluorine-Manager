@@ -71,6 +71,11 @@ TEST(VfsCatalog, ReusesHashesAndPreservesOverwritePriority)
   VfsTree initial = std::move(initialResult.tree);
   EXPECT_EQ(first.files_scanned, 3u);
   EXPECT_EQ(first.files_hashed, 3u);
+  EXPECT_GE(first.hash_workers, 1u);
+  EXPECT_LE(
+      first.hash_workers,
+      static_cast<uint64_t>(
+          std::max(1u, std::thread::hardware_concurrency())));
   EXPECT_EQ(winnerOrigin(initial, "same.txt"), "Overwrite");
 
   VfsCatalogProgress second;
@@ -81,6 +86,10 @@ TEST(VfsCatalog, ReusesHashesAndPreservesOverwritePriority)
   EXPECT_EQ(second.files_scanned, 3u);
   EXPECT_EQ(second.files_hashed, 0u);
   EXPECT_EQ(second.provider_roots_changed, 0u);
+  EXPECT_EQ(second.catalog_rows_written, 0u);
+  EXPECT_EQ(second.catalog_rows_deleted, 0u);
+  EXPECT_EQ(second.catalog_rows_loaded, 3u);
+  EXPECT_EQ(second.merkle_roots_reused, 3u);
   EXPECT_EQ(initialResult.profile_root, warmResult.profile_root);
   ASSERT_EQ(initialResult.provider_roots.size(), warmResult.provider_roots.size());
   for (size_t i = 0; i < initialResult.provider_roots.size(); ++i) {
@@ -119,6 +128,38 @@ TEST(VfsCatalog, MetadataDriftRehashesOnlyChangedFile)
       [&](const VfsCatalogProgress& value) { progress = value; });
   EXPECT_EQ(progress.files_scanned, 2u);
   EXPECT_EQ(progress.files_hashed, 1u);
+}
+
+TEST(VfsCatalog, HashesChangedFilesWithAvailableCpuWorkers)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path overwrite = temp.path() / "overwrite";
+  fs::create_directories(overwrite);
+
+  constexpr unsigned int fileCount = 16;
+  for (unsigned int index = 0; index < fileCount; ++index) {
+    writeFile(data / ("changed-" + std::to_string(index) + ".bin"),
+              "changed file " + std::to_string(index));
+  }
+
+  VfsCatalog catalog(temp.path() / "catalog.sqlite");
+  VfsCatalogProgress first;
+  catalog.reconcileAndBuild(
+      data.string(), {}, overwrite.string(), true,
+      [&](const VfsCatalogProgress& progress) { first = progress; });
+
+  const uint64_t expectedWorkers = std::min<uint64_t>(
+      fileCount, std::max(1u, std::thread::hardware_concurrency()));
+  EXPECT_EQ(first.files_hashed, fileCount);
+  EXPECT_EQ(first.hash_workers, expectedWorkers);
+
+  VfsCatalogProgress warm;
+  catalog.reconcileAndBuild(
+      data.string(), {}, overwrite.string(), true,
+      [&](const VfsCatalogProgress& progress) { warm = progress; });
+  EXPECT_EQ(warm.files_hashed, 0u);
+  EXPECT_EQ(warm.hash_workers, 0u);
 }
 
 TEST(VfsCatalog, ForceRefreshHashesControlledWritesAndUpdatesMerkleRoot)
@@ -289,6 +330,8 @@ TEST(VfsCatalog, CatalogsBsaAndBa2MembersAndReusesContentManifests)
   EXPECT_EQ(firstProgress.archives_indexed, 2u);
   EXPECT_EQ(firstProgress.archives_reused, 0u);
   EXPECT_EQ(firstProgress.archive_errors, 0u);
+  EXPECT_GE(firstProgress.archive_workers, 1u);
+  EXPECT_LE(firstProgress.archive_workers, 4u);
   ASSERT_NE(first.archive_member_index, nullptr);
   EXPECT_TRUE(first.archive_member_index->complete());
   EXPECT_EQ(first.archive_member_index->archiveCount(), 2u);
@@ -305,6 +348,7 @@ TEST(VfsCatalog, CatalogsBsaAndBa2MembersAndReusesContentManifests)
   EXPECT_EQ(secondProgress.archives_indexed, 0u);
   EXPECT_EQ(secondProgress.archives_reused, 2u);
   EXPECT_EQ(secondProgress.archive_errors, 0u);
+  EXPECT_EQ(secondProgress.archive_workers, 0u);
   ASSERT_NE(second.archive_member_index, nullptr);
   EXPECT_TRUE(second.archive_member_index->complete());
   EXPECT_TRUE(second.archive_member_index->mightContain("textures/grass/test.dds"));
