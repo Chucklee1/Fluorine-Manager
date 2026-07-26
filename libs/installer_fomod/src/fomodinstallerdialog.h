@@ -209,7 +209,8 @@ class FomodInstallerDialog : public QDialog, public IConditionTester
 public:
   explicit FomodInstallerDialog(
       InstallerFomod* installer, const MOBase::GuessedValue<QString>& modName,
-      const QString& fomodPath, const QString& fomodDirName,
+      const QString& extractionRoot, const QString& fomodPath,
+      const QString& fomodDirName,
       const std::function<MOBase::IPluginList::PluginStates(const QString&)>& fileCheck,
       QWidget* parent = 0);
   ~FomodInstallerDialog();
@@ -452,6 +453,7 @@ private:
 
   int m_ModID;
 
+  QString m_ExtractionRoot;
   QString m_FomodPath;
   QString m_FomodDirName;
   bool m_Manual;

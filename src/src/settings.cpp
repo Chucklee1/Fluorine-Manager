@@ -250,18 +250,38 @@ void Settings::setUsePrereleases(bool b)
 
 QString Settings::fluorineUpdateChannel() const
 {
-#if FLUORINE_IS_BETA_BUILD
-  const QString defaultChannel = QStringLiteral("beta");
+#if FLUORINE_IS_NIGHTLY_BUILD
+  const QString defaultChannel = QStringLiteral("nightly");
 #else
   const QString defaultChannel = QStringLiteral("stable");
 #endif
-  return get<QString>(m_Settings, "Settings", "fluorine_update_channel",
-                      defaultChannel);
+  const QString saved = get<QString>(
+      m_Settings, "Settings", "fluorine_update_channel", defaultChannel);
+  // Migrate the old name without silently moving rolling-build users back to
+  // stable updates.
+  return saved.compare(QStringLiteral("beta"), Qt::CaseInsensitive) == 0
+             ? QStringLiteral("nightly")
+             : saved;
 }
 
 void Settings::setFluorineUpdateChannel(const QString& channel)
 {
-  set(m_Settings, "Settings", "fluorine_update_channel", channel);
+  const QString normalized =
+      channel.compare(QStringLiteral("beta"), Qt::CaseInsensitive) == 0
+          ? QStringLiteral("nightly")
+          : channel;
+  set(m_Settings, "Settings", "fluorine_update_channel", normalized);
+}
+
+QString Settings::fluorineLastPromptedUpdate() const
+{
+  return get<QString>(m_Settings, "Settings",
+                      "fluorine_last_prompted_update", QString());
+}
+
+void Settings::setFluorineLastPromptedUpdate(const QString& updateId)
+{
+  set(m_Settings, "Settings", "fluorine_last_prompted_update", updateId);
 }
 
 bool Settings::profileLocalInis() const

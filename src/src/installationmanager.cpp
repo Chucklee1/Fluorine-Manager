@@ -48,6 +48,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSettings>
+#include <QTemporaryDir>
 #include <QTextDocument>
 #include <QtConcurrent/QtConcurrentRun>
 
@@ -281,6 +282,12 @@ QString InstallationManager::extractFile(std::shared_ptr<const FileTreeEntry> en
 QStringList InstallationManager::extractFiles(
     std::vector<std::shared_ptr<const FileTreeEntry>> const& entries, bool silent)
 {
+  if (!m_TempExtractionDirectory || !m_TempExtractionDirectory->isValid()) {
+    throw MyException(tr("Temporary extraction directory is unavailable."));
+  }
+
+  const QString extractionRoot = m_TempExtractionDirectory->path();
+
   // Remove the directory since mapToArchive would add them:
   std::vector<std::shared_ptr<const FileTreeEntry>> files;
   std::copy_if(entries.begin(), entries.end(), std::back_inserter(files),
@@ -296,11 +303,11 @@ QStringList InstallationManager::extractFiles(
 
   for (auto& entry : files) {
     auto path = entry->path();
-    result.append(QDir::tempPath().append("/").append(path));
+    result.append(QDir(extractionRoot).filePath(path));
     m_TempFilesToDelete.insert(path);
   }
 
-  if (!extractFiles(QDir::tempPath(), tr("Extracting files"), false, silent)) {
+  if (!extractFiles(extractionRoot, tr("Extracting files"), false, silent)) {
     return {};
   }
 
@@ -310,9 +317,13 @@ QStringList InstallationManager::extractFiles(
 QString
 InstallationManager::createFile(std::shared_ptr<const MOBase::FileTreeEntry> entry)
 {
+  if (!m_TempExtractionDirectory || !m_TempExtractionDirectory->isValid()) {
+    throw MyException(tr("Temporary extraction directory is unavailable."));
+  }
+
   // Use QTemporaryFile to create the temporary file with the given template:
   QTemporaryFile tempFile(
-      QDir::cleanPath(QDir::tempPath() + QDir::separator() + "mo2-install"));
+      QDir(m_TempExtractionDirectory->path()).filePath("mo2-install-XXXXXX"));
 
   // Turn-off autoRemove otherwise the file is deleted when destructor is called:
   tempFile.setAutoRemove(false);
@@ -327,7 +338,8 @@ InstallationManager::createFile(std::shared_ptr<const MOBase::FileTreeEntry> ent
   const QString absPath = tempFile.fileName();
 
   m_CreatedFiles[entry] = absPath;
-  m_TempFilesToDelete.insert(QDir::temp().relativeFilePath(absPath));
+  m_TempFilesToDelete.insert(
+      QDir(m_TempExtractionDirectory->path()).relativeFilePath(absPath));
 
   // Returns the path with native separators:
   return QDir::toNativeSeparators(absPath);
@@ -601,6 +613,9 @@ void InstallationManager::postInstallCleanup()
   // Close the archive:
   m_ArchiveHandler->close();
 
+  const QString extractionRoot =
+      m_TempExtractionDirectory ? m_TempExtractionDirectory->path() : QString();
+
   // directories we may want to remove. sorted from longest to shortest to ensure we
   // remove subdirectories first.
   auto longestFirst = [](const QString& LHS, const QString& RHS) -> bool {
@@ -617,7 +632,7 @@ void InstallationManager::postInstallCleanup()
   // TODO: this doesn't yet remove directories. Also, the files may be left there if
   // this point isn't reached
   for (const QString& tempFile : m_TempFilesToDelete) {
-    QFileInfo const fileInfo(QDir::tempPath() + "/" + tempFile);
+    QFileInfo const fileInfo(QDir(extractionRoot).filePath(tempFile));
     if (fileInfo.exists()) {
       if (!fileInfo.isReadable() || !fileInfo.isWritable()) {
         QFile::setPermissions(fileInfo.absoluteFilePath(),
@@ -637,6 +652,11 @@ void InstallationManager::postInstallCleanup()
   for (const QString& dir : directoriesToRemove) {
     QDir().rmdir(dir);
   }
+
+  // QTemporaryDir removes any paths an installer did not explicitly track,
+  // including differently-cased files. This prevents one installation from
+  // leaking FOMOD metadata into the next on case-sensitive filesystems.
+  m_TempExtractionDirectory.reset();
 }
 
 InstallationResult InstallationManager::install(const QString& fileName,
@@ -653,6 +673,15 @@ InstallationResult InstallationManager::install(const QString& fileName,
     reportError(tr("File format \"%1\" not supported").arg(fileInfo.suffix()));
     return {IPluginInstaller::RESULT_FAILED};
   }
+
+  m_TempExtractionDirectory = std::make_unique<QTemporaryDir>(
+      QDir::temp().filePath(QStringLiteral("fluorine-install-XXXXXX")));
+  if (!m_TempExtractionDirectory->isValid()) {
+    reportError(tr("Unable to create a private temporary directory for installation."));
+    m_TempExtractionDirectory.reset();
+    return {IPluginInstaller::RESULT_FAILED};
+  }
+  ON_BLOCK_EXIT(std::bind(&InstallationManager::postInstallCleanup, this));
 
   modName.setFilter(&fixDirectoryName);
 
@@ -768,8 +797,6 @@ InstallationResult InstallationManager::install(const QString& fileName,
                getErrorString(m_ArchiveHandler->getLastError()),
                m_ArchiveHandler->getLastError());
   }
-  ON_BLOCK_EXIT(std::bind(&InstallationManager::postInstallCleanup, this));
-
   std::shared_ptr<IFileTree> filesTree =
       archiveOpen ? ArchiveFileTree::makeTree(*m_ArchiveHandler) : nullptr;
 

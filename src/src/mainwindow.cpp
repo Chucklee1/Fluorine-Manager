@@ -39,6 +39,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include "executableslist.h"
 #include "filedialogmemory.h"
 #include "filterlist.h"
+#include "fluorineupdateinstaller.h"
 #include "fluorineupdater.h"
 #include "guessedvalue.h"
 #include "imodinterface.h"
@@ -509,9 +510,24 @@ MainWindow::MainWindow(Settings& settings, OrganizerCore& organizerCore,
   // no-op'd, so this is what actually drives the statusbar update badge.
   if (auto* fu = m_OrganizerCore.fluorineUpdater()) {
     connect(fu, &FluorineUpdater::updateAvailable, this,
-            [this](const FluorineUpdater::ReleaseInfo&) {
+            [this](const FluorineUpdater::ReleaseInfo& info) {
               m_FluorineUpdatePending = true;
               updateAvailable();
+
+              const QString releaseId =
+                  FluorineUpdater::channelToString(info.channel) +
+                  QStringLiteral(":") +
+                  (info.channel == FluorineUpdater::Channel::Nightly
+                       ? info.buildNumber
+                       : info.tagName);
+              Settings& settings = m_OrganizerCore.settings();
+              if (!releaseId.endsWith(QLatin1Char(':')) &&
+                  settings.fluorineLastPromptedUpdate() != releaseId) {
+                settings.setFluorineLastPromptedUpdate(releaseId);
+                QTimer::singleShot(
+                    0, this,
+                    [this, info]() { showFluorineUpdatePrompt(info); });
+              }
             });
   }
 
@@ -706,21 +722,7 @@ MainWindow::~MainWindow()
 void MainWindow::updateWindowTitle(const APIUserAccount& user)
 {
   //"\xe2\x80\x93" is an "em dash", a longer "-"
-#if FLUORINE_IS_BETA_BUILD
-  // Beta builds: "<semver>-beta @ <hash>" so users can see both the line
-  // they're on (e.g. 0.2.0) and the exact commit. Plain "beta @ <hash>"
-  // hid the version, making it impossible to tell at a glance whether a
-  // user was running 0.1.x or 0.2.x betas.
-  const QString commitShort = QStringLiteral(FLUORINE_BUILD_COMMIT);
-  QString versionLabel = QStringLiteral(FLUORINE_VERSION_STRING) +
-                         QStringLiteral("-beta");
-  if (!commitShort.isEmpty()) {
-    versionLabel += QStringLiteral(" @ ") + commitShort;
-  }
-#else
-  const QString versionLabel =
-      m_OrganizerCore.getVersion().string(Version::FormatCondensed);
-#endif
+  const QString versionLabel = QStringLiteral(FLUORINE_DISPLAY_VERSION);
 
   QString title =
       QString("%1 \xe2\x80\x93 Fluorine Manager %2")
@@ -3182,6 +3184,84 @@ void MainWindow::updateAvailable()
   ui->actionUpdate->setEnabled(true);
   ui->actionUpdate->setToolTip(tr("Update available"));
   ui->statusBar->setUpdateAvailable(true);
+}
+
+void MainWindow::showFluorineUpdatePrompt(
+    const FluorineUpdater::ReleaseInfo& info)
+{
+  const QString availableVersion =
+      !info.versionString.isEmpty()
+          ? info.versionString
+          : (!info.name.isEmpty() ? info.name : info.tagName);
+
+  QMessageBox prompt(this);
+  prompt.setIcon(QMessageBox::Information);
+  prompt.setWindowTitle(tr("Fluorine Manager update available"));
+  prompt.setText(
+      tr("Fluorine Manager %1 is available.").arg(availableVersion));
+  prompt.setInformativeText(
+      tr("Current build: %1\nChannel: %2")
+          .arg(QStringLiteral(FLUORINE_DISPLAY_VERSION),
+               FluorineUpdater::channelToString(info.channel)));
+
+  QPushButton* installButton = prompt.addButton(
+      tr("Install && restart"), QMessageBox::AcceptRole);
+  installButton->setEnabled(!info.downloadUrl.isEmpty());
+  QPushButton* releaseButton = nullptr;
+  if (!info.htmlUrl.isEmpty()) {
+    releaseButton =
+        prompt.addButton(tr("View release"), QMessageBox::ActionRole);
+  }
+  prompt.addButton(tr("Later"), QMessageBox::RejectRole);
+  prompt.setDefaultButton(installButton);
+  prompt.exec();
+
+  if (releaseButton != nullptr && prompt.clickedButton() == releaseButton) {
+    QDesktopServices::openUrl(QUrl(info.htmlUrl));
+    return;
+  }
+  if (prompt.clickedButton() != installButton) {
+    return;
+  }
+
+  auto* progress = new QProgressDialog(
+      tr("Downloading update…"), QString(), 0, 100, this);
+  progress->setWindowTitle(tr("Installing Fluorine Manager update"));
+  progress->setWindowModality(Qt::WindowModal);
+  progress->setCancelButton(nullptr);
+  progress->setAutoClose(false);
+  progress->setAutoReset(false);
+  progress->setValue(0);
+  progress->show();
+
+  auto* installer = new FluorineUpdateInstaller(this);
+  connect(installer, &FluorineUpdateInstaller::statusChanged, progress,
+          [progress](const QString& status) {
+            progress->setLabelText(status);
+            if (status.contains(QObject::tr("Extracting")) ||
+                status.contains(QObject::tr("Restarting"))) {
+              progress->setRange(0, 0);
+            }
+          });
+  connect(installer, &FluorineUpdateInstaller::downloadProgress, progress,
+          [progress](qint64 received, qint64 total) {
+            if (total > 0) {
+              progress->setRange(0, 100);
+              progress->setValue(
+                  static_cast<int>((received * 100) / total));
+            } else {
+              progress->setRange(0, 0);
+            }
+          });
+  connect(installer, &FluorineUpdateInstaller::failed, this,
+          [this, installer, progress](const QString& reason) {
+            progress->close();
+            progress->deleteLater();
+            installer->deleteLater();
+            QMessageBox::warning(
+                this, tr("Update installation failed"), reason);
+          });
+  installer->install(info);
 }
 
 void MainWindow::motdReceived(const QString& motd)

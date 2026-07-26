@@ -31,7 +31,7 @@ QString buildApiUrl(FluorineUpdater::Channel c)
           .arg(kRepoOwner, kRepoProject);
   return c == FluorineUpdater::Channel::Stable
              ? base + QStringLiteral("/latest")
-             : base + QStringLiteral("/tags/beta");
+             : base + QStringLiteral("/tags/nightly");
 }
 
 // Returns {major, minor, patch}; components that fail to parse stay at -1.
@@ -82,8 +82,8 @@ FluorineUpdater::~FluorineUpdater() = default;
 
 FluorineUpdater::Channel FluorineUpdater::buildChannel()
 {
-#if FLUORINE_IS_BETA_BUILD
-  return Channel::Beta;
+#if FLUORINE_IS_NIGHTLY_BUILD
+  return Channel::Nightly;
 #else
   return Channel::Stable;
 #endif
@@ -91,14 +91,16 @@ FluorineUpdater::Channel FluorineUpdater::buildChannel()
 
 QString FluorineUpdater::channelToString(Channel c)
 {
-  return c == Channel::Beta ? QStringLiteral("beta") : QStringLiteral("stable");
+  return c == Channel::Nightly ? QStringLiteral("nightly")
+                               : QStringLiteral("stable");
 }
 
 FluorineUpdater::Channel FluorineUpdater::channelFromString(const QString& s,
                                                             Channel fallback)
 {
-  if (s.compare(QStringLiteral("beta"), Qt::CaseInsensitive) == 0) {
-    return Channel::Beta;
+  if (s.compare(QStringLiteral("nightly"), Qt::CaseInsensitive) == 0 ||
+      s.compare(QStringLiteral("beta"), Qt::CaseInsensitive) == 0) {
+    return Channel::Nightly;
   }
   if (s.compare(QStringLiteral("stable"), Qt::CaseInsensitive) == 0) {
     return Channel::Stable;
@@ -162,8 +164,8 @@ void FluorineUpdater::onReplyFinished()
   const QJsonObject obj = doc.object();
 
   bool ok = false;
-  if (channel == Channel::Beta) {
-    ok = parseBetaRelease(obj, info);
+  if (channel == Channel::Nightly) {
+    ok = parseNightlyRelease(obj, info);
   } else {
     ok = parseStableRelease(obj, info);
   }
@@ -173,27 +175,41 @@ void FluorineUpdater::onReplyFinished()
     return;
   }
 
-  if (channel == Channel::Beta) {
+  if (channel == Channel::Nightly) {
+    const QString currentBuild   = QStringLiteral(FLUORINE_BUILD_NUMBER);
     const QString currentTs      = QStringLiteral(FLUORINE_BUILD_TIMESTAMP);
     const QString currentCommit  = QStringLiteral(FLUORINE_BUILD_COMMIT);
 
-    // If the fluorine-meta block is missing, fall back to timestamp-only
-    // comparison. If even the timestamp is empty, we can't make a safe
-    // decision — surface as checkFailed so the user knows.
-    if (info.timestamp.isEmpty()) {
+    bool remoteBuildOk = false;
+    bool currentBuildOk = false;
+    const qulonglong remoteBuild = info.buildNumber.toULongLong(&remoteBuildOk);
+    const qulonglong installedBuild =
+        currentBuild.toULongLong(&currentBuildOk);
+
+    if (!remoteBuildOk && info.timestamp.isEmpty()) {
       emit checkFailed(
-          tr("Beta release is missing build metadata; cannot compare"));
+          tr("Nightly release is missing build metadata; cannot compare"));
       return;
     }
 
     const bool sameCommit = !currentCommit.isEmpty() && !info.commit.isEmpty() &&
                             currentCommit == info.commit;
-    const bool sameTimestamp = !currentTs.isEmpty() && currentTs == info.timestamp;
-
-    if (sameCommit || sameTimestamp) {
+    if (sameCommit) {
       emit upToDate(info);
-    } else {
+    } else if (remoteBuildOk && currentBuildOk) {
+      if (remoteBuild > installedBuild) {
+        emit updateAvailable(info);
+      } else {
+        emit upToDate(info);
+      }
+    } else if (!currentTs.isEmpty() && info.timestamp > currentTs) {
       emit updateAvailable(info);
+    } else if (currentBuild.isEmpty() && currentTs.isEmpty()) {
+      // A stable/dev build explicitly checking Nightly has no rolling build
+      // identity, so offer the current Nightly.
+      emit updateAvailable(info);
+    } else {
+      emit upToDate(info);
     }
   } else {
     const QString currentVersion = QStringLiteral(FLUORINE_VERSION_STRING);
@@ -206,10 +222,11 @@ void FluorineUpdater::onReplyFinished()
 }
 
 bool FluorineUpdater::parseStableRelease(const QJsonObject& obj,
-                                         ReleaseInfo& out) 
+                                         ReleaseInfo& out)
 {
   out.tagName = obj.value(QStringLiteral("tag_name")).toString();
   out.name    = obj.value(QStringLiteral("name")).toString();
+  out.releaseNotes = obj.value(QStringLiteral("body")).toString();
   out.htmlUrl = obj.value(QStringLiteral("html_url")).toString();
 
   if (out.tagName.isEmpty()) {
@@ -245,17 +262,19 @@ bool FluorineUpdater::parseStableRelease(const QJsonObject& obj,
   return true;
 }
 
-bool FluorineUpdater::parseBetaRelease(const QJsonObject& obj,
-                                       ReleaseInfo& out) 
+bool FluorineUpdater::parseNightlyRelease(const QJsonObject& obj,
+                                          ReleaseInfo& out)
 {
   out.tagName = obj.value(QStringLiteral("tag_name")).toString();
   out.name    = obj.value(QStringLiteral("name")).toString();
+  out.releaseNotes = obj.value(QStringLiteral("body")).toString();
   out.htmlUrl = obj.value(QStringLiteral("html_url")).toString();
 
   // Extract fluorine-meta block from release body. Format emitted by the CI
   // workflow:
   //   <!-- fluorine-meta
-  //   channel=beta
+  //   channel=nightly
+  //   build_number=<monotonic GitHub Actions run number>
   //   timestamp=YYYYMMDDHHMM
   //   commit=<full sha>
   //   short=<7-char sha>
@@ -263,7 +282,7 @@ bool FluorineUpdater::parseBetaRelease(const QJsonObject& obj,
   const QString body = obj.value(QStringLiteral("body")).toString();
   const int metaStart = body.indexOf(QStringLiteral("<!-- fluorine-meta"));
   if (metaStart < 0) {
-    MOBase::log::debug("beta release body missing fluorine-meta block");
+    MOBase::log::debug("nightly release body missing fluorine-meta block");
     return true;  // partially parsed — let caller surface checkFailed
   }
   const int metaEnd = body.indexOf(QStringLiteral("-->"), metaStart);
@@ -280,14 +299,16 @@ bool FluorineUpdater::parseBetaRelease(const QJsonObject& obj,
     }
     const QString key   = line.left(eq).trimmed();
     const QString value = line.mid(eq + 1).trimmed();
-    if (key == QStringLiteral("timestamp")) {
+    if (key == QStringLiteral("build_number")) {
+      out.buildNumber = value;
+    } else if (key == QStringLiteral("timestamp")) {
       out.timestamp = value;
     } else if (key == QStringLiteral("commit")) {
       out.commit = value;
     }
   }
 
-  // Prefer a .tar.gz asset with "beta" in the name, else any .tar.gz,
+  // Prefer a .tar.gz asset with "nightly" in the name, else any .tar.gz,
   // else fall back to a .zip. GitHub Releases serves whatever we upload,
   // but some CI flows produce zip artifacts; accepting both lets users
   // swap formats without breaking the in-app updater.
@@ -310,7 +331,7 @@ bool FluorineUpdater::parseBetaRelease(const QJsonObject& obj,
     }
     const QString url =
         a.value(QStringLiteral("browser_download_url")).toString();
-    if (name.contains(QStringLiteral("beta"), Qt::CaseInsensitive) &&
+    if (name.contains(QStringLiteral("nightly"), Qt::CaseInsensitive) &&
         !isZip(name)) {
       out.downloadUrl = url;
       break;

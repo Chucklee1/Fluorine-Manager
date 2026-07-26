@@ -26,8 +26,9 @@ fi
 PYTHON_ROOT="$(dirname "$(dirname "${BUILD_PY}")")"
 
 # Forward version/channel settings from the CI workflow (or local overrides).
-# Defaults: stable channel, empty timestamp/commit (CMake fills commit from git).
-FLUORINE_BUILD_CHANNEL="${FLUORINE_BUILD_CHANNEL:-stable}"
+# Defaults: dev channel, empty build metadata (CMake fills commit from git).
+FLUORINE_BUILD_CHANNEL="${FLUORINE_BUILD_CHANNEL:-dev}"
+FLUORINE_BUILD_NUMBER="${FLUORINE_BUILD_NUMBER:-}"
 FLUORINE_BUILD_TIMESTAMP="${FLUORINE_BUILD_TIMESTAMP:-}"
 FLUORINE_BUILD_COMMIT="${FLUORINE_BUILD_COMMIT:-}"
 
@@ -38,6 +39,7 @@ cmake -S . -B build -G Ninja \
     ${PYBIND11_DIR:+-Dpybind11_DIR="${PYBIND11_DIR}"} \
     -DBUILD_PLUGIN_PYTHON=ON \
     -DFLUORINE_BUILD_CHANNEL="${FLUORINE_BUILD_CHANNEL}" \
+    -DFLUORINE_BUILD_NUMBER="${FLUORINE_BUILD_NUMBER}" \
     -DFLUORINE_BUILD_TIMESTAMP="${FLUORINE_BUILD_TIMESTAMP}" \
     -DFLUORINE_BUILD_COMMIT="${FLUORINE_BUILD_COMMIT}" \
     "${CMAKE_EXTRA_ARGS[@]}"

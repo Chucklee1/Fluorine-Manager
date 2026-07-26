@@ -830,11 +830,15 @@ public:
   bool usePrereleases() const;
   void setUsePrereleases(bool b);
 
-  // Fluorine self-update channel: "stable" (tagged releases) or "beta"
-  // (rolling build). Defaults to whichever channel the installed binary
+  // Fluorine self-update channel: "stable" (tagged releases) or "nightly"
+  // (rolling build from main). Defaults to whichever channel the installed binary
   // was built under — set at first launch, mutable via Settings dialog.
   QString fluorineUpdateChannel() const;
   void setFluorineUpdateChannel(const QString& channel);
+
+  // Last release/build for which the automatic update popup was shown.
+  QString fluorineLastPromptedUpdate() const;
+  void setFluorineLastPromptedUpdate(const QString& updateId);
 
   // whether profiles should default to local INIs
   //

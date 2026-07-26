@@ -77,6 +77,10 @@ ${DOCKER} run --rm \
     -e CCACHE_DIR=/ccache \
     -e BUILD_MODE="${BUILD_MODE}" \
     -e BUILD_JOBS="${BUILD_JOBS}" \
+    -e FLUORINE_BUILD_CHANNEL="${FLUORINE_BUILD_CHANNEL:-dev}" \
+    -e FLUORINE_BUILD_NUMBER="${FLUORINE_BUILD_NUMBER:-}" \
+    -e FLUORINE_BUILD_TIMESTAMP="${FLUORINE_BUILD_TIMESTAMP:-}" \
+    -e FLUORINE_BUILD_COMMIT="${FLUORINE_BUILD_COMMIT:-}" \
     -w /src \
     --device /dev/fuse \
     --cap-add SYS_ADMIN \
