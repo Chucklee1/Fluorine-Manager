@@ -77,11 +77,13 @@ bool PagesDescending(QGroupBox* LHS, QGroupBox* RHS)
 
 FomodInstallerDialog::FomodInstallerDialog(
     InstallerFomod* installer, const GuessedValue<QString>& modName,
-    const QString& fomodPath, const QString& fomodDirName,
+    const QString& extractionRoot, const QString& fomodPath,
+    const QString& fomodDirName,
     const std::function<MOBase::IPluginList::PluginStates(const QString&)>& fileCheck,
     QWidget* parent)
     : QDialog(parent), ui(new Ui::FomodInstallerDialog), m_Installer(installer),
-      m_ModName(modName), m_ModID(-1), m_FomodPath(fomodPath),
+      m_ModName(modName), m_ModID(-1), m_ExtractionRoot(extractionRoot),
+      m_FomodPath(fomodPath),
       m_FomodDirName(fomodDirName), m_Manual(false), m_FileCheck(fileCheck),
       m_FileSystemItemSequence()
 {
@@ -161,15 +163,19 @@ static QString joinArchivePath(const QString& base, const QString& child)
   return normalizeArchivePath(QDir(base).filePath(child));
 }
 
-static QString tempArchivePath(const QString& archivePath)
+static QString tempArchivePath(const QString& extractionRoot,
+                               const QString& archivePath)
 {
-  return QDir(QDir::tempPath()).filePath(normalizeArchivePath(archivePath));
+  return QDir(extractionRoot).filePath(normalizeArchivePath(archivePath));
 }
 
-static QString fomodFilePath(const QString& fomodPath, const QString& fomodDirName,
+static QString fomodFilePath(const QString& extractionRoot,
+                             const QString& fomodPath,
+                             const QString& fomodDirName,
                              const QString& fileName)
 {
-  const QString directory = tempArchivePath(joinArchivePath(fomodPath, fomodDirName));
+  const QString directory = tempArchivePath(
+      extractionRoot, joinArchivePath(fomodPath, fomodDirName));
   const QDir dir(directory);
 
   for (const QString& candidate : dir.entryList(QDir::Files | QDir::NoDotAndDotDot)) {
@@ -280,7 +286,8 @@ void FomodInstallerDialog::readXml(QFile& file,
 
 void FomodInstallerDialog::readInfoXml()
 {
-  QFile file(fomodFilePath(m_FomodPath, m_FomodDirName, "info.xml"));
+  QFile file(fomodFilePath(
+      m_ExtractionRoot, m_FomodPath, m_FomodDirName, "info.xml"));
 
   // We don't need a info.xml file, so we just return if we cannot open it:
   if (!file.open(QIODevice::ReadOnly)) {
@@ -291,7 +298,8 @@ void FomodInstallerDialog::readInfoXml()
 
 void FomodInstallerDialog::readModuleConfigXml()
 {
-  QFile file(fomodFilePath(m_FomodPath, m_FomodDirName, "ModuleConfig.xml"));
+  QFile file(fomodFilePath(
+      m_ExtractionRoot, m_FomodPath, m_FomodDirName, "ModuleConfig.xml"));
   if (!file.open(QIODevice::ReadOnly)) {
     throw Exception(tr("%1 missing.").arg(file.fileName()));
   }
@@ -305,8 +313,10 @@ void FomodInstallerDialog::initData(IOrganizer* moInfo)
   // parse provided package information
   readInfoXml();
 
-  QString screenshotPath = tempArchivePath(joinArchivePath(
-      joinArchivePath(m_FomodPath, m_FomodDirName), "screenshot.png"));
+  QString screenshotPath = tempArchivePath(
+      m_ExtractionRoot,
+      joinArchivePath(joinArchivePath(m_FomodPath, m_FomodDirName),
+                      "screenshot.png"));
   if (!QImage(screenshotPath).isNull()) {
     ui->screenshotLabel->setScalableResource(screenshotPath);
     ui->screenshotExpand->setVisible(false);
@@ -681,7 +691,8 @@ void FomodInstallerDialog::highlightControl(QAbstractButton* button)
     QString screenshotFileName = screenshotName.toString();
     if (!screenshotFileName.isEmpty()) {
       QString temp =
-          tempArchivePath(joinArchivePath(m_FomodPath, screenshotFileName));
+          tempArchivePath(m_ExtractionRoot,
+                          joinArchivePath(m_FomodPath, screenshotFileName));
       ui->screenshotLabel->setScalableResource(temp);
       ui->screenshotExpand->setVisible(true);
     } else {
@@ -1729,7 +1740,8 @@ void FomodInstallerDialog::on_screenshotExpand_clicked()
     }
 
     QString temp =
-        tempArchivePath(joinArchivePath(m_FomodPath, screenshotFileName));
+        tempArchivePath(m_ExtractionRoot,
+                        joinArchivePath(m_FomodPath, screenshotFileName));
     carouselImages.push_back(std::pair<QString, QString>(choice->text(), temp));
 
     // Focus the screenshot carousel on the user's selected choice (or the first if

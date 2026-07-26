@@ -50,15 +50,24 @@ jobs:
         id: channel
         run: |
           # Tag push (refs/tags/v*) → stable release.
-          # Branch push / PR / workflow_dispatch → beta rolling build.
+          # Branch push / PR / workflow_dispatch → nightly rolling build.
           # Stable releases are CI-built (not local) so AVX-512 / host CPU
           # flags can never leak into the binary that users download.
+          BASE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "${BASE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION must contain a semantic version, got '${BASE_VERSION}'"
+            exit 1
+          fi
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
             CHANNEL=stable
             VERSION="${GITHUB_REF#refs/tags/v}"
+            if [[ "${VERSION}" != "${BASE_VERSION}" ]]; then
+              echo "::error::Tag v${VERSION} does not match VERSION (${BASE_VERSION})"
+              exit 1
+            fi
           else
-            CHANNEL=beta
-            VERSION=""
+            CHANNEL=nightly
+            VERSION="${BASE_VERSION}"
           fi
           echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -78,6 +87,7 @@ jobs:
             -e CCACHE_MAXSIZE=5G \
             -e BUILD_MODE=tarball \
             -e FLUORINE_BUILD_CHANNEL=${{ steps.channel.outputs.channel }} \
+            -e FLUORINE_BUILD_NUMBER=${{ github.run_number }} \
             -e FLUORINE_BUILD_TIMESTAMP=${{ steps.channel.outputs.timestamp }} \
             -e FLUORINE_BUILD_COMMIT=${{ steps.channel.outputs.commit }} \
             -w /src \
@@ -95,7 +105,9 @@ jobs:
           if [[ "${{ steps.channel.outputs.channel }}" == "stable" ]]; then
             ARCHIVE_NAME="fluorine-manager-${{ steps.channel.outputs.version }}.tar.gz"
           else
-            ARCHIVE_NAME="fluorine-manager-beta.tar.gz"
+            # Fixed name so the rolling release replaces one asset instead of
+            # accumulating a new large tarball on every main push.
+            ARCHIVE_NAME="fluorine-manager-nightly-linux-x86_64.tar.gz"
           fi
           tar czf "${ARCHIVE_NAME}" fluorine-manager/
           echo "archive=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
@@ -110,40 +122,43 @@ jobs:
           if-no-files-found: warn
 
       # -------------------------------------------------------------------
-      # Beta rolling release: every push to main overwrites the `beta` tag's
+      # Nightly rolling release: every push to main overwrites the `nightly` tag's
       # release assets so the in-app updater always sees the latest build
       # without cluttering the release history with new tags.
       # -------------------------------------------------------------------
-      - name: Publish beta rolling release
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.channel.outputs.channel == 'beta'
+      - name: Publish nightly rolling release
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.channel.outputs.channel == 'nightly'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          TAG="beta"
-          BETA_TS="${{ steps.channel.outputs.timestamp }}"
-          BETA_COMMIT="${GITHUB_SHA}"
-          BETA_SHORT="${BETA_COMMIT:0:7}"
-          TITLE="Fluorine Manager beta ${BETA_TS} (${BETA_SHORT})"
+          TAG="nightly"
+          NIGHTLY_TS="${{ steps.channel.outputs.timestamp }}"
+          NIGHTLY_BUILD="${{ github.run_number }}"
+          NIGHTLY_COMMIT="${GITHUB_SHA}"
+          NIGHTLY_SHORT="${NIGHTLY_COMMIT:0:7}"
+          TITLE="Fluorine Manager ${{ steps.channel.outputs.version }} nightly ${NIGHTLY_BUILD} (${NIGHTLY_SHORT})"
           NOTES_FILE="$(mktemp)"
           {
-            echo "Rolling beta build from main @ ${BETA_SHORT}."
+            echo "Rolling Nightly build from main @ ${NIGHTLY_SHORT}."
             echo ""
-            echo "- Channel: beta"
-            echo "- Timestamp (UTC): ${BETA_TS}"
-            echo "- Commit: ${BETA_COMMIT}"
+            echo "- Version: ${{ steps.channel.outputs.version }}-nightly.${NIGHTLY_BUILD}"
+            echo "- Channel: nightly"
+            echo "- Timestamp (UTC): ${NIGHTLY_TS}"
+            echo "- Commit: ${NIGHTLY_COMMIT}"
             echo ""
-            echo "This release is overwritten with each successful CI build on main."
+            echo "This prerelease is overwritten with each successful CI build on main."
             echo "For stable releases, see tagged v* releases."
             echo ""
             # Machine-parseable block used by the in-app updater to decide
-            # whether the currently-installed beta build already matches. Do
+            # whether the currently-installed Nightly build already matches. Do
             # not remove or reformat — the updater reads it line-by-line.
             echo "<!-- fluorine-meta"
-            echo "channel=beta"
-            echo "timestamp=${BETA_TS}"
-            echo "commit=${BETA_COMMIT}"
-            echo "short=${BETA_SHORT}"
+            echo "channel=nightly"
+            echo "build_number=${NIGHTLY_BUILD}"
+            echo "timestamp=${NIGHTLY_TS}"
+            echo "commit=${NIGHTLY_COMMIT}"
+            echo "short=${NIGHTLY_SHORT}"
             echo "-->"
           } > "${NOTES_FILE}"
 
@@ -162,6 +177,41 @@ jobs:
             gh release create "${TAG}" "${archive_path}" \
               --title "${TITLE}" \
               --notes-file "${NOTES_FILE}" \
+              --prerelease
+          fi
+
+          # Compatibility bridge for installations built before the channel
+          # was renamed. Their updater is hardcoded to /tags/beta, so mirror
+          # Nightly there until the 0.3.x line is retired.
+          LEGACY_TAG="beta"
+          LEGACY_ARCHIVE="$(dirname "${archive_path}")/fluorine-manager-beta.tar.gz"
+          cp "${archive_path}" "${LEGACY_ARCHIVE}"
+          LEGACY_NOTES_FILE="$(mktemp)"
+          {
+            echo "The rolling beta channel was renamed to Nightly."
+            echo "Install this build once and Fluorine will migrate the saved channel automatically."
+            echo ""
+            echo "<!-- fluorine-meta"
+            echo "channel=beta"
+            echo "build_number=${NIGHTLY_BUILD}"
+            echo "timestamp=${NIGHTLY_TS}"
+            echo "commit=${NIGHTLY_COMMIT}"
+            echo "short=${NIGHTLY_SHORT}"
+            echo "-->"
+          } > "${LEGACY_NOTES_FILE}"
+
+          git tag -f "${LEGACY_TAG}" "${GITHUB_SHA}"
+          git push -f origin "refs/tags/${LEGACY_TAG}"
+          if gh release view "${LEGACY_TAG}" >/dev/null 2>&1; then
+            gh release edit "${LEGACY_TAG}" \
+              --title "Fluorine Manager Nightly compatibility bridge" \
+              --notes-file "${LEGACY_NOTES_FILE}" \
+              --prerelease
+            gh release upload "${LEGACY_TAG}" "${LEGACY_ARCHIVE}" --clobber
+          else
+            gh release create "${LEGACY_TAG}" "${LEGACY_ARCHIVE}" \
+              --title "Fluorine Manager Nightly compatibility bridge" \
+              --notes-file "${LEGACY_NOTES_FILE}" \
               --prerelease
           fi
 
@@ -202,7 +252,6 @@ jobs:
             else
               gh release edit "${TAG}" \
                 --title "${TITLE}" \
-                --notes-file "${NOTES_FILE}" \
                 --draft=false \
                 --prerelease=false \
                 --latest

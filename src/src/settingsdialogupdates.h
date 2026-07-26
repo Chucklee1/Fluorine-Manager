@@ -13,6 +13,7 @@ class QProgressBar;
 class QPushButton;
 
 class FluorineUpdater;
+class FluorineUpdateInstaller;
 
 // Dedicated Settings > Updates tab. Hosts the Fluorine self-update
 // preferences (channel selector, startup check toggle) plus an explicit
@@ -38,6 +39,7 @@ private:
   QLabel* m_statusLabel          = nullptr;
   QProgressBar* m_progressBar    = nullptr;
   FluorineUpdater* m_updater     = nullptr;
+  FluorineUpdateInstaller* m_installer = nullptr;
   FluorineUpdater::ReleaseInfo m_pendingUpdate{};
   bool m_updatePending           = false;
 };

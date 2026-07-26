@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include <QImageReader>
+#include <QDir>
 #include <QStringList>
 #include <QtPlugin>
 
@@ -219,14 +220,34 @@ InstallerFomod::install(GuessedValue<QString>& modName,
                         std::shared_ptr<IFileTree>& tree, QString& version, int& modID)
 {
   auto installerFiles = buildFomodTree(tree);
-  if (manager()->extractFiles(installerFiles).size() == installerFiles.size()) {
+  const QStringList extractedFiles = manager()->extractFiles(installerFiles);
+  if (extractedFiles.size() == installerFiles.size()) {
     try {
       std::shared_ptr<const IFileTree> fomodTree = findFomodDirectory(tree);
+
+      QString extractionRoot;
+      for (qsizetype i = 0; i < extractedFiles.size(); ++i) {
+        QString relativePath =
+            QDir::fromNativeSeparators(installerFiles[i]->path());
+        relativePath.replace(QLatin1Char('\\'), QLatin1Char('/'));
+        relativePath = QDir::cleanPath(relativePath);
+        const QString absolutePath =
+            QDir::cleanPath(QDir::fromNativeSeparators(extractedFiles[i]));
+        const QString suffix = QStringLiteral("/") + relativePath;
+        if (absolutePath.endsWith(suffix)) {
+          extractionRoot =
+              absolutePath.left(absolutePath.size() - suffix.size());
+          break;
+        }
+      }
+      if (extractionRoot.isEmpty()) {
+        throw Exception(tr("Unable to locate extracted FOMOD files."));
+      }
 
       QString fomodPath = fomodTree->parent()->path("/");
       QString fomodDirName = fomodTree->name();
       FomodInstallerDialog dialog(
-          this, modName, fomodPath, fomodDirName,
+          this, modName, extractionRoot, fomodPath, fomodDirName,
           std::bind(&InstallerFomod::fileState, this, std::placeholders::_1));
       dialog.initData(m_MOInfo);
       if (!dialog.getVersion().isEmpty()) {

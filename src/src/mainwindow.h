@@ -28,6 +28,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <uibase/tutorialcontrol.h>
 
 #include "delayedfilewriter.h"
+#include "fluorineupdater.h"
 #include "iuserinterface.h"
 #include "modinfo.h"
 #include "modlistbypriorityproxy.h"
@@ -246,6 +247,7 @@ private:
 
   void toggleMO2EndorseState();
   void toggleUpdateAction();
+  void showFluorineUpdatePrompt(const FluorineUpdater::ReleaseInfo& info);
 
   // update info
   struct NxmUpdateInfoData

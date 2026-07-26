@@ -31,10 +31,13 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include <QProgressDialog>
 
 #include <map>
+#include <memory>
 #include <set>
 
 #include "modinfo.h"
 #include "plugincontainer.h"
+
+class QTemporaryDir;
 
 // contains installation result from the manager, internal class
 // for MO2 that is not forwarded to plugin
@@ -361,6 +364,7 @@ private:
   // paths to temporary files.
   std::map<std::shared_ptr<const MOBase::FileTreeEntry>, QString> m_CreatedFiles;
   std::set<QString> m_TempFilesToDelete;
+  std::unique_ptr<QTemporaryDir> m_TempExtractionDirectory;
 };
 
 #endif  // INSTALLATIONMANAGER_H

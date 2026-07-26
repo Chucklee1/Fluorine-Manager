@@ -131,8 +131,8 @@ Version createVersionInfo()
 {
   // Fluorine Manager version is the user-facing one. The numeric components
   // are injected by CMake from top-level FLUORINE_VERSION_* variables.
-#if FLUORINE_IS_BETA_BUILD
-  // Beta builds tag themselves as Development pre-releases so the update
+#if FLUORINE_IS_NIGHTLY_BUILD
+  // Nightly builds tag themselves as Development pre-releases so the update
   // checker can distinguish them from stable tags when comparing versions.
   return Version(FLUORINE_VERSION_MAJOR, FLUORINE_VERSION_MINOR,
                  FLUORINE_VERSION_PATCH, 0, {Version::Development});

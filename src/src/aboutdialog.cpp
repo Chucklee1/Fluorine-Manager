@@ -79,13 +79,13 @@ AboutDialog::AboutDialog(const QString& version, QWidget* parent)
   addLicense("DXTex Headers", LICENSE_DXTEX);
   addLicense("Valve File VDF Reader", LICENSE_VDF);
 
-  // Show Fluorine Manager's own version (e.g. "0.1.4" stable or "0.1.4B202604231800"
-  // for beta builds) instead of the upstream MO2 engine version. The incoming
+  // Show Fluorine Manager's own version instead of the upstream MO2 engine
+  // version. The incoming
   // `version` parameter is the engine version string and is retained on the
   // revision line for reference.
   QString displayVersion = QStringLiteral(FLUORINE_DISPLAY_VERSION);
-  if (FLUORINE_IS_BETA_BUILD) {
-    displayVersion += QStringLiteral(" (beta)");
+  if (FLUORINE_IS_NIGHTLY_BUILD) {
+    displayVersion += QStringLiteral(" (nightly)");
   }
   ui->nameLabel->setText(
       QString("<span style=\"font-size:12pt; font-weight:600;\">%1 %2</span>")

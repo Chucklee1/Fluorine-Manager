@@ -4,23 +4,42 @@ project(ModOrganizer2 VERSION 2.5.3 LANGUAGES C CXX)
 # ---------------------------------------------------------------------------
 # Fluorine Manager version (distinct from the MO2 engine version above).
 # ---------------------------------------------------------------------------
-set(FLUORINE_VERSION_MAJOR 0)
-set(FLUORINE_VERSION_MINOR 3)
-set(FLUORINE_VERSION_PATCH 1)
-set(FLUORINE_BUILD_CHANNEL "stable" CACHE STRING
-    "Build channel: 'stable' for tagged releases, 'beta' for rolling CI builds")
+file(STRINGS "${CMAKE_SOURCE_DIR}/VERSION" _FLUORINE_VERSION_FILE LIMIT_COUNT 1)
+set(FLUORINE_VERSION "${_FLUORINE_VERSION_FILE}" CACHE STRING
+    "Fluorine Manager base semantic version")
+if(NOT FLUORINE_VERSION MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)$")
+    message(FATAL_ERROR
+        "FLUORINE_VERSION must be a semantic version such as 0.3.2; got '${FLUORINE_VERSION}'")
+endif()
+set(FLUORINE_VERSION_MAJOR "${CMAKE_MATCH_1}")
+set(FLUORINE_VERSION_MINOR "${CMAKE_MATCH_2}")
+set(FLUORINE_VERSION_PATCH "${CMAKE_MATCH_3}")
+
+set(FLUORINE_BUILD_CHANNEL "dev" CACHE STRING
+    "Build channel: 'stable' for tags, 'nightly' for main CI, or 'dev' locally")
+set_property(CACHE FLUORINE_BUILD_CHANNEL PROPERTY STRINGS dev nightly stable)
+set(FLUORINE_BUILD_NUMBER "" CACHE STRING
+    "Monotonically increasing CI run number used to order nightly builds")
 set(FLUORINE_BUILD_TIMESTAMP "" CACHE STRING
-    "UTC timestamp (YYYYMMDDHHMM) appended to beta builds after a 'B' suffix")
+    "UTC timestamp (YYYYMMDDHHMM) recorded for nightly builds")
 set(FLUORINE_BUILD_COMMIT "" CACHE STRING
     "Short git commit SHA for the build, embedded in the About dialog")
 
-if(FLUORINE_BUILD_CHANNEL STREQUAL "beta")
-    set(FLUORINE_IS_BETA_BUILD 1)
+if(FLUORINE_BUILD_CHANNEL STREQUAL "nightly")
+    set(FLUORINE_IS_NIGHTLY_BUILD 1)
     if(FLUORINE_BUILD_TIMESTAMP STREQUAL "")
         string(TIMESTAMP FLUORINE_BUILD_TIMESTAMP "%Y%m%d%H%M" UTC)
     endif()
+    if(FLUORINE_BUILD_NUMBER STREQUAL "")
+        set(FLUORINE_BUILD_NUMBER "${FLUORINE_BUILD_TIMESTAMP}")
+    endif()
+elseif(FLUORINE_BUILD_CHANNEL STREQUAL "stable" OR
+       FLUORINE_BUILD_CHANNEL STREQUAL "dev")
+    set(FLUORINE_IS_NIGHTLY_BUILD 0)
 else()
-    set(FLUORINE_IS_BETA_BUILD 0)
+    message(FATAL_ERROR
+        "Unknown FLUORINE_BUILD_CHANNEL '${FLUORINE_BUILD_CHANNEL}'; "
+        "expected dev, nightly, or stable")
 endif()
 
 if(FLUORINE_BUILD_COMMIT STREQUAL "" AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
@@ -35,13 +54,27 @@ if(FLUORINE_BUILD_COMMIT STREQUAL "" AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
     endif()
 endif()
 
+set(FLUORINE_DISPLAY_VERSION "${FLUORINE_VERSION}")
+if(FLUORINE_BUILD_CHANNEL STREQUAL "nightly")
+    set(FLUORINE_DISPLAY_VERSION
+        "${FLUORINE_VERSION}-nightly.${FLUORINE_BUILD_NUMBER}")
+    if(NOT FLUORINE_BUILD_COMMIT STREQUAL "")
+        string(APPEND FLUORINE_DISPLAY_VERSION "+${FLUORINE_BUILD_COMMIT}")
+    endif()
+elseif(FLUORINE_BUILD_CHANNEL STREQUAL "dev")
+    set(FLUORINE_DISPLAY_VERSION "${FLUORINE_VERSION}-dev")
+    if(NOT FLUORINE_BUILD_COMMIT STREQUAL "")
+        string(APPEND FLUORINE_DISPLAY_VERSION "+${FLUORINE_BUILD_COMMIT}")
+    endif()
+endif()
+
 configure_file(
     "${CMAKE_SOURCE_DIR}/src/src/fluorine_build_info.h.in"
     "${CMAKE_BINARY_DIR}/generated/fluorine_build_info.h"
     @ONLY)
 include_directories("${CMAKE_BINARY_DIR}/generated")
 
-message(STATUS "[Fluorine] Version: ${FLUORINE_VERSION_MAJOR}.${FLUORINE_VERSION_MINOR}.${FLUORINE_VERSION_PATCH} channel=${FLUORINE_BUILD_CHANNEL} timestamp=${FLUORINE_BUILD_TIMESTAMP} commit=${FLUORINE_BUILD_COMMIT}")
+message(STATUS "[Fluorine] Version: ${FLUORINE_DISPLAY_VERSION} channel=${FLUORINE_BUILD_CHANNEL} timestamp=${FLUORINE_BUILD_TIMESTAMP} commit=${FLUORINE_BUILD_COMMIT}")
 
 if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
