@@ -302,7 +302,10 @@ QStringList InstallationManager::extractFiles(
   QStringList result;
 
   for (auto& entry : files) {
-    auto path = entry->path();
+    // FileTreeEntry paths default to Windows separators. Use archive-style
+    // separators here so the returned path names the file actually extracted
+    // on case-sensitive Unix filesystems.
+    auto path = entry->path("/");
     result.append(QDir(extractionRoot).filePath(path));
     m_TempFilesToDelete.insert(path);
   }
