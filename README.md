@@ -67,6 +67,7 @@ new-generation publication remain serialized and crash-safe.
   - `libstdc++`
   - `libX11`
   - `libxkbcommon`
+  - `wayland` (if using wayland)
 
 On most distros these are already present or installable via your package manager.
 
