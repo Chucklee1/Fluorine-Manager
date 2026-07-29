@@ -731,25 +731,6 @@ void ModListView::forceHeaderVisibilityRefresh()
   }
 }
 
-bool ModListView::headerStateLooksBroken() const
-{
-  int visibleCount = 0;
-  int tinyCount    = 0;
-
-  for (int column = 0; column <= ModList::COL_LASTCOLUMN; ++column) {
-    if (header()->isSectionHidden(column)) {
-      continue;
-    }
-
-    ++visibleCount;
-    if (header()->sectionSize(column) < 50) {
-      ++tinyCount;
-    }
-  }
-
-  return visibleCount >= 8 && tinyCount >= visibleCount - 1;
-}
-
 void ModListView::syncColumnVisibilityFromHeader()
 {
   if (m_sortProxy == nullptr) {
@@ -934,12 +915,9 @@ void ModListView::restoreState(const Settings& s)
   m_restoringHeaderState = true;
   const bool headerRestored = s.geometry().restoreState(header());
   m_restoringHeaderState = false;
-  if (headerRestored && !headerStateLooksBroken()) {
+  if (headerRestored) {
     forceHeaderVisibilityRefresh();
   } else {
-    if (headerRestored) {
-      log::warn("discarding broken mod list header state");
-    }
     applyDefaultHeaderState();
   }
 

@@ -320,7 +320,6 @@ private:  // private functions
   void updateGroupByProxy();
   void applyDefaultHeaderState();
   void forceHeaderVisibilityRefresh();
-  bool headerStateLooksBroken() const;
   void syncColumnVisibilityFromHeader();
 
 public:  // member variables

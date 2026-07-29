@@ -836,8 +836,7 @@ void GeometrySettings::saveState(const QHeaderView* w)
 bool GeometrySettings::restoreState(QHeaderView* w) const
 {
   if (auto v = getOptional<QByteArray>(m_Settings, "Geometry", stateSettingName(w))) {
-    w->restoreState(*v);
-    return true;
+    return w->restoreState(*v);
   }
 
   return false;
