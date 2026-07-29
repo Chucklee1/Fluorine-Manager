@@ -20,7 +20,7 @@ class KingdomComeDeliverance2Game(BasicGame):
     GameNexusName = "kingdomcomedeliverance2"
     GameNexusId = 7286
     GameSteamId = [1771300]
-    GameBinary = "bin/Win64MasterMasterSteamPGO/KingdomCome.exe"
+    GameBinary = "Bin/Win64MasterMasterSteamPGO/KingdomCome.exe"
     GameDataPath = "Mods"
     GameSaveExtension = "whs"
     GameDocumentsDirectory = "%GAME_PATH%"
