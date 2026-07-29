@@ -868,7 +868,7 @@ QString resolveStyleSheetUrl(const QString& url, const QString& baseDir)
     return trimmed;
   }
 
-  return QUrl::fromLocalFile(QDir(baseDir).absoluteFilePath(trimmed)).toString();
+  return QDir(baseDir).absoluteFilePath(trimmed);
 }
 
 QString resolveRelativeStyleSheetUrls(const QString& stylesheet,
