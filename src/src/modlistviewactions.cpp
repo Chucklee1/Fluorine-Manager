@@ -164,12 +164,9 @@ void ModListViewActions::createSeparator(const QModelIndex& index) const
       return;
     }
   }
-  if (m_core.modList()->getMod(name) != nullptr) {
-    reportError(tr("A separator with this name already exists"));
-    return;
-  }
   name->append("_separator");
   if (m_core.modList()->getMod(name) != nullptr) {
+    reportError(tr("A separator with this name already exists"));
     return;
   }
 

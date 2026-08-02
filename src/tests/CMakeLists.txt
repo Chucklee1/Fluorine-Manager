@@ -24,6 +24,10 @@ add_test(
     NAME test_epic_utils
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_epic_utils.py
 )
+add_test(
+    NAME test_palworld_game_metadata
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_palworld_game_metadata.py
+)
 
 # ---------------------------------------------------------------------------
 # TES3 metadata and OpenMW Player stub parsing tests
