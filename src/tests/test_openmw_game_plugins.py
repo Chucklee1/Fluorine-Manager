@@ -655,6 +655,107 @@ class OpenMWGamePluginsTests(unittest.TestCase):
             state["archives"], ["Morrowind.bsa", "NewAssets.bsa"]
         )
 
+    def test_v3_hydration_preserves_selected_archive_order(self) -> None:
+        state = _state(["Morrowind.esm"], ["Morrowind.esm"])
+        state["known_archives"] = [
+            "Bloodmoon.bsa",
+            "Morrowind - Invalidation.bsa",
+            "Morrowind.bsa",
+            "Tribunal.bsa",
+            "dynamicsounds.bsa",
+            "Hiding Vampirism Under Helmets.bsa",
+            "Protection From Sun Damage.bsa",
+        ]
+        state["archives"] = [
+            "Morrowind.bsa",
+            "Tribunal.bsa",
+            "Bloodmoon.bsa",
+            "Morrowind - Invalidation.bsa",
+            "Hiding Vampirism Under Helmets.bsa",
+            "Protection From Sun Damage.bsa",
+            "dynamicsounds.bsa",
+        ]
+        available = list(state["known_archives"])
+
+        reconciled = game_plugins._reconcile_archives(state, available)
+
+        self.assertEqual(reconciled["known_archives"], state["known_archives"])
+        self.assertEqual(reconciled["archives"], state["archives"])
+
+    def test_archive_reconciliation_appends_only_new_selected_archives(self) -> None:
+        state = _state(["Morrowind.esm"], ["Morrowind.esm"])
+        state["known_archives"] = [
+            "Unavailable.bsa",
+            "Disabled.bsa",
+            "Enabled.bsa",
+        ]
+        state["archives"] = ["Unavailable.bsa", "Enabled.bsa"]
+
+        reconciled = game_plugins._reconcile_archives(
+            state,
+            ["Disabled.bsa", "Enabled.BSA", "New.bsa"],
+        )
+
+        self.assertEqual(
+            reconciled["known_archives"],
+            [
+                "Unavailable.bsa",
+                "Disabled.bsa",
+                "Enabled.BSA",
+                "New.bsa",
+            ],
+        )
+        self.assertEqual(
+            reconciled["archives"],
+            ["Unavailable.bsa", "Enabled.BSA", "New.bsa"],
+        )
+
+    def test_v3_hydration_keeps_state_archive_order_authoritative(self) -> None:
+        physical = [
+            "Bloodmoon.bsa",
+            "Morrowind - Invalidation.bsa",
+            "Morrowind.bsa",
+            "Tribunal.bsa",
+            "dynamicsounds.bsa",
+            "Hiding Vampirism Under Helmets.bsa",
+            "Protection From Sun Damage.bsa",
+        ]
+        selected = [
+            "Morrowind.bsa",
+            "Tribunal.bsa",
+            "Bloodmoon.bsa",
+            "Morrowind - Invalidation.bsa",
+            "Hiding Vampirism Under Helmets.bsa",
+            "Protection From Sun Damage.bsa",
+            "dynamicsounds.bsa",
+        ]
+        state = _state(["Morrowind.esm"], ["Morrowind.esm"])
+        state["known_archives"] = list(physical)
+        state["archives"] = list(selected)
+        _write_state(self.directory, state)
+        (self.directory / "openmw.cfg").write_text(
+            "replace=content,groundcover\n",
+            encoding="utf-8",
+        )
+        game_directory = self.directory / "game"
+        data_files = game_directory / "Data Files"
+        data_files.mkdir(parents=True)
+        for name in physical:
+            (data_files / name).write_bytes(b"archive")
+        self.organizer = _Organizer(
+            self.directory, game_directory=game_directory
+        )
+        self.adapter = game_plugins.OpenMWGamePlugins(self.organizer)
+
+        self.adapter.readPluginLists(_FakePluginList(["Morrowind.esm"]))
+        self.adapter.readPluginLists(_FakePluginList(["Morrowind.esm"]))
+
+        persisted = openmw_cfg.read_selection_state(
+            self.directory / "fluorine-openmw-selection.json"
+        )
+        self.assertEqual(persisted["known_archives"], physical)
+        self.assertEqual(persisted["archives"], selected)
+
     def test_v2_groundcover_wins_during_migration_read(self) -> None:
         legacy = {
             "version": 2,

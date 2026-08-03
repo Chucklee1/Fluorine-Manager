@@ -257,7 +257,7 @@ def _reconcile_archives(
     available: Sequence[str],
     previously_known: Sequence[str] | None = None,
 ) -> dict:
-    """Retain unavailable archives and enable newly discovered physical BSAs."""
+    """Reconcile inventory without conflating known and selected order."""
     candidate = copy.deepcopy(state)
     providers = {name.casefold(): name for name in available}
     known_keys = {
@@ -285,11 +285,13 @@ def _reconcile_archives(
         providers.get(name.casefold(), name)
         for name in candidate["known_archives"]
     ] + new_archives
-    selected_keys.update(name.casefold() for name in newly_available)
     candidate["archives"] = [
+        providers.get(name.casefold(), name)
+        for name in candidate["archives"]
+    ] + [
         name
-        for name in candidate["known_archives"]
-        if name.casefold() in selected_keys
+        for name in newly_available
+        if name.casefold() not in selected_keys
     ]
     validate_selection_state(candidate)
     return candidate
