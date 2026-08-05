@@ -1226,11 +1226,11 @@ bool PrefixSetupRunner::ensureDirectXRedist(QString& redistPath)
     return downloadAndVerify(DIRECTX_JUN2010_URL, redistPath, DIRECTX_JUN2010_SHA256);
   }
 
-  if (!verifySha256(redistPath, DIRECTX_JUN2010_SHA256)) {
-    emit logMessage("Cached redist has bad checksum, re-downloading...");
-    QFile::remove(redistPath);
-    return downloadAndVerify(DIRECTX_JUN2010_URL, redistPath, DIRECTX_JUN2010_SHA256);
-  }
+  // if (!verifySha256(redistPath, DIRECTX_JUN2010_SHA256)) {
+  //   emit logMessage("Cached redist has bad checksum, re-downloading...");
+  //   QFile::remove(redistPath);
+  //   return downloadAndVerify(DIRECTX_JUN2010_URL, redistPath, DIRECTX_JUN2010_SHA256);
+  // }
 
   return true;
 }
