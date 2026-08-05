@@ -183,7 +183,7 @@ static const char* D3DCOMPILER_47_64_SHA256 =
 // DirectX End-User Runtimes (June 2010) — shared by d3dcompiler_43, d3dx9,
 // d3dx11_43, xact, xact_x64.
 static const char* DIRECTX_JUN2010_URL =
-    "https://files.holarse-linuxgaming.de/mirrors/microsoft/"
+    "https://web.archive.org/web/20260218142109/https://files.holarse-linuxgaming.de/mirrors/microsoft/"
     "directx_Jun2010_redist.exe";
 static const char* DIRECTX_JUN2010_SHA256 =
     "8746ee1a84a083a90e37899d71d50d5c7c015e69688a466aa80447f011780c0d";
