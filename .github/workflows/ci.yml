@@ -180,41 +180,6 @@ jobs:
               --prerelease
           fi
 
-          # Compatibility bridge for installations built before the channel
-          # was renamed. Their updater is hardcoded to /tags/beta, so mirror
-          # Nightly there until the 0.3.x line is retired.
-          LEGACY_TAG="beta"
-          LEGACY_ARCHIVE="$(dirname "${archive_path}")/fluorine-manager-beta.tar.gz"
-          cp "${archive_path}" "${LEGACY_ARCHIVE}"
-          LEGACY_NOTES_FILE="$(mktemp)"
-          {
-            echo "The rolling beta channel was renamed to Nightly."
-            echo "Install this build once and Fluorine will migrate the saved channel automatically."
-            echo ""
-            echo "<!-- fluorine-meta"
-            echo "channel=beta"
-            echo "build_number=${NIGHTLY_BUILD}"
-            echo "timestamp=${NIGHTLY_TS}"
-            echo "commit=${NIGHTLY_COMMIT}"
-            echo "short=${NIGHTLY_SHORT}"
-            echo "-->"
-          } > "${LEGACY_NOTES_FILE}"
-
-          git tag -f "${LEGACY_TAG}" "${GITHUB_SHA}"
-          git push -f origin "refs/tags/${LEGACY_TAG}"
-          if gh release view "${LEGACY_TAG}" >/dev/null 2>&1; then
-            gh release edit "${LEGACY_TAG}" \
-              --title "Fluorine Manager Nightly compatibility bridge" \
-              --notes-file "${LEGACY_NOTES_FILE}" \
-              --prerelease
-            gh release upload "${LEGACY_TAG}" "${LEGACY_ARCHIVE}" --clobber
-          else
-            gh release create "${LEGACY_TAG}" "${LEGACY_ARCHIVE}" \
-              --title "Fluorine Manager Nightly compatibility bridge" \
-              --notes-file "${LEGACY_NOTES_FILE}" \
-              --prerelease
-          fi
-
       # -------------------------------------------------------------------
       # Stable release: triggered by pushing a v* tag. Uses CI's generic
       # x86-64 toolchain so AVX-512 (or other host-CPU flags) from the
