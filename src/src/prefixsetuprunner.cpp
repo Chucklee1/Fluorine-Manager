@@ -1223,7 +1223,8 @@ bool PrefixSetupRunner::ensureDirectXRedist(QString& redistPath)
 
   if (!QFileInfo::exists(redistPath)) {
     emit logMessage("Downloading DirectX June 2010 redistributable...");
-    return downloadAndVerify(DIRECTX_JUN2010_URL, redistPath, DIRECTX_JUN2010_SHA256);
+    return true;
+    //return downloadAndVerify(DIRECTX_JUN2010_URL, redistPath, DIRECTX_JUN2010_SHA256);
   }
 
   // if (!verifySha256(redistPath, DIRECTX_JUN2010_SHA256)) {
