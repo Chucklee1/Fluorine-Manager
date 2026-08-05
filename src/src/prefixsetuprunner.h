@@ -108,6 +108,17 @@ private:
                              const QString& name,
                              const QStringList& knownSha25632 = {},
                              const QStringList& knownSha25664 = {});
+  int runDotNetInstaller(const QString& installerPath,
+                         const QString& displayName,
+                         const QMap<QString, QString>& env,
+                         QByteArray* captured,
+                         QString* installerLogPath);
+  QStringList storageDiagnostics(const QString& installerPath) const;
+  QString reportInstallerFailure(const QString& displayName,
+                                 const QString& installerPath,
+                                 int exitCode,
+                                 const QByteArray& processOutput,
+                                 const QString& installerLogPath);
   bool stepNuGetSignaturePolicy();
   bool stepGameDetection();
   bool stepWineRegistry();
@@ -124,6 +135,8 @@ private:
                     const QString& displayName = {});
   bool downloadAndVerify(const QString& url, const QString& destPath,
                          const QString& expectedSha256);
+  bool downloadAndVerifyAny(const QStringList& urls, const QString& destPath,
+                            const QStringList& expectedSha256);
   bool downloadRuntimeInstaller(const QString& url, const QString& destPath,
                                 const QString& displayName,
                                 const QStringList& knownSha256 = {});

@@ -8,6 +8,7 @@
 #include "prefixsymlinks.h"
 
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -20,7 +21,9 @@
 #include <QProcessEnvironment>
 #include <QRegularExpression>
 #include <QCryptographicHash>
+#include <QSaveFile>
 #include <QStandardPaths>
+#include <QStorageInfo>
 #include <QTemporaryFile>
 #include <QThread>
 #include <QTimer>
@@ -28,6 +31,7 @@
 
 #include <log.h>
 
+#include <algorithm>
 #include <csignal>
 #include <sys/types.h>
 
@@ -55,7 +59,10 @@ static const char* CABEXTRACT_URL =
 static const char* SEVENZIP_URL =
     "https://github.com/ip7z/7zip/releases/download/26.00/7z2600-linux-x86.tar.xz";
 
-static const char* DOTNET9_RUNTIME_URL =
+static const char* DOTNET9_X86_URL =
+    "https://builds.dotnet.microsoft.com/dotnet/Runtime/9.0.14/"
+    "dotnet-runtime-9.0.14-win-x86.exe";
+static const char* DOTNET9_X64_URL =
     "https://builds.dotnet.microsoft.com/dotnet/Runtime/9.0.14/"
     "dotnet-runtime-9.0.14-win-x64.exe";
 
@@ -182,11 +189,28 @@ static const char* D3DCOMPILER_47_64_SHA256 =
 
 // DirectX End-User Runtimes (June 2010) — shared by d3dcompiler_43, d3dx9,
 // d3dx11_43, xact, xact_x64.
-static const char* DIRECTX_JUN2010_URL =
-    "https://files.holarse-linuxgaming.de/mirrors/microsoft/"
-    "directx_Jun2010_redist.exe";
-static const char* DIRECTX_JUN2010_SHA256 =
-    "8746ee1a84a083a90e37899d71d50d5c7c015e69688a466aa80447f011780c0d";
+static const QStringList DIRECTX_JUN2010_URLS = {
+    // Current link exposed by Microsoft's official Download Center (id=8109).
+    QStringLiteral(
+        "https://download.microsoft.com/download/8/4/a/"
+        "84a35bf1-dafe-4ae8-82af-ad2ae20b6b14/"
+        "directx_Jun2010_redist.exe"),
+    // Independent mirror and its archived copy.  The mirror has returned 403
+    // intermittently, so keep the immutable archive as the final fallback.
+    QStringLiteral(
+        "https://files.holarse-linuxgaming.de/mirrors/microsoft/"
+        "directx_Jun2010_redist.exe"),
+    QStringLiteral(
+        "https://web.archive.org/web/20260218142109id_/"
+        "https://files.holarse-linuxgaming.de/mirrors/microsoft/"
+        "directx_Jun2010_redist.exe"),
+};
+static const QStringList DIRECTX_JUN2010_SHA256 = {
+    // Microsoft republished the signed package in 2024.
+    QStringLiteral("053f76dcbb28802e23341b6a787e3b0791c0fa5c8d4d011b1044172dbf89c73b"),
+    // Original package still served by the fallback archive.
+    QStringLiteral("8746ee1a84a083a90e37899d71d50d5c7c015e69688a466aa80447f011780c0d"),
+};
 
 // Visual C++ 2015-2022 redistributable.
 static const char* VCRUN2022_X86_URL = "https://aka.ms/vs/17/release/vc_redist.x86.exe";
@@ -237,6 +261,12 @@ static const QStringList DOTNET8_X86_SHA256 = {
 };
 static const QStringList DOTNET8_X64_SHA256 = {
     QStringLiteral("a7c394e6ee4e8104d7a01f78103700052cc504370941b7f620e3aa5afbbc61df"),
+};
+static const QStringList DOTNET9_X86_SHA256 = {
+    QStringLiteral("a99eb555e90eaa6703efa20f3b8fe676a9ba24bd24d439f016c20815d4ff815c"),
+};
+static const QStringList DOTNET9_X64_SHA256 = {
+    QStringLiteral("690f85d3592edb3e5810f8cd8b4a630bbaa2a8abc354061d44d7d6c0f0d8a0dd"),
 };
 
 static const QStringList VCRUN_DLLS = {
@@ -1223,13 +1253,16 @@ bool PrefixSetupRunner::ensureDirectXRedist(QString& redistPath)
 
   if (!QFileInfo::exists(redistPath)) {
     emit logMessage("Downloading DirectX June 2010 redistributable...");
-    return downloadAndVerify(DIRECTX_JUN2010_URL, redistPath, DIRECTX_JUN2010_SHA256);
+    return downloadAndVerifyAny(DIRECTX_JUN2010_URLS, redistPath,
+                                DIRECTX_JUN2010_SHA256);
   }
 
-  if (!verifySha256(redistPath, DIRECTX_JUN2010_SHA256)) {
+  const QString cachedSha = fileSha256(redistPath);
+  if (!DIRECTX_JUN2010_SHA256.contains(cachedSha, Qt::CaseInsensitive)) {
     emit logMessage("Cached redist has bad checksum, re-downloading...");
     QFile::remove(redistPath);
-    return downloadAndVerify(DIRECTX_JUN2010_URL, redistPath, DIRECTX_JUN2010_SHA256);
+    return downloadAndVerifyAny(DIRECTX_JUN2010_URLS, redistPath,
+                                DIRECTX_JUN2010_SHA256);
   }
 
   return true;
@@ -1576,6 +1609,8 @@ bool PrefixSetupRunner::stepDotNetRuntimes()
      .sha32=&DOTNET7_X86_SHA256, .sha64=&DOTNET7_X64_SHA256},
     {.url32=DOTNET8_X86_URL, .url64=DOTNET8_X64_URL, .name=".NET 8",
      .sha32=&DOTNET8_X86_SHA256, .sha64=&DOTNET8_X64_SHA256},
+    {.url32=DOTNET9_X86_URL, .url64=DOTNET9_X64_URL, .name=".NET 9",
+     .sha32=&DOTNET9_X86_SHA256, .sha64=&DOTNET9_X64_SHA256},
   };
 
   for (const auto& rt : runtimes) {
@@ -1584,11 +1619,6 @@ bool PrefixSetupRunner::stepDotNetRuntimes()
                                *rt.sha32, *rt.sha64))
       return false;
   }
-
-  // .NET 9 is 64-bit only.
-  if (isCancelled()) return false;
-  if (!stepDotNetInstall(DOTNET9_RUNTIME_URL, ".NET 9 Runtime"))
-    return false;
 
   emit logMessage(".NET Runtimes installed");
   return true;
@@ -1624,17 +1654,27 @@ bool PrefixSetupRunner::stepDotNetInstallPair(const QString& url32, const QStrin
     }
 
     emit logMessage(QStringLiteral("Installing %1 (32-bit)...").arg(name));
-    const int rc = runProcess(m_wineBin, {path, "/install", "/quiet", "/norestart"}, env);
+    QByteArray installerOutput;
+    QString installerLogPath;
+    const int rc = runDotNetInstaller(path, QStringLiteral("%1 x86").arg(name),
+                                      env, &installerOutput, &installerLogPath);
     if (!isMicrosoftInstallerSuccess(rc)) {
+      const QString diagnosticsPath = reportInstallerFailure(
+          QStringLiteral("%1 x86").arg(name), path, rc, installerOutput,
+          installerLogPath);
       currentStep().errorMessage =
           QStringLiteral("%1 x86 installer failed (%2)")
               .arg(name, describeInstallerExitCode(rc));
+      if (!diagnosticsPath.isEmpty())
+        currentStep().errorMessage +=
+            QStringLiteral("; diagnostics: %1").arg(diagnosticsPath);
       return false;
     } else if (rc != 0) {
       emit logMessage(QStringLiteral("%1 x86 installer returned nonfatal exit code %2")
                           .arg(name)
                           .arg(rc));
     }
+    QFile::remove(installerLogPath);
   }
 
   // Install 64-bit runtime.
@@ -1656,17 +1696,27 @@ bool PrefixSetupRunner::stepDotNetInstallPair(const QString& url32, const QStrin
     }
 
     emit logMessage(QStringLiteral("Installing %1 (64-bit)...").arg(name));
-    const int rc = runProcess(m_wineBin, {path, "/install", "/quiet", "/norestart"}, env);
+    QByteArray installerOutput;
+    QString installerLogPath;
+    const int rc = runDotNetInstaller(path, QStringLiteral("%1 x64").arg(name),
+                                      env, &installerOutput, &installerLogPath);
     if (!isMicrosoftInstallerSuccess(rc)) {
+      const QString diagnosticsPath = reportInstallerFailure(
+          QStringLiteral("%1 x64").arg(name), path, rc, installerOutput,
+          installerLogPath);
       currentStep().errorMessage =
           QStringLiteral("%1 x64 installer failed (%2)")
               .arg(name, describeInstallerExitCode(rc));
+      if (!diagnosticsPath.isEmpty())
+        currentStep().errorMessage +=
+            QStringLiteral("; diagnostics: %1").arg(diagnosticsPath);
       return false;
     } else if (rc != 0) {
       emit logMessage(QStringLiteral("%1 x64 installer returned nonfatal exit code %2")
                           .arg(name)
                           .arg(rc));
     }
+    QFile::remove(installerLogPath);
   }
 
   emit logMessage(QStringLiteral("%1 installed").arg(name));
@@ -1698,23 +1748,195 @@ bool PrefixSetupRunner::stepDotNetInstall(const QString& url, const QString& nam
   QMap<QString, QString> env = baseWineEnv();
   env["WINEDLLOVERRIDES"] = "mshtml=d";
 
-  const int rc = runProcess(
-      m_wineBin,
-      {installerPath, "/install", "/quiet", "/norestart"},
-      env);
+  QByteArray installerOutput;
+  QString installerLogPath;
+  const int rc = runDotNetInstaller(installerPath, name, env,
+                                    &installerOutput, &installerLogPath);
 
   if (!isMicrosoftInstallerSuccess(rc)) {
+    const QString diagnosticsPath = reportInstallerFailure(
+        name, installerPath, rc, installerOutput, installerLogPath);
     currentStep().errorMessage =
         QStringLiteral("%1 installer failed (%2)")
             .arg(name, describeInstallerExitCode(rc));
+    if (!diagnosticsPath.isEmpty())
+      currentStep().errorMessage +=
+          QStringLiteral("; diagnostics: %1").arg(diagnosticsPath);
     return false;
   } else if (rc != 0) {
     emit logMessage(QStringLiteral("%1 installer returned nonfatal exit code %2")
                         .arg(name)
                         .arg(rc));
   }
+  QFile::remove(installerLogPath);
 
   return true;
+}
+
+int PrefixSetupRunner::runDotNetInstaller(
+    const QString& installerPath,
+    const QString& displayName,
+    const QMap<QString, QString>& env,
+    QByteArray* captured,
+    QString* installerLogPath)
+{
+  const QString logDir = fluorineTmpDir() + "/installer-logs";
+  QDir().mkpath(logDir);
+
+  QString safeName = displayName.toLower();
+  safeName.replace(QRegularExpression(QStringLiteral("[^a-z0-9]+")),
+                   QStringLiteral("-"));
+  safeName.remove(QRegularExpression(QStringLiteral("^-|-$")));
+  const QString timestamp =
+      QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmss-zzz"));
+  const QString logPath =
+      QDir(logDir).filePath(QStringLiteral("%1-%2.log").arg(safeName, timestamp));
+  QFile::remove(logPath);
+
+  if (installerLogPath)
+    *installerLogPath = logPath;
+
+  return runProcess(
+      m_wineBin,
+      {installerPath, "/install", "/quiet", "/norestart", "/log",
+       linuxPathToWineZPath(logPath)},
+      env, -1, captured);
+}
+
+QStringList PrefixSetupRunner::storageDiagnostics(const QString& installerPath) const
+{
+  auto formatBytes = [](qint64 bytes) {
+    if (bytes < 0)
+      return QStringLiteral("unknown");
+    return QStringLiteral("%1 bytes (%2 GiB)")
+        .arg(bytes)
+        .arg(static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0),
+             0, 'f', 2);
+  };
+
+  auto describeStorage = [&formatBytes](const QString& label,
+                                        const QStorageInfo& storage) {
+    return QStringLiteral(
+               "%1: root=%2 device=%3 filesystem=%4 total=%5 free=%6 "
+               "available=%7 readOnly=%8 ready=%9 valid=%10")
+        .arg(label,
+             storage.rootPath(),
+             QString::fromUtf8(storage.device()),
+             QString::fromUtf8(storage.fileSystemType()),
+             formatBytes(storage.bytesTotal()),
+             formatBytes(storage.bytesFree()),
+             formatBytes(storage.bytesAvailable()),
+             storage.isReadOnly() ? QStringLiteral("yes") : QStringLiteral("no"),
+             storage.isReady() ? QStringLiteral("yes") : QStringLiteral("no"),
+             storage.isValid() ? QStringLiteral("yes") : QStringLiteral("no"));
+  };
+
+  QStringList lines;
+  lines << QStringLiteral("Relevant paths:")
+        << describeStorage(QStringLiteral("prefix (%1)").arg(m_prefixPath),
+                           QStorageInfo(m_prefixPath))
+        << describeStorage(
+               QStringLiteral("cache (%1)").arg(fluorineCacheDir()),
+               QStorageInfo(fluorineCacheDir()))
+        << describeStorage(
+               QStringLiteral("temporary (%1)").arg(fluorineTmpDir()),
+               QStorageInfo(fluorineTmpDir()))
+        << describeStorage(
+               QStringLiteral("installer (%1)").arg(installerPath),
+               QStorageInfo(installerPath));
+
+  const QDir dosDevices(QDir(m_prefixPath).filePath(QStringLiteral("dosdevices")));
+  lines << QStringLiteral("Wine drive mappings:");
+  const QStringList drives =
+      dosDevices.entryList(QDir::AllEntries | QDir::NoDotAndDotDot, QDir::Name);
+  if (drives.isEmpty()) {
+    lines << QStringLiteral("(none found)");
+  } else {
+    for (const QString& drive : drives) {
+      const QFileInfo info(dosDevices.filePath(drive));
+      lines << QStringLiteral("%1 -> %2")
+                   .arg(drive, info.isSymLink() ? info.symLinkTarget()
+                                                : info.absoluteFilePath());
+    }
+  }
+
+  lines << QStringLiteral("Mounted filesystems:");
+  QList<QStorageInfo> volumes = QStorageInfo::mountedVolumes();
+  std::sort(volumes.begin(), volumes.end(),
+            [](const QStorageInfo& left, const QStorageInfo& right) {
+              return left.rootPath() < right.rootPath();
+            });
+  for (const QStorageInfo& storage : volumes)
+    lines << describeStorage(storage.rootPath(), storage);
+
+  return lines;
+}
+
+QString PrefixSetupRunner::reportInstallerFailure(
+    const QString& displayName,
+    const QString& installerPath,
+    int exitCode,
+    const QByteArray& processOutput,
+    const QString& installerLogPath)
+{
+  const QStringList storageLines = storageDiagnostics(installerPath);
+  emit logMessage(QStringLiteral("--- Storage diagnostics ---"));
+  for (const QString& line : storageLines)
+    emit logMessage(line);
+
+  QByteArray installerLog;
+  QFile sourceLog(installerLogPath);
+  if (sourceLog.open(QIODevice::ReadOnly))
+    installerLog = sourceLog.readAll();
+
+  emit logMessage(QStringLiteral("--- Microsoft installer log (%1) ---")
+                      .arg(installerLogPath));
+  if (installerLog.isEmpty()) {
+    emit logMessage(QStringLiteral("(installer did not produce a log)"));
+  } else {
+    emit logMessage(QString::fromUtf8(installerLog));
+  }
+
+  const QString diagnosticsDir = fluorineDataDir() + "/logs";
+  QDir().mkpath(diagnosticsDir);
+  const QString timestamp =
+      QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd-HHmmss-zzz"));
+  QString safeName = displayName.toLower();
+  safeName.replace(QRegularExpression(QStringLiteral("[^a-z0-9]+")),
+                   QStringLiteral("-"));
+  safeName.remove(QRegularExpression(QStringLiteral("^-|-$")));
+  const QString diagnosticsPath = QDir(diagnosticsDir).filePath(
+      QStringLiteral("dependency-installer-%1-%2.log").arg(safeName, timestamp));
+
+  QFile diagnostics(diagnosticsPath);
+  if (!diagnostics.open(QIODevice::WriteOnly | QIODevice::Text)) {
+    emit logMessage(
+        QStringLiteral("Failed to write installer diagnostics: %1")
+            .arg(diagnosticsPath));
+    return {};
+  }
+
+  diagnostics.write(QStringLiteral(
+                        "Dependency installer: %1\nInstaller: %2\nExit code: %3\n"
+                        "Prefix: %4\nProton: %5\nWine: %6\n\n")
+                        .arg(displayName, installerPath)
+                        .arg(exitCode)
+                        .arg(m_prefixPath, m_protonPath, m_wineBin)
+                        .toUtf8());
+  diagnostics.write("=== Storage diagnostics ===\n");
+  diagnostics.write(storageLines.join(QLatin1Char('\n')).toUtf8());
+  diagnostics.write("\n\n=== Raw process output ===\n");
+  diagnostics.write(processOutput.isEmpty() ? QByteArray("(no console output)\n")
+                                             : processOutput);
+  diagnostics.write("\n\n=== Microsoft installer log ===\n");
+  diagnostics.write(installerLog.isEmpty() ? QByteArray("(no installer log)\n")
+                                            : installerLog);
+  diagnostics.close();
+
+  emit logMessage(
+      QStringLiteral("Full installer diagnostics written to: %1")
+          .arg(diagnosticsPath));
+  return diagnosticsPath;
 }
 
 bool PrefixSetupRunner::stepNuGetSignaturePolicy()
@@ -2031,12 +2253,19 @@ static void setExecPermissions(const QString& path)
 bool PrefixSetupRunner::downloadFile(const QString& url, const QString& destPath,
                                      const QString& displayName)
 {
+  QSaveFile file(destPath);
+  if (!file.open(QIODevice::WriteOnly)) {
+    emit logMessage(QStringLiteral("Failed to write: %1").arg(destPath));
+    return false;
+  }
+
   // Use Qt networking — no dependency on host curl.
   QNetworkAccessManager nam;
   QNetworkRequest request{QUrl(url)};
   request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
                         QNetworkRequest::NoLessSafeRedirectPolicy);
   request.setHeader(QNetworkRequest::UserAgentHeader, "Fluorine-Manager");
+  request.setTransferTimeout(60'000);
 
   const QString shownName =
       displayName.isEmpty() ? QFileInfo(destPath).fileName() : displayName;
@@ -2045,7 +2274,18 @@ bool PrefixSetupRunner::downloadFile(const QString& url, const QString& destPath
 
   QNetworkReply* reply = nam.get(request);
   QEventLoop loop;
+  bool writeFailed = false;
   emit downloadStarted(shownName);
+  QObject::connect(reply, &QIODevice::readyRead, this,
+                   [&file, reply, &writeFailed] {
+                     if (writeFailed)
+                       return;
+                     const QByteArray data = reply->readAll();
+                     if (file.write(data) != data.size()) {
+                       writeFailed = true;
+                       reply->abort();
+                     }
+                   });
   QObject::connect(reply, &QNetworkReply::downloadProgress,
                    this,
                    [this, shownName, &timer](qint64 received, qint64 total) {
@@ -2059,25 +2299,44 @@ bool PrefixSetupRunner::downloadFile(const QString& url, const QString& destPath
                                            bytesPerSecond);
                    });
   QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+
+  QTimer cancelTimer;
+  QObject::connect(&cancelTimer, &QTimer::timeout, this, [this, reply] {
+    if (isCancelled())
+      reply->abort();
+  });
+  cancelTimer.start(100);
   loop.exec();
+  cancelTimer.stop();
 
-  if (reply->error() != QNetworkReply::NoError) {
-    emit logMessage(QStringLiteral("Download failed: %1").arg(reply->errorString()));
+  // Drain any final bytes made available together with finished().
+  if (!writeFailed) {
+    const QByteArray data = reply->readAll();
+    if (file.write(data) != data.size())
+      writeFailed = true;
+  }
+
+  if (isCancelled() || reply->error() != QNetworkReply::NoError || writeFailed) {
+    if (isCancelled()) {
+      emit logMessage(QStringLiteral("Download cancelled: %1").arg(shownName));
+    } else if (writeFailed) {
+      emit logMessage(QStringLiteral("Failed while writing: %1").arg(destPath));
+    } else {
+      emit logMessage(QStringLiteral("Download failed: %1").arg(reply->errorString()));
+    }
+    file.cancelWriting();
     reply->deleteLater();
     emit downloadFinished();
     return false;
   }
 
-  QFile file(destPath);
-  if (!file.open(QIODevice::WriteOnly)) {
-    emit logMessage(QStringLiteral("Failed to write: %1").arg(destPath));
+  if (!file.commit()) {
+    emit logMessage(QStringLiteral("Failed to save: %1").arg(destPath));
     reply->deleteLater();
     emit downloadFinished();
     return false;
   }
 
-  file.write(reply->readAll());
-  file.close();
   reply->deleteLater();
   emit downloadFinished();
   return true;
@@ -2239,6 +2498,63 @@ bool PrefixSetupRunner::downloadAndVerify(const QString& url, const QString& des
   }
 
   return true;
+}
+
+bool PrefixSetupRunner::downloadAndVerifyAny(const QStringList& urls,
+                                             const QString& destPath,
+                                             const QStringList& expectedSha256)
+{
+  const QString partPath = destPath + QStringLiteral(".part");
+  QFile::remove(partPath);
+
+  for (int i = 0; i < urls.size(); ++i) {
+    if (isCancelled()) {
+      QFile::remove(partPath);
+      currentStep().errorMessage = "Download cancelled";
+      return false;
+    }
+
+    const QString& url = urls.at(i);
+    if (i > 0) {
+      emit logMessage(
+          QStringLiteral("Trying fallback download %1 of %2...")
+              .arg(i)
+              .arg(urls.size() - 1));
+    }
+
+    if (!downloadFile(url, partPath)) {
+      QFile::remove(partPath);
+      continue;
+    }
+
+    const QString sha = fileSha256(partPath);
+    if (!expectedSha256.contains(sha, Qt::CaseInsensitive)) {
+      emit logMessage(
+          QStringLiteral("Downloaded file from %1 has unexpected SHA256: %2")
+              .arg(QUrl(url).host(), sha));
+      QFile::remove(partPath);
+      continue;
+    }
+
+    QFile::remove(destPath);
+    if (!QFile::rename(partPath, destPath)) {
+      QFile::remove(partPath);
+      currentStep().errorMessage =
+          QStringLiteral("Failed to cache %1").arg(QFileInfo(destPath).fileName());
+      return false;
+    }
+
+    emit logMessage(
+        QStringLiteral("Verified %1 (SHA256 %2)")
+            .arg(QFileInfo(destPath).fileName(), sha));
+    return true;
+  }
+
+  currentStep().errorMessage = QStringLiteral(
+      "Failed to download a verified %1 from %2 source(s)")
+                                   .arg(QFileInfo(destPath).fileName())
+                                   .arg(urls.size());
+  return false;
 }
 
 bool PrefixSetupRunner::ensure7zz()
@@ -2641,7 +2957,10 @@ QString PrefixSetupRunner::makeDllOverrideEnv(const QString& base,
 
 bool PrefixSetupRunner::isMicrosoftInstallerSuccess(int exitCode)
 {
-  return exitCode == 0 || exitCode == 105 || exitCode == 194 || exitCode == 236;
+  // Wine exposes only the low byte of Windows process exit codes:
+  // 1641 (restart initiated) -> 105, 3010 (restart required) -> 194, and
+  // 1638 (another/newer version is installed) -> 102.
+  return exitCode == 0 || exitCode == 102 || exitCode == 105 || exitCode == 194;
 }
 
 QString PrefixSetupRunner::describeInstallerExitCode(int exitCode)
@@ -2656,8 +2975,8 @@ QString PrefixSetupRunner::describeInstallerExitCode(int exitCode)
     return QStringLiteral("exit code 105: installer requested restart now");
   case 194:
     return QStringLiteral("exit code 194: installer requested restart later");
-  case 236:
-    return QStringLiteral("exit code 236: newer version is already installed");
+  case 102:
+    return QStringLiteral("exit code 102: newer version is already installed");
   default:
     return QStringLiteral("exit code %1").arg(exitCode);
   }
