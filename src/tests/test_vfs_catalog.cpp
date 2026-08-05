@@ -71,6 +71,8 @@ TEST(VfsCatalog, ReusesHashesAndPreservesOverwritePriority)
   VfsTree initial = std::move(initialResult.tree);
   EXPECT_EQ(first.files_scanned, 3u);
   EXPECT_EQ(first.files_hashed, 3u);
+  EXPECT_EQ(first.fingerprint_misses, 3u);
+  EXPECT_EQ(first.fingerprint_uncached, 3u);
   EXPECT_GE(first.hash_workers, 1u);
   EXPECT_LE(
       first.hash_workers,
@@ -85,6 +87,7 @@ TEST(VfsCatalog, ReusesHashesAndPreservesOverwritePriority)
   VfsTree warm = std::move(warmResult.tree);
   EXPECT_EQ(second.files_scanned, 3u);
   EXPECT_EQ(second.files_hashed, 0u);
+  EXPECT_EQ(second.fingerprint_misses, 0u);
   EXPECT_EQ(second.provider_roots_changed, 0u);
   EXPECT_EQ(second.catalog_rows_written, 0u);
   EXPECT_EQ(second.catalog_rows_deleted, 0u);
@@ -128,6 +131,76 @@ TEST(VfsCatalog, MetadataDriftRehashesOnlyChangedFile)
       [&](const VfsCatalogProgress& value) { progress = value; });
   EXPECT_EQ(progress.files_scanned, 2u);
   EXPECT_EQ(progress.files_hashed, 1u);
+  EXPECT_EQ(progress.fingerprint_misses, 1u);
+  EXPECT_EQ(progress.fingerprint_uncached, 0u);
+  EXPECT_EQ(progress.fingerprint_mtime_mismatches, 1u);
+  EXPECT_EQ(progress.fingerprint_ctime_mismatches, 1u);
+}
+
+TEST(VfsCatalog, CanonicalPathAliasesShareDatabaseAndCachedHashes)
+{
+  TempRoot temp;
+  const fs::path realRoot = temp.path() / "real";
+  const fs::path aliasRoot = temp.path() / "alias";
+  const fs::path realData = realRoot / "Data";
+  const fs::path realOverwrite = realRoot / "overwrite";
+  writeFile(realData / "base.txt", "base");
+  writeFile(realOverwrite / "generated.ini", "generated");
+
+  std::error_code ec;
+  fs::create_directory_symlink(realRoot, aliasRoot, ec);
+  ASSERT_FALSE(ec);
+  const fs::path aliasData = aliasRoot / "Data";
+  const fs::path aliasOverwrite = aliasRoot / "overwrite";
+
+  EXPECT_EQ(VfsCatalog::databasePath(realData.string()),
+            VfsCatalog::databasePath(aliasData.string()));
+
+  const fs::path database = temp.path() / "catalog.sqlite";
+  VfsCatalog catalog(database);
+  VfsCatalogProgress first;
+  const auto initial = catalog.reconcileAndBuild(
+      realData.string(), {}, realOverwrite.string(), true,
+      [&](const VfsCatalogProgress& value) { first = value; });
+  EXPECT_EQ(first.files_hashed, 2u);
+
+  VfsCatalogProgress aliased;
+  const auto reused = catalog.reconcileAndBuild(
+      aliasData.string(), {}, aliasOverwrite.string(), true,
+      [&](const VfsCatalogProgress& value) { aliased = value; });
+  EXPECT_EQ(aliased.files_scanned, 2u);
+  EXPECT_EQ(aliased.files_hashed, 0u);
+  EXPECT_EQ(aliased.fingerprint_misses, 0u);
+  EXPECT_EQ(aliased.catalog_rows_loaded, 2u);
+  EXPECT_EQ(initial.profile_root, reused.profile_root);
+  ASSERT_EQ(reused.provider_roots.size(), 2u);
+  EXPECT_EQ(reused.provider_roots.front().root_key,
+            fs::canonical(realData).string());
+  EXPECT_EQ(reused.provider_roots.back().root_key,
+            fs::canonical(realOverwrite).string());
+  EXPECT_EQ(catalog.loadBaseSnapshot(aliasData.string()).size(), 1u);
+
+  writeFile(aliasOverwrite / "generated.ini", "updated");
+  const auto refreshed = catalog.forceRefreshProviderFiles(
+      aliasOverwrite.string(), "Overwrite", false, {"generated.ini"});
+  EXPECT_EQ(refreshed.provider_root.root_key,
+            fs::canonical(realOverwrite).string());
+  VfsCatalogProgress afterRefresh;
+  const auto refreshedReconcile = catalog.reconcileAndBuild(
+      realData.string(), {}, realOverwrite.string(), true,
+      [&](const VfsCatalogProgress& value) { afterRefresh = value; });
+  EXPECT_EQ(afterRefresh.files_hashed, 0u);
+  EXPECT_EQ(refreshedReconcile.provider_roots.back().digest,
+            refreshed.provider_root.digest);
+
+  catalog.invalidateProviderFiles(
+      aliasOverwrite.string(), {"generated.ini"});
+  VfsCatalogProgress afterInvalidation;
+  catalog.reconcileAndBuild(
+      realData.string(), {}, realOverwrite.string(), true,
+      [&](const VfsCatalogProgress& value) { afterInvalidation = value; });
+  EXPECT_EQ(afterInvalidation.files_hashed, 1u);
+  EXPECT_EQ(afterInvalidation.fingerprint_uncached, 1u);
 }
 
 TEST(VfsCatalog, HashesChangedFilesWithAvailableCpuWorkers)

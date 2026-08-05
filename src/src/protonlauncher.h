@@ -34,6 +34,7 @@ public:
   // Both paths must already exist before launch; the mount is torn down
   // automatically when the game process tree exits.
   ProtonLauncher& setSavesBindMount(const QString& source, const QString& target);
+  ProtonLauncher& setUsvfsRequest(const QString& requestPath);
 
   // True iff the running kernel supports unprivileged user namespaces with
   // CAP_SYS_ADMIN so that `setSavesBindMount` will actually take effect.
@@ -63,6 +64,7 @@ private:
   bool m_useTerminal = false;
   QString m_bindMountSource;
   QString m_bindMountTarget;
+  QString m_usvfsRequestPath;
 };
 
 #endif  // PROTONLAUNCHER_H

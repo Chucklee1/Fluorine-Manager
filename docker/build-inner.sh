@@ -7,6 +7,15 @@ BUILD_PY="${BUILD_PYTHON:-$(command -v python3)}"
 PYBIND11_DIR="$("${BUILD_PY}" -c 'import pybind11; print(pybind11.get_cmake_dir())' 2>/dev/null || true)"
 
 CMAKE_EXTRA_ARGS=()
+# FetchContent dependencies are revision-pinned. Reuse an existing populated
+# source tree without contacting every remote on each incremental build; an
+# absent source is still downloaded during the initial population step.
+CMAKE_EXTRA_ARGS+=("-DFETCHCONTENT_UPDATES_DISCONNECTED=ON")
+# Always set the runtime directory explicitly. CMake caches this PATH, so
+# omitting it after an experimental build would silently repackage that prior
+# candidate during a normal reference restore.
+CMAKE_EXTRA_ARGS+=(
+    "-DFLUORINE_USVFS_RUNTIME_DIR=${FLUORINE_USVFS_RUNTIME_DIR:-/opt/fluorine-usvfs}")
 if [ "${BUILD_MODE:-tarball}" = "test" ]; then
     CMAKE_EXTRA_ARGS+=("-DBUILD_TESTING=OFF" "-DBUILD_FLUORINE_TESTING=ON")
 fi
@@ -103,6 +112,23 @@ fi
 cp -f "${RUNDIR}/ModOrganizer" "${OUT_DIR}/ModOrganizer-core"
 [ -f "${RUNDIR}/README-PORTABLE.txt" ] && cp -f "${RUNDIR}/README-PORTABLE.txt" "${OUT_DIR}/"
 [ -f "/src/src/fluorine-manager" ] && cp -f "/src/src/fluorine-manager" "${OUT_DIR}/"
+
+# Wine-side USVFS controller and pinned x64/x86 injection runtime.
+if [ -f "${RUNDIR}/usvfs/fluorine-usvfs-launcher.exe" ]; then
+    cp -a "${RUNDIR}/usvfs" "${OUT_DIR}/usvfs"
+    if [ -n "${FLUORINE_USVFS_PROVENANCE:-}" ]; then
+        if [ ! -f "${FLUORINE_USVFS_PROVENANCE}" ]; then
+            echo "ERROR: USVFS provenance file is missing: ${FLUORINE_USVFS_PROVENANCE}"
+            exit 1
+        fi
+        cp -f "${FLUORINE_USVFS_PROVENANCE}" \
+            "${OUT_DIR}/usvfs/fluorine-candidate-build.txt"
+    fi
+    cp -f /opt/fluorine-usvfs/LICENSE "${OUT_DIR}/licenses/usvfs-GPL-3.0.txt"
+else
+    echo "ERROR: Wine-side USVFS runtime was not built"
+    exit 1
+fi
 
 # wrestool/icotool no longer needed — icon extraction is built into the C++ PE parser
 
@@ -581,9 +607,16 @@ if [ "${HERE_REAL}" != "${DST_REAL}" ]; then
         exit 1
     fi
 
-    # Fingerprint from size+mtime (not inode) so re-extracting the same tarball
-    # onto a different filesystem doesn't trigger a spurious full resync.
-    CURRENT_VER="$(stat -c '%s:%Y' "${HERE}/ModOrganizer-core" 2>/dev/null || echo "unknown")"
+    # New bundles carry a content-derived identity covering every shipped
+    # regular file. Hashing this tiny identity file keeps launches cheap while
+    # still noticing DLL/helper/plugin-only updates. Retain the old core
+    # size+mtime identity for bundles created before this file existed.
+    BUNDLE_VERSION="${HERE}/fluorine-bundle-version.txt"
+    if [ -f "${BUNDLE_VERSION}" ]; then
+        CURRENT_VER="bundle:$(sha256sum "${BUNDLE_VERSION}" | cut -d' ' -f1)"
+    else
+        CURRENT_VER="core:$(stat -c '%s:%Y' "${HERE}/ModOrganizer-core" 2>/dev/null || echo "unknown")"
+    fi
     MARKER="${BIN_DST}/.version"
 
     if [ ! -f "${MARKER}" ] || [ "$(cat "${MARKER}" 2>/dev/null)" != "${CURRENT_VER}" ]; then
@@ -760,6 +793,25 @@ mkdir -p "${OUT_DIR}/icons"
 cp -f /src/data/icons/com.fluorine.manager.desktop "${OUT_DIR}/icons/"
 cp -f /src/data/icons/com.fluorine.manager.png "${OUT_DIR}/icons/"
 cp -f /src/data/icons/com.fluorine.manager.metainfo.xml "${OUT_DIR}/icons/"
+
+# ── Content-derived bundle identity ──
+# Compute this once while packaging. The launcher hashes only this tiny file,
+# not the full payload, on normal startup. Exclude the identity itself and the
+# subsequently generated manifest to avoid circular input.
+BUNDLE_SHA256="$(
+    cd "${OUT_DIR}"
+    find . -type f \
+        ! -path './fluorine-bundle-version.txt' \
+        ! -path './fluorine-manifest.txt' -print0 \
+        | LC_ALL=C sort -z \
+        | xargs -0 sha256sum \
+        | sha256sum \
+        | cut -d' ' -f1
+)"
+{
+    printf 'format=1\n'
+    printf 'payload_sha256=%s\n' "${BUNDLE_SHA256}"
+} > "${OUT_DIR}/fluorine-bundle-version.txt"
 
 # ── Manifest of top-level entries ──
 # The launcher's sync step copies only files listed here into

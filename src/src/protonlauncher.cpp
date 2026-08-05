@@ -3,6 +3,7 @@
 #include "fluorinepaths.h"
 #include "steamdetection.h"
 #include "slrmanager.h"
+#include "vfsbackend.h"
 #include <cstdio>
 #include <QByteArray>
 #include <QCoreApplication>
@@ -685,10 +686,16 @@ ProtonLauncher& ProtonLauncher::setUseTerminal(bool useTerminal)
 }
 
 ProtonLauncher& ProtonLauncher::setSavesBindMount(const QString& source,
-                                                  const QString& target)
+                                                   const QString& target)
 {
   m_bindMountSource = source.trimmed();
   m_bindMountTarget = target.trimmed();
+  return *this;
+}
+
+ProtonLauncher& ProtonLauncher::setUsvfsRequest(const QString& requestPath)
+{
+  m_usvfsRequestPath = requestPath;
   return *this;
 }
 
@@ -741,11 +748,45 @@ bool ProtonLauncher::launchWithProton(qint64& pid) const
     protonScript = QDir(m_protonPath).filePath("proton");
   }
 
+  QString launchBinary = m_binary;
+  QStringList launchArguments = m_arguments;
+  QString usvfsBundlePath;
+  if (!m_usvfsRequestPath.isEmpty()) {
+    usvfsBundlePath = QDir(QCoreApplication::applicationDirPath())
+                          .filePath(QStringLiteral("usvfs"));
+    const QString helper =
+        QDir(usvfsBundlePath).filePath(QStringLiteral("fluorine-usvfs-launcher.exe"));
+    const QStringList requiredRuntime{
+        helper,
+        QDir(usvfsBundlePath).filePath(QStringLiteral("usvfs_x64.dll")),
+        QDir(usvfsBundlePath).filePath(QStringLiteral("usvfs_x86.dll")),
+        QDir(usvfsBundlePath).filePath(QStringLiteral("usvfs_proxy_x64.exe")),
+        QDir(usvfsBundlePath).filePath(QStringLiteral("usvfs_proxy_x86.exe")),
+        m_usvfsRequestPath,
+    };
+    QStringList missingRuntime;
+    for (const QString& path : requiredRuntime) {
+      if (!QFileInfo::exists(path)) missingRuntime.append(path);
+    }
+    if (!missingRuntime.isEmpty()) {
+      MOBase::log::error(
+          "USVFS launch requested but required files are missing: {}",
+          missingRuntime.join(QStringLiteral(", ")));
+      errno = ENOENT;
+      return false;
+    }
+    launchBinary = helper;
+    launchArguments = {toWinePath(m_usvfsRequestPath)};
+    MOBase::log::info("USVFS launch bridge: '{}' request='{}' target='{}'",
+                      helper, m_usvfsRequestPath, m_binary);
+  }
+
   // Use "waitforexitandrun" instead of "run": this tells Proton to wait for
   // any existing wineserver to shut down first, then launch the game.  This is
   // what umu-launcher uses and ensures the previous session is fully cleaned up
   // before starting a new one.
-  const QStringList protonArgs = QStringList() << "waitforexitandrun" << m_binary << m_arguments;
+  const QStringList protonArgs =
+      QStringList() << "waitforexitandrun" << launchBinary << launchArguments;
   const QString targetAppId =
       m_steamAppId == 0 ? QString{} : QString::number(m_steamAppId);
   const QString inheritedSteamGameId =
@@ -764,7 +805,8 @@ bool ProtonLauncher::launchWithProton(qint64& pid) const
   }
 
   QStringList pressureVesselImportantPaths;
-  pressureVesselImportantPaths << m_binary << m_workingDir << m_gameDirectory
+  pressureVesselImportantPaths << m_binary << launchBinary << m_usvfsRequestPath
+                               << usvfsBundlePath << m_workingDir << m_gameDirectory
                                << m_prefixPath << m_bindMountSource
                                << m_bindMountTarget;
 
@@ -791,6 +833,13 @@ bool ProtonLauncher::launchWithProton(qint64& pid) const
       }
       if (!m_prefixPath.isEmpty()) {
         slrArgs << QStringLiteral("--filesystem=%1").arg(m_prefixPath);
+      }
+      if (!usvfsBundlePath.isEmpty()) {
+        slrArgs << QStringLiteral("--filesystem=%1").arg(usvfsBundlePath);
+      }
+      if (!m_usvfsRequestPath.isEmpty()) {
+        slrArgs << QStringLiteral("--filesystem=%1")
+                       .arg(QFileInfo(m_usvfsRequestPath).absolutePath());
       }
       // Expose the Proton installation directory — needed for
       // system-installed Protons (e.g. /usr/share/steam/compatibilitytools.d/)

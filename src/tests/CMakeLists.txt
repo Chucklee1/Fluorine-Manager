@@ -70,6 +70,30 @@ target_link_libraries(test_plugincompatibility PRIVATE
 add_test(NAME test_plugincompatibility COMMAND test_plugincompatibility)
 
 # ---------------------------------------------------------------------------
+# Per-instance FUSE/USVFS selection and Wine launch-request serialization
+# ---------------------------------------------------------------------------
+add_executable(test_vfs_backend EXCLUDE_FROM_ALL
+    test_vfs_backend.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/vfsbackend.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/usvfsrequest.cpp
+)
+set_target_properties(test_vfs_backend PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_vfs_backend PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/src
+)
+target_link_libraries(test_vfs_backend PRIVATE
+    Qt6::Core
+    mo2::uibase
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_vfs_backend COMMAND test_vfs_backend)
+
+# ---------------------------------------------------------------------------
 # meta.ini case-normalization helper tests
 # ---------------------------------------------------------------------------
 add_executable(test_metainiutils EXCLUDE_FROM_ALL
@@ -337,6 +361,7 @@ add_test(NAME test_staging_promotion COMMAND test_staging_promotion)
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
     DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
+            test_vfs_backend
             test_fluorineconfigownership
             test_heroicjson test_protondetection
             test_external_dir_mapping test_vfs_file_ops

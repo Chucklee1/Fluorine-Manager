@@ -81,6 +81,9 @@ public:
   void setRootBuilderEnabled(bool enabled, const std::string& storageDir = {});
   void deployRootFiles(
       const std::vector<std::pair<std::string, std::string>>& mods);
+  // Deploy only the backend-independent Root/ payload for an upcoming USVFS
+  // session. The normal FUSE update path performs this as part of mount().
+  void prepareRootFilesForUsvfs(const MappingType& mapping);
   void clearRootFiles();
 
 private:

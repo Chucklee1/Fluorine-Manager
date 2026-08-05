@@ -1975,6 +1975,54 @@ If you disable this feature, MO will only display official DLCs this way. Please
          </property>
          <layout class="QVBoxLayout" name="verticalLayout_39">
           <item>
+           <layout class="QFormLayout" name="vfsBackendLayout">
+            <item row="0" column="0">
+             <widget class="QLabel" name="vfsBackendLabel">
+              <property name="text">
+               <string>Wine/Proton backend:</string>
+              </property>
+             </widget>
+            </item>
+            <item row="0" column="1">
+             <widget class="QComboBox" name="vfsBackendComboBox">
+              <property name="toolTip">
+               <string>Select the virtual filesystem used by Windows executables in this instance. Native Linux executables continue to use FUSE. USVFS is experimental and requires the bundled Wine-side helper.</string>
+              </property>
+             </widget>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QLabel" name="vfsBackendDescriptionLabel">
+            <property name="text">
+             <string>USVFS hooks Windows filesystem APIs inside Wine/Proton. FUSE remains active for native Linux executables; games such as OpenMW that manage their own VFS remain unchanged.</string>
+            </property>
+            <property name="wordWrap">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="usvfsExactQueryExhaustionCheckBox">
+            <property name="text">
+             <string>Skip exhausted exact directory queries (experimental)</string>
+            </property>
+            <property name="toolTip">
+             <string>Removes a redundant backing-directory continuation query after an exact virtual match. Disabled by default after a visual asset regression; enable only for one-at-a-time comparison testing.</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="usvfsSharedContextCheckBox">
+            <property name="text">
+             <string>Use recursive shared context locking (experimental)</string>
+            </property>
+            <property name="toolTip">
+             <string>Allows concurrent read-labelled USVFS operations after the audited write paths are separated. Disabled by default; synthetic concurrency improves, but Skyrim startup was neutral.</string>
+            </property>
+           </widget>
+          </item>
+          <item>
            <widget class="QCheckBox" name="disableVfsCacheCheckBox">
             <property name="text">
              <string>Disable VFS cache (diagnostic)</string>

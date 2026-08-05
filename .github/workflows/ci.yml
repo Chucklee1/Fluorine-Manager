@@ -29,13 +29,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull or build Docker image
+      - name: Seed Docker build cache
         run: |
           if docker pull ${{ env.IMAGE_NAME }}:latest; then
             docker tag ${{ env.IMAGE_NAME }}:latest fluorine-builder:latest
           else
-            echo "Pull failed, building from scratch..."
-            docker build -t fluorine-builder:latest docker/
+            echo "Published builder unavailable; build.sh will build from scratch."
           fi
 
       - name: Restore ccache
@@ -69,30 +68,23 @@ jobs:
             CHANNEL=nightly
             VERSION="${BASE_VERSION}"
           fi
-          echo "channel=${CHANNEL}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "timestamp=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "channel=${CHANNEL}"
+            echo "version=${VERSION}"
+            echo "timestamp=$(date -u +%Y%m%d%H%M)"
+            echo "commit=$(git rev-parse --short HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Build inside container
+      - name: Test and build through the repository entry point
+        env:
+          FLUORINE_BUILD_CHANNEL: ${{ steps.channel.outputs.channel }}
+          FLUORINE_BUILD_NUMBER: ${{ github.run_number }}
+          FLUORINE_BUILD_TIMESTAMP: ${{ steps.channel.outputs.timestamp }}
+          FLUORINE_BUILD_COMMIT: ${{ steps.channel.outputs.commit }}
         run: |
           mkdir -p ~/.cache/fluorine-ccache
-          docker run --rm \
-            -v "${{ github.workspace }}:/src:rw" \
-            -v "$HOME/.cache/fluorine-ccache:/ccache:rw" \
-            -e CCACHE_DIR=/ccache \
-            -e CCACHE_BASEDIR=/src \
-            -e CCACHE_COMPILERCHECK=content \
-            -e CCACHE_SLOPPINESS=time_macros,include_file_mtime,include_file_ctime,pch_defines \
-            -e CCACHE_MAXSIZE=5G \
-            -e BUILD_MODE=tarball \
-            -e FLUORINE_BUILD_CHANNEL=${{ steps.channel.outputs.channel }} \
-            -e FLUORINE_BUILD_NUMBER=${{ github.run_number }} \
-            -e FLUORINE_BUILD_TIMESTAMP=${{ steps.channel.outputs.timestamp }} \
-            -e FLUORINE_BUILD_COMMIT=${{ steps.channel.outputs.commit }} \
-            -w /src \
-            fluorine-builder:latest \
-            bash -c 'set -e; uv pip install --system --break-system-packages --python /opt/python-bundled/bin/python3 --no-cache --upgrade pybind11==2.13.6 sip psutil larian-formats==0.2.0 vdf "PyQt6>=6.11,<6.12"; ccache -s; bash /src/docker/build-inner.sh; status=$?; echo "=== ccache stats after build ==="; ccache -s; exit $status'
+          ./build.sh test
+          ./build.sh
 
       - name: Package tarball
         run: |

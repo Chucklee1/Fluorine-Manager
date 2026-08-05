@@ -111,6 +111,56 @@ set_target_properties(organizer PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON)
 
+# USVFS itself is a Windows DLL, so Fluorine hands a versioned launch request
+# to a small Windows controller inside the same Proton invocation. Release
+# builds provide the pinned runtime under /opt from docker/Dockerfile. Keep the
+# native organizer build usable for contributors without MinGW or those assets.
+find_program(FLUORINE_MINGW_CXX x86_64-w64-mingw32-g++)
+set(FLUORINE_USVFS_RUNTIME_DIR "/opt/fluorine-usvfs" CACHE PATH
+    "Directory containing the pinned USVFS Windows runtime")
+set(FLUORINE_USVFS_REQUIRED_FILES
+    usvfs_x64.dll
+    usvfs_x86.dll
+    usvfs_proxy_x64.exe
+    usvfs_proxy_x86.exe)
+set(FLUORINE_USVFS_RUNTIME_AVAILABLE TRUE)
+foreach(runtime_file IN LISTS FLUORINE_USVFS_REQUIRED_FILES)
+    if(NOT EXISTS "${FLUORINE_USVFS_RUNTIME_DIR}/${runtime_file}")
+        set(FLUORINE_USVFS_RUNTIME_AVAILABLE FALSE)
+    endif()
+endforeach()
+
+if(FLUORINE_MINGW_CXX AND FLUORINE_USVFS_RUNTIME_AVAILABLE)
+    set(FLUORINE_USVFS_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/usvfs")
+    set(FLUORINE_USVFS_HELPER
+        "${FLUORINE_USVFS_OUTPUT_DIR}/fluorine-usvfs-launcher.exe")
+    add_custom_command(
+        OUTPUT "${FLUORINE_USVFS_HELPER}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${FLUORINE_USVFS_OUTPUT_DIR}"
+        COMMAND "${FLUORINE_MINGW_CXX}"
+                -std=c++20 -O2 -static -static-libgcc -static-libstdc++ -municode
+                "${CMAKE_SOURCE_DIR}/tools/usvfs-launcher/main.cpp"
+                -o "${FLUORINE_USVFS_HELPER}"
+        DEPENDS "${CMAKE_SOURCE_DIR}/tools/usvfs-launcher/main.cpp"
+        COMMENT "Building Wine-side Fluorine USVFS controller"
+        VERBATIM)
+    add_custom_target(fluorine-usvfs-runtime ALL
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${FLUORINE_USVFS_RUNTIME_DIR}/usvfs_x64.dll"
+                "${FLUORINE_USVFS_RUNTIME_DIR}/usvfs_x86.dll"
+                "${FLUORINE_USVFS_RUNTIME_DIR}/usvfs_proxy_x64.exe"
+                "${FLUORINE_USVFS_RUNTIME_DIR}/usvfs_proxy_x86.exe"
+                "${FLUORINE_USVFS_OUTPUT_DIR}"
+        DEPENDS "${FLUORINE_USVFS_HELPER}"
+        COMMENT "Refreshing pinned Wine-side USVFS runtime"
+        VERBATIM)
+    add_dependencies(organizer fluorine-usvfs-runtime)
+else()
+    message(WARNING
+        "USVFS runtime helper will not be built (MinGW compiler or pinned runtime missing). "
+        "The FUSE backend remains available.")
+endif()
+
 target_include_directories(organizer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}

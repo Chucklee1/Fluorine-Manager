@@ -63,6 +63,9 @@ struct SpawnParameters
   // without symlinks, which Wine can accidentally replace.
   QString saveBindMountSource;
   QString saveBindMountTarget;
+  // Versioned request consumed by the Wine-side USVFS controller. Empty means
+  // launch the target normally (the FUSE path).
+  QString usvfsRequestPath;
 };
 
 bool checkSteam(QWidget* parent, const SpawnParameters& sp, const QDir& gameDirectory,

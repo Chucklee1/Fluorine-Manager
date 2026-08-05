@@ -33,6 +33,8 @@
 #include "spawn.h"
 #include "syncoverwritedialog.h"
 #include "virtualfiletree.h"
+#include "usvfsrequest.h"
+#include "vfsbackend.h"
 #include "vfs/permissionrepair.h"
 #include "vfs/gamesavemigration.h"
 #include <ipluginmodpage.h>
@@ -2867,6 +2869,7 @@ bool OrganizerCore::beforeRun(
     const QFileInfo& binary, const QDir& cwd, const QString& arguments,
     const QString& profileName, const QString& customOverwrite,
     const QList<MOBase::ExecutableForcedLoadSetting>& forcedLibraries,
+    bool useProton, QString* usvfsRequestPath,
     QString* saveBindMountSource, QString* saveBindMountTarget)
 {
   saveCurrentProfile();
@@ -2887,6 +2890,7 @@ bool OrganizerCore::beforeRun(
   }
   if (saveBindMountSource) saveBindMountSource->clear();
   if (saveBindMountTarget) saveBindMountTarget->clear();
+  if (usvfsRequestPath) usvfsRequestPath->clear();
 
   // need to wait until directory structure is ready
   if (m_DirectoryUpdate) {
@@ -2990,16 +2994,98 @@ bool OrganizerCore::beforeRun(
       QSettings().value("fluorine/disable_vfs_cache", false).toBool());
 
   try {
-    // OpenMW and other self-managed-VFS games skip the FUSE mount (usesVFS()).
-    if (managedGame() == nullptr || managedGame()->usesVFS()) {
+    // OpenMW and other self-managed-VFS games skip both organizer VFS
+    // backends. USVFS is a Windows hooking library, so native launches always
+    // retain the existing FUSE implementation even if this instance prefers
+    // USVFS for Wine/Proton.
+    const bool gameUsesOrganizerVfs =
+        managedGame() == nullptr || managedGame()->usesVFS();
+    const QSettings instanceIni(m_Settings.filename(), QSettings::IniFormat);
+    const VfsBackend configuredBackend = parseVfsBackend(
+        instanceIni.value(kVfsBackendSetting, QStringLiteral("fuse"))
+            .toString());
+    const bool launchWithUsvfs =
+        useUsvfsForLaunch(configuredBackend, useProton, gameUsesOrganizerVfs);
+
+    if (launchWithUsvfs) {
+      if (usvfsRequestPath == nullptr) {
+        throw std::runtime_error(
+            "USVFS selected but no launcher request destination was provided");
+      }
+
+      const auto usvfsPreparationStart = std::chrono::steady_clock::now();
+
+      // The Data tab may have mounted a preview FUSE tree earlier. USVFS maps
+      // the original physical destinations, so tear the preview down first.
+      m_USVFS.unmount();
+      const MappingType mappings = fileMapping(profileName, customOverwrite);
+      m_USVFS.prepareRootFilesForUsvfs(mappings);
+
+      const QString logsDirectory =
+          QDir(qApp->property("dataPath").toString()).filePath("logs");
+      QDir().mkpath(logsDirectory);
+      UsvfsRequestOptions requestOptions{
+          .binary = binary,
+          .workingDirectory = cwd,
+          .arguments = QProcess::splitCommand(arguments),
+          .mappings = mappings,
+          .forcedLibraries = forcedLibraries,
+          .executableBlacklist =
+              m_Settings.executablesBlacklist().split(';', Qt::SkipEmptyParts),
+          .skipFileSuffixes = m_Settings.skipFileSuffixes(),
+          .skipDirectories = m_Settings.skipDirectories(),
+          .logPath =
+              QDir(logsDirectory)
+                  .filePath(QStringLiteral("usvfs-%1.log")
+                                .arg(QDateTime::currentDateTimeUtc().toString(
+                                    QStringLiteral("yyyyMMdd-HHmmss-zzz")))),
+      };
+      const auto mappingPreparedAt = std::chrono::steady_clock::now();
+      const auto requestWriteStart = mappingPreparedAt;
+      const UsvfsRequestResult request = writeUsvfsRequest(requestOptions);
+      if (!request) {
+        throw std::runtime_error(request.error.toStdString());
+      }
+      const auto requestWrittenAt = std::chrono::steady_clock::now();
+      {
+        QFile benchmarkLog(requestOptions.logPath);
+        if (benchmarkLog.open(QIODevice::WriteOnly | QIODevice::Append |
+                              QIODevice::Text)) {
+          QTextStream stream(&benchmarkLog);
+          stream << "[benchmark] format=1 phase=fluorine_prepare elapsed_ms="
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        mappingPreparedAt - usvfsPreparationStart)
+                        .count()
+                 << " mappings=" << mappings.size() << Qt::endl;
+          stream << "[benchmark] format=1 phase=request_serialize elapsed_ms="
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        requestWrittenAt - requestWriteStart)
+                        .count()
+                 << Qt::endl;
+        }
+      }
+      *usvfsRequestPath = request.path;
+      log::info("beforeRun: using Wine/Proton USVFS backend (instance='{}', "
+                "request='{}', mappings={})",
+                request.instanceName, request.path, mappings.size());
+    } else if (gameUsesOrganizerVfs) {
       m_USVFS.updateMapping(fileMapping(profileName, customOverwrite));
       m_USVFS.updateForcedLibraries(forcedLibraries);
+      log::debug("beforeRun: using FUSE backend{}",
+                 configuredBackend == VfsBackend::Usvfs && !useProton
+                     ? " (native launch override)"
+                     : "");
     } else {
-      log::debug("beforeRun: skipping FUSE mount; managed game manages its own "
+      log::debug("beforeRun: skipping organizer VFS; managed game manages its own "
                  "VFS (usesVFS=false)");
     }
   } catch (const FuseConnectorException& e) {
     log::error("VFS mount failed: {}", e.what());
+    if (usvfsRequestPath && !usvfsRequestPath->isEmpty()) {
+      QFile::remove(*usvfsRequestPath);
+      usvfsRequestPath->clear();
+    }
+    m_USVFS.unmount();
     return false;
   } catch (const std::exception& e) {
     QWidget* w = nullptr;
@@ -3007,6 +3093,11 @@ bool OrganizerCore::beforeRun(
       w = m_UserInterface->mainWindow();
     }
     QMessageBox::warning(w, tr("Error"), e.what());
+    if (usvfsRequestPath && !usvfsRequestPath->isEmpty()) {
+      QFile::remove(*usvfsRequestPath);
+      usvfsRequestPath->clear();
+    }
+    m_USVFS.unmount();
     return false;
   }
 

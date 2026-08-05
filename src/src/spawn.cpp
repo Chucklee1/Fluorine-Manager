@@ -25,6 +25,7 @@ along with Mod Organizer.  If not, see <http://www.gnu.org/licenses/>.
 #include "protonlauncher.h"
 #include "settings.h"
 #include "shared/appconfig.h"
+#include "vfsbackend.h"
 
 #include <QApplication>
 #include <QDir>
@@ -457,6 +458,39 @@ int spawn(const SpawnParameters& sp, pid_t& processId)
 
     if (!sp.saveBindMountSource.isEmpty() && !sp.saveBindMountTarget.isEmpty()) {
       launcher.setSavesBindMount(sp.saveBindMountSource, sp.saveBindMountTarget);
+    }
+    if (!sp.usvfsRequestPath.isEmpty()) {
+      launcher.setUsvfsRequest(sp.usvfsRequestPath);
+
+      bool exactQueryExhaustion = false;
+      bool sharedContext        = false;
+      if (instanceForLaunch) {
+        const QSettings instanceIni(instanceForLaunch->filename(),
+                                    QSettings::IniFormat);
+        exactQueryExhaustion =
+            instanceIni.value(kUsvfsExactQueryExhaustionSetting, false).toBool();
+        sharedContext =
+            instanceIni.value(kUsvfsSharedContextSetting, false).toBool();
+      }
+      const auto environmentFlag = [](const char* name, bool fallback) {
+        if (!qEnvironmentVariableIsSet(name)) {
+          return fallback;
+        }
+        return parseUsvfsExperimentFlag(qEnvironmentVariable(name), fallback);
+      };
+      exactQueryExhaustion = environmentFlag(
+          kUsvfsExactQueryExhaustionEnvironment, exactQueryExhaustion);
+      sharedContext =
+          environmentFlag(kUsvfsSharedContextEnvironment, sharedContext);
+      launcher
+          .addEnvVar(QString::fromLatin1(kUsvfsExactQueryExhaustionEnvironment),
+                     exactQueryExhaustion ? QStringLiteral("1")
+                                          : QStringLiteral("0"))
+          .addEnvVar(QString::fromLatin1(kUsvfsSharedContextEnvironment),
+                     sharedContext ? QStringLiteral("1") : QStringLiteral("0"));
+      MOBase::log::info(
+          "USVFS experiments: exact_query_exhaustion={} shared_context={}",
+          exactQueryExhaustion, sharedContext);
     }
   } else {
     MOBase::log::info("Launching executable directly without Proton");

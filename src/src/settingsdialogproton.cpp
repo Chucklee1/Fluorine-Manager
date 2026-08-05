@@ -4,7 +4,9 @@
 #include "fluorinepaths.h"
 #include "prefixsetupdialog.h"
 #include "ui_settingsdialog.h"
+#include "vfsbackend.h"
 
+#include <algorithm>
 #include <QtConcurrent/QtConcurrentRun>
 #include <log.h>
 #include <uibase/utility.h>
@@ -50,6 +52,23 @@ ProtonSettingsTab::ProtonSettingsTab(Settings& s, SettingsDialog& d)
 
   ui->disableVfsCacheCheckBox->setChecked(
       QSettings().value("fluorine/disable_vfs_cache", false).toBool());
+
+  ui->vfsBackendComboBox->addItem(tr("FUSE (default)"),
+                                  vfsBackendSettingValue(VfsBackend::Fuse));
+  ui->vfsBackendComboBox->addItem(
+      tr("USVFS for Wine/Proton (experimental)"),
+      vfsBackendSettingValue(VfsBackend::Usvfs));
+  const QSettings instanceSettings(settings().filename(), QSettings::IniFormat);
+  const QString configuredBackend =
+      instanceSettings.value(kVfsBackendSetting, QStringLiteral("fuse"))
+          .toString();
+  const int backendIndex = ui->vfsBackendComboBox->findData(
+      vfsBackendSettingValue(parseVfsBackend(configuredBackend)));
+  ui->vfsBackendComboBox->setCurrentIndex(std::max(0, backendIndex));
+  ui->usvfsExactQueryExhaustionCheckBox->setChecked(
+      instanceSettings.value(kUsvfsExactQueryExhaustionSetting, false).toBool());
+  ui->usvfsSharedContextCheckBox->setChecked(
+      instanceSettings.value(kUsvfsSharedContextSetting, false).toBool());
 
   populateProtons();
 
@@ -122,6 +141,13 @@ void ProtonSettingsTab::update()
   QSettings().setValue("fluorine/launch_wrapper", ui->launchWrapperEdit->text());
   QSettings().setValue("fluorine/disable_vfs_cache",
                        ui->disableVfsCacheCheckBox->isChecked());
+  QSettings instanceSettings(settings().filename(), QSettings::IniFormat);
+  instanceSettings.setValue(kVfsBackendSetting,
+                            ui->vfsBackendComboBox->currentData().toString());
+  instanceSettings.setValue(kUsvfsExactQueryExhaustionSetting,
+                            ui->usvfsExactQueryExhaustionCheckBox->isChecked());
+  instanceSettings.setValue(kUsvfsSharedContextSetting,
+                            ui->usvfsSharedContextCheckBox->isChecked());
 }
 
 void ProtonSettingsTab::populateProtons()

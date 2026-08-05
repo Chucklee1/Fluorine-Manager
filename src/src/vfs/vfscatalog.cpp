@@ -180,6 +180,20 @@ uint64_t fnv1a(const std::string& value)
   return hash;
 }
 
+std::string catalogRootIdentity(const std::string& path)
+{
+  // Persistent keys must not vary with aliases such as Bazzite's /home and
+  // /var/home. Callers retain the original path for filesystem traversal.
+  std::error_code error;
+  fs::path identity = fs::weakly_canonical(fs::path(path), error);
+  if (error) {
+    error.clear();
+    identity = fs::absolute(fs::path(path), error);
+  }
+  if (error) identity = fs::path(path);
+  return identity.lexically_normal().string();
+}
+
 bool isBethesdaArchive(const std::string& path)
 {
   const std::string normalized = normalizeForLookup(path);
@@ -665,7 +679,8 @@ fs::path VfsCatalog::databasePath(const std::string& data_dir)
 {
   char name[48];
   std::snprintf(name, sizeof(name), "%016llx.catalog.sqlite",
-                static_cast<unsigned long long>(fnv1a(data_dir)));
+                static_cast<unsigned long long>(
+                    fnv1a(catalogRootIdentity(data_dir))));
   return fs::path(fluorineVfsCacheDir().toStdString()) / name;
 }
 
@@ -707,15 +722,22 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
     VfsCatalogProgress state;
 
     std::vector<Root> roots;
-    if (scan_base) roots.push_back({data_dir, data_dir, "_base_game", true});
-    for (const auto& [name, path] : mods) roots.push_back({path, path, name, false});
-    roots.push_back({overwrite_dir, overwrite_dir, "Overwrite", false});
+    const std::string dataRootKey = catalogRootIdentity(data_dir);
+    const std::string overwriteRootKey = catalogRootIdentity(overwrite_dir);
+    if (scan_base) {
+      roots.push_back({dataRootKey, data_dir, "_base_game", true});
+    }
+    for (const auto& [name, path] : mods) {
+      roots.push_back({catalogRootIdentity(path), path, name, false});
+    }
+    roots.push_back(
+        {overwriteRootKey, overwrite_dir, "Overwrite", false});
 
     if (!scan_base) {
       auto base = prepare(db.get(),
           "SELECT relative_path,size,mtime_ns,mode,blake3 FROM catalog_files"
           " WHERE root_key=?1 ORDER BY normalized_path;");
-      bindText(db.get(), base.get(), 1, data_dir);
+      bindText(db.get(), base.get(), 1, dataRootKey);
       while (sqlite3_step(base.get()) == SQLITE_ROW) {
         const auto* rel = reinterpret_cast<const char*>(sqlite3_column_text(base.get(), 0));
         if (rel == nullptr) continue;
@@ -783,9 +805,9 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
     if (!scan_base) {
       sqlite3_reset(findRoot.get());
       sqlite3_clear_bindings(findRoot.get());
-      bindText(db.get(), findRoot.get(), 1, data_dir);
+      bindText(db.get(), findRoot.get(), 1, dataRootKey);
       VfsProviderRoot baseRoot{
-          data_dir, "_base_game", true, 0, {}};
+          dataRootKey, "_base_game", true, 0, {}};
       if (sqlite3_step(findRoot.get()) == SQLITE_ROW) {
         const void* digest = sqlite3_column_blob(findRoot.get(), 0);
         const int bytes = sqlite3_column_bytes(findRoot.get(), 0);
@@ -798,11 +820,11 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
           ++state.merkle_roots_reused;
         } else {
           baseRoot = calculateProviderRoot(
-              db.get(), Root{data_dir, data_dir, "_base_game", true});
+              db.get(), Root{dataRootKey, data_dir, "_base_game", true});
         }
       } else {
         baseRoot = calculateProviderRoot(
-            db.get(), Root{data_dir, data_dir, "_base_game", true});
+            db.get(), Root{dataRootKey, data_dir, "_base_game", true});
       }
       providerRoots.push_back(std::move(baseRoot));
     }
@@ -906,17 +928,32 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
           const auto cached = cachedFiles.find(normalized);
           if (cached != cachedFiles.end()) {
             const CachedCatalogFile& old = cached->second;
-            reuseHash =
-                old.device == st.st_dev &&
-                old.inode == st.st_ino &&
-                old.size == st.st_size &&
-                old.mode == (st.st_mode & 07777) &&
-                old.mtime_ns == mtimeNs &&
-                old.ctime_ns == ctimeNs &&
-                old.has_digest;
+            const bool deviceMatches = old.device == st.st_dev;
+            const bool inodeMatches = old.inode == st.st_ino;
+            const bool sizeMatches = old.size == st.st_size;
+            const bool modeMatches = old.mode == (st.st_mode & 07777);
+            const bool mtimeMatches = old.mtime_ns == mtimeNs;
+            const bool ctimeMatches = old.ctime_ns == ctimeNs;
+            reuseHash = deviceMatches && inodeMatches && sizeMatches &&
+                        modeMatches && mtimeMatches && ctimeMatches &&
+                        old.has_digest;
             if (reuseHash) {
               digest = old.digest;
+            } else {
+              ++state.fingerprint_misses;
+              if (!deviceMatches) {
+                ++state.fingerprint_device_mismatches;
+              }
+              if (!inodeMatches) ++state.fingerprint_inode_mismatches;
+              if (!sizeMatches) ++state.fingerprint_size_mismatches;
+              if (!modeMatches) ++state.fingerprint_mode_mismatches;
+              if (!mtimeMatches) ++state.fingerprint_mtime_mismatches;
+              if (!ctimeMatches) ++state.fingerprint_ctime_mismatches;
+              if (!old.has_digest) ++state.fingerprint_missing_digests;
             }
+          } else {
+            ++state.fingerprint_misses;
+            ++state.fingerprint_uncached;
           }
 
           pendingFiles.push_back({
@@ -1058,7 +1095,7 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
     auto overwriteRows = prepare(db.get(),
         "SELECT relative_path,normalized_path,blake3 FROM catalog_files"
         " WHERE root_key=?1 ORDER BY normalized_path;");
-    bindText(db.get(), overwriteRows.get(), 1, overwrite_dir);
+    bindText(db.get(), overwriteRows.get(), 1, overwriteRootKey);
     auto matchingProvider = prepare(db.get(),
         "SELECT blake3 FROM catalog_files"
         " WHERE root_key=?1 AND normalized_path=?2;");
@@ -1078,7 +1115,8 @@ VfsCatalogResult VfsCatalog::reconcileAndBuild(
       for (auto mod = mods.rbegin(); mod != mods.rend(); ++mod) {
         sqlite3_reset(matchingProvider.get());
         sqlite3_clear_bindings(matchingProvider.get());
-        bindText(db.get(), matchingProvider.get(), 1, mod->second);
+        bindText(db.get(), matchingProvider.get(), 1,
+                 catalogRootIdentity(mod->second));
         bindText(db.get(), matchingProvider.get(), 2, normalized);
         if (sqlite3_step(matchingProvider.get()) != SQLITE_ROW) continue;
         const void* modHash = sqlite3_column_blob(matchingProvider.get(), 0);
@@ -1109,6 +1147,7 @@ VfsCatalogRefreshResult VfsCatalog::forceRefreshProviderFiles(
     const std::string& rootKey, const std::string& origin, bool isBacking,
     const std::vector<std::string>& relativePaths)
 {
+  const std::string rootIdentity = catalogRootIdentity(rootKey);
   std::error_code ec;
   fs::create_directories(m_database_path.parent_path(), ec);
   if (ec) {
@@ -1162,7 +1201,7 @@ VfsCatalogRefreshResult VfsCatalog::forceRefreshProviderFiles(
         }
         sqlite3_reset(remove.get());
         sqlite3_clear_bindings(remove.get());
-        bindText(db.get(), remove.get(), 1, rootKey);
+        bindText(db.get(), remove.get(), 1, rootIdentity);
         bindText(db.get(), remove.get(), 2, normalized);
         if (sqlite3_step(remove.get()) != SQLITE_DONE) {
           throwDb(db.get(), "Removing missing catalog file");
@@ -1196,7 +1235,7 @@ VfsCatalogRefreshResult VfsCatalog::forceRefreshProviderFiles(
 
       sqlite3_reset(upsert.get());
       sqlite3_clear_bindings(upsert.get());
-      bindText(db.get(), upsert.get(), 1, rootKey);
+      bindText(db.get(), upsert.get(), 1, rootIdentity);
       bindText(db.get(), upsert.get(), 2, relativePath.generic_string());
       bindText(db.get(), upsert.get(), 3, normalized);
       bindText(db.get(), upsert.get(), 4, origin);
@@ -1215,14 +1254,14 @@ VfsCatalogRefreshResult VfsCatalog::forceRefreshProviderFiles(
       result.files.push_back({relativePath.generic_string(), true, digest});
     }
 
-    const Root root{rootKey, rootKey, origin, isBacking};
+    const Root root{rootIdentity, rootKey, origin, isBacking};
     result.provider_root = calculateProviderRoot(db.get(), root);
     auto upsertRoot = prepare(db.get(),
         "INSERT INTO catalog_roots(root_key,merkle_root,file_count,generation)"
         " VALUES(?1,?2,?3,?4) ON CONFLICT(root_key) DO UPDATE SET"
         " merkle_root=excluded.merkle_root,file_count=excluded.file_count,"
         " generation=excluded.generation;");
-    bindText(db.get(), upsertRoot.get(), 1, rootKey);
+    bindText(db.get(), upsertRoot.get(), 1, rootIdentity);
     sqlite3_bind_blob(upsertRoot.get(), 2, result.provider_root.digest.data(),
                       result.provider_root.digest.size(), SQLITE_TRANSIENT);
     sqlite3_bind_int64(upsertRoot.get(), 3, result.provider_root.file_count);
@@ -1242,6 +1281,7 @@ void VfsCatalog::invalidateProviderFiles(
     const std::string& rootKey,
     const std::vector<std::string>& relativePaths) noexcept
 {
+  const std::string rootIdentity = catalogRootIdentity(rootKey);
   sqlite3* raw = nullptr;
   if (sqlite3_open_v2(m_database_path.c_str(), &raw,
                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
@@ -1259,12 +1299,12 @@ void VfsCatalog::invalidateProviderFiles(
     for (const std::string& relative : relativePaths) {
       sqlite3_reset(remove.get());
       sqlite3_clear_bindings(remove.get());
-      bindText(db.get(), remove.get(), 1, rootKey);
+      bindText(db.get(), remove.get(), 1, rootIdentity);
       bindText(db.get(), remove.get(), 2, normalizeForLookup(relative));
       if (sqlite3_step(remove.get()) != SQLITE_DONE) throwDb(db.get(), "Invalidating catalog file");
     }
     auto removeRoot = prepare(db.get(), "DELETE FROM catalog_roots WHERE root_key=?1;");
-    bindText(db.get(), removeRoot.get(), 1, rootKey);
+    bindText(db.get(), removeRoot.get(), 1, rootIdentity);
     if (sqlite3_step(removeRoot.get()) != SQLITE_DONE) throwDb(db.get(), "Invalidating catalog root");
     exec(db.get(), "COMMIT;");
   } catch (...) {
@@ -1275,6 +1315,7 @@ void VfsCatalog::invalidateProviderFiles(
 std::vector<CachedBaseFile> VfsCatalog::loadBaseSnapshot(
     const std::string& data_dir) const
 {
+  const std::string dataRootKey = catalogRootIdentity(data_dir);
   sqlite3* raw = nullptr;
   if (sqlite3_open_v2(m_database_path.c_str(), &raw,
                       SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
@@ -1286,7 +1327,7 @@ std::vector<CachedBaseFile> VfsCatalog::loadBaseSnapshot(
   auto stmt = prepare(db.get(),
       "SELECT relative_path,size,mtime_ns,mode FROM catalog_files"
       " WHERE root_key=?1 ORDER BY normalized_path;");
-  bindText(db.get(), stmt.get(), 1, data_dir);
+  bindText(db.get(), stmt.get(), 1, dataRootKey);
 
   std::vector<CachedBaseFile> files;
   while (sqlite3_step(stmt.get()) == SQLITE_ROW) {

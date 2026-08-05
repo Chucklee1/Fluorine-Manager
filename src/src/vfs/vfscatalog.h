@@ -18,6 +18,15 @@ struct VfsCatalogProgress
   uint64_t files_hashed = 0;
   uint64_t bytes_hashed = 0;
   uint64_t hash_workers = 0;
+  uint64_t fingerprint_misses = 0;
+  uint64_t fingerprint_uncached = 0;
+  uint64_t fingerprint_device_mismatches = 0;
+  uint64_t fingerprint_inode_mismatches = 0;
+  uint64_t fingerprint_size_mismatches = 0;
+  uint64_t fingerprint_mode_mismatches = 0;
+  uint64_t fingerprint_mtime_mismatches = 0;
+  uint64_t fingerprint_ctime_mismatches = 0;
+  uint64_t fingerprint_missing_digests = 0;
   uint64_t provider_roots_changed = 0;
   uint64_t catalog_rows_loaded = 0;
   uint64_t catalog_rows_written = 0;

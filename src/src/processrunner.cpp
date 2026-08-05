@@ -4,6 +4,7 @@
 #include "instancemanager.h"
 #include "iuserinterface.h"
 #include "organizercore.h"
+#include "vfsbackend.h"
 
 #include <iplugingame.h>
 #include <log.h>
@@ -17,6 +18,7 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QProcess>
+#include <QSettings>
 #include <QThread>
 
 #include <cerrno>
@@ -1190,18 +1192,42 @@ std::optional<ProcessRunner::Results> ProcessRunner::runBinary()
     m_profileName = profile->name();
   }
 
+  const auto* game = m_core.managedGame();
+  auto& settings   = m_core.settings();
+
+  // FUSE makes an executable stored under mods/ visible at its virtual game
+  // path before adjustForVirtualized runs. USVFS is installed by the Windows
+  // helper later, so its request must contain that virtual target from the
+  // outset.
+  const QSettings instanceIni(settings.filename(), QSettings::IniFormat);
+  const bool preparingUsvfs = useUsvfsForLaunch(
+      parseVfsBackend(
+          instanceIni.value(kVfsBackendSetting, QStringLiteral("fuse"))
+              .toString()),
+      m_sp.useProton, game == nullptr || game->usesVFS());
+  if (preparingUsvfs && game != nullptr) {
+    adjustForVirtualized(game, m_sp, settings);
+  }
+
   // saves profile, sets up the VFS, notifies plugins, etc.; can return false
   // if a plugin doesn't want the program to run.
   if (!m_core.beforeRun(m_sp.binary, m_sp.currentDirectory, m_sp.arguments,
                         m_profileName, m_customOverwrite, m_forcedLibraries,
+                        m_sp.useProton, &m_sp.usvfsRequestPath,
                         &m_sp.saveBindMountSource, &m_sp.saveBindMountTarget)) {
     return Error;
   }
 
+  const auto abortPreparedLaunch = [this]() {
+    if (!m_sp.usvfsRequestPath.isEmpty()) {
+      QFile::remove(m_sp.usvfsRequestPath);
+      m_sp.usvfsRequestPath.clear();
+    }
+    m_core.unmountVFS();
+  };
+
   QWidget* parent = (m_ui ? m_ui->mainWindow() : nullptr);
 
-  const auto* game = m_core.managedGame();
-  auto& settings   = m_core.settings();
   m_sp.gameDirectory = game->gameDirectory();
 
   if (m_sp.steamAppID.trimmed().isEmpty()) {
@@ -1214,21 +1240,28 @@ std::optional<ProcessRunner::Results> ProcessRunner::runBinary()
   }
 
   if (!checkSteam(parent, m_sp, game->gameDirectory(), m_sp.steamAppID, settings)) {
+    abortPreparedLaunch();
     return Error;
   }
 
   if (!checkBlacklist(parent, m_sp, settings)) {
+    abortPreparedLaunch();
     return Error;
   }
 
   // if the executable is inside the mods folder another instance of
   // ModOrganizer is spawned instead to launch it
-  adjustForVirtualized(game, m_sp, settings);
+  if (!preparingUsvfs) {
+    adjustForVirtualized(game, m_sp, settings);
+  }
 
   m_handle.reset(reinterpret_cast<HANDLE>(
       static_cast<intptr_t>(startBinary(parent, m_sp))));
 
   if (m_handle.get() == INVALID_HANDLE_VALUE) {
+    // beforeRun may have deployed Root Builder files for the Wine-side USVFS
+    // helper. Use the normal VFS teardown path when process creation fails.
+    abortPreparedLaunch();
     return Error;
   }
 
@@ -1295,8 +1328,14 @@ ProcessRunner::Results ProcessRunner::postRun()
     m_lockReason = UILocker::LockUI;
   }
 
-  const QStringList expectedExecutables  =
-      buildExpectedExecutables(m_sp.binary, m_sp.arguments);
+  const bool usingUsvfsHelper = !m_sp.usvfsRequestPath.isEmpty();
+  const QStringList expectedExecutables = processTrackingExecutables(
+      buildExpectedExecutables(m_sp.binary, m_sp.arguments), usingUsvfsHelper);
+
+  if (usingUsvfsHelper) {
+    log::debug("process runner: using {} as the USVFS lifetime anchor",
+               kUsvfsLauncherExecutable);
+  }
 
   if (!mustWait) {
     if (m_lockReason == UILocker::NoReason) {
@@ -1309,28 +1348,18 @@ ProcessRunner::Results ProcessRunner::postRun()
         const QFileInfo binary       = m_sp.binary;
         QPointer<OrganizerCore> core = &m_core;
 
-        std::thread([core, binary, pid]() {
-          int status     = 0;
-          pid_t waited   = -1;
-          do {
-            waited = ::waitpid(pid, &status, 0);
-          } while (waited == -1 && errno == EINTR);
-
+        std::thread([core, binary, pid, expectedExecutables]() {
           DWORD exitCode = 0;
-          if (waited == pid) {
-            if (WIFEXITED(status)) {
-              exitCode = static_cast<DWORD>(WEXITSTATUS(status));
-            } else if (WIFSIGNALED(status)) {
-              exitCode = static_cast<DWORD>(128 + WTERMSIG(status));
-            }
-          } else if (errno == ECHILD) {
-            // Detached process — poll with kill(0) until gone.
-            while (::kill(pid, 0) == 0 || errno == EPERM) {
-              usleep(200000);
-            }
-          } else {
-            MOBase::log::warn("process runner: waitpid failed for pid {}: {}", pid,
-                              errno);
+          const auto result = waitForPid(pid, &exitCode, nullptr,
+                                         expectedExecutables,
+                                         /*killTreeOnUnlock=*/false);
+
+          if (result != ProcessRunner::Completed) {
+            MOBase::log::warn(
+                "process runner: asynchronous lifetime tracking failed for "
+                "pid {} (result {})",
+                pid, static_cast<int>(result));
+            exitCode = 1;
           }
 
           if (!core) {
@@ -1347,7 +1376,10 @@ ProcessRunner::Results ProcessRunner::postRun()
               Qt::QueuedConnection);
         }).detach();
 
-        log::debug("process runner: scheduled async post-run refresh for pid {}", pid);
+        log::debug(
+            "process runner: scheduled async post-run refresh for pid {} "
+            "tracking [{}]",
+            pid, expectedExecutables.join(", ").toStdString());
       }
       return Running;
     }

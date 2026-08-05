@@ -10,7 +10,7 @@ ENV PATH="/opt/rust/cargo/bin:${PATH}"
 # Python comes from uv (python-build-standalone), not apt.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Build essentials
-    build-essential cmake meson ninja-build ccache \
+    build-essential cmake meson ninja-build ccache mingw-w64 \
     git curl wget file binutils patchelf pkg-config ca-certificates \
     fonts-dejavu-core \
     # Library dependencies
@@ -36,12 +36,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-xkb-dev libxkbcommon-x11-dev libatspi2.0-dev \
     libwayland-dev \
     # Misc
-    zip unzip \
+    zip unzip p7zip-full \
     # Static analysis
     clang-tidy \
     # WebP support for Qt image format plugin
     libwebp-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# ── Wine-side USVFS runtime ──
+# Pin the fork's full-matrix release containing only the Wine short-name
+# application change over upstream 0.5.7.2. The helper compiled by Fluorine is
+# kept separate from these third-party artifacts so updates remain auditable.
+ARG USVFS_RELEASE_TAG=v0.5.7.2-wine-shortname.3
+ARG USVFS_ARCHIVE_SHA256=91e24d6971e8f9f084d60d2f372a5c6d816587a83f2683737c22e643eb40c133
+ARG USVFS_LICENSE_SHA256=6ade493f62fb87b3a2fc83d681eb5cb84e1a7a17d426b0277490c0d618017935
+RUN mkdir -p /opt/fluorine-usvfs /tmp/usvfs-extract && \
+    curl -L --fail --retry 3 \
+      "https://github.com/SulfurNitride/usvfs/releases/download/${USVFS_RELEASE_TAG}/usvfs_${USVFS_RELEASE_TAG}.7z" \
+      -o /tmp/usvfs.7z && \
+    echo "${USVFS_ARCHIVE_SHA256}  /tmp/usvfs.7z" | sha256sum -c - && \
+    7z x -y /tmp/usvfs.7z -o/tmp/usvfs-extract >/dev/null && \
+    cp /tmp/usvfs-extract/bin/usvfs_x64.dll \
+       /tmp/usvfs-extract/bin/usvfs_x86.dll \
+       /tmp/usvfs-extract/bin/usvfs_proxy_x64.exe \
+       /tmp/usvfs-extract/bin/usvfs_proxy_x86.exe \
+       /opt/fluorine-usvfs/ && \
+    curl -L --fail --retry 3 \
+      "https://raw.githubusercontent.com/SulfurNitride/usvfs/${USVFS_RELEASE_TAG}/LICENSE" \
+      -o /opt/fluorine-usvfs/LICENSE && \
+    echo "${USVFS_LICENSE_SHA256}  /opt/fluorine-usvfs/LICENSE" | sha256sum -c - && \
+    rm -rf /tmp/usvfs.7z /tmp/usvfs-extract
 
 # Build a pinned upstream libfuse so Fluorine compiles and bundles matching
 # headers/runtime across supported build images.

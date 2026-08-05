@@ -574,15 +574,18 @@ bool FuseConnector::mount(
   // need only a stat fingerprint; BLAKE3 is recalculated only for drifted
   // files. The returned tree is a complete immutable in-memory generation.
   const auto treeStart = std::chrono::steady_clock::now();
-  VfsCatalog catalog(VfsCatalog::databasePath(m_dataDirPath));
+  const fs::path catalogDatabase = VfsCatalog::databasePath(m_dataDirPath);
+  VfsCatalog catalog(catalogDatabase);
+  std::fprintf(stderr, "[VFS] [catalog] database='%s'\n",
+               catalogDatabase.c_str());
   uint64_t lastProgress = 0;
   VfsCatalogProgress finalProgress;
   std::unique_ptr<QProgressDialog> catalogProgress;
   if (qApp != nullptr && QThread::currentThread() == qApp->thread()) {
     catalogProgress = std::make_unique<QProgressDialog>(
-        QObject::tr("Preparing the VFS catalog…"), QObject::tr("Cancel"),
+        QObject::tr("Checking cached file metadata…"), QObject::tr("Cancel"),
         0, 0, QApplication::activeWindow());
-    catalogProgress->setWindowTitle(QObject::tr("Indexing game files"));
+    catalogProgress->setWindowTitle(QObject::tr("Verifying game files"));
     catalogProgress->setMinimumDuration(750);
     catalogProgress->setAutoClose(false);
   }
@@ -591,16 +594,29 @@ bool FuseConnector::mount(
       [&lastProgress, &catalogProgress, &finalProgress](const VfsCatalogProgress& p) {
         finalProgress = p;
         if (catalogProgress) {
-          catalogProgress->setLabelText(QObject::tr(
-              "Verified %1 files; hashed %2 changed files (%3 MiB at %4 MiB/s)…\n%5")
-              .arg(p.files_scanned)
-              .arg(p.files_hashed)
-              .arg(p.bytes_hashed / (1024 * 1024))
-              .arg(p.hash_mib_per_second, 0, 'f', 1)
-              .arg(QString::fromStdString(p.current_file)));
+          if (p.fingerprint_misses == 0) {
+            catalogProgress->setWindowTitle(
+                QObject::tr("Verifying game files"));
+            catalogProgress->setLabelText(
+                QObject::tr("Checking cached metadata: %1 files verified…\n%2")
+                    .arg(p.files_scanned)
+                    .arg(QString::fromStdString(p.current_root)));
+          } else {
+            catalogProgress->setWindowTitle(
+                QObject::tr("Indexing changed game files"));
+            catalogProgress->setLabelText(QObject::tr(
+                "Verified %1 files; hashed %2 of %3 changed/new files "
+                "(%4 MiB at %5 MiB/s)…\n%6")
+                .arg(p.files_scanned)
+                .arg(p.files_hashed)
+                .arg(p.fingerprint_misses)
+                .arg(p.bytes_hashed / (1024 * 1024))
+                .arg(p.hash_mib_per_second, 0, 'f', 1)
+                .arg(QString::fromStdString(p.current_file)));
+          }
           QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
           if (catalogProgress->wasCanceled()) {
-            throw std::runtime_error("VFS catalog indexing cancelled");
+            throw std::runtime_error("VFS catalog verification cancelled");
           }
         }
         if (p.files_scanned == lastProgress && p.files_scanned != 0) return;
@@ -618,6 +634,8 @@ bool FuseConnector::mount(
   std::fprintf(stderr,
                "[VFS] [catalog] complete scanned=%llu hashed=%llu bytes=%llu "
                "elapsed_ms=%llu mib_s=%.1f hash_workers=%llu "
+               "fingerprint_misses=%llu uncached=%llu device=%llu inode=%llu "
+               "size=%llu mode=%llu mtime=%llu ctime=%llu no_digest=%llu "
                "roots_changed=%llu "
                "catalog_loaded=%llu catalog_written=%llu catalog_deleted=%llu "
                "merkle_reused=%llu "
@@ -629,6 +647,22 @@ bool FuseConnector::mount(
                static_cast<unsigned long long>(finalProgress.elapsed_ms),
                finalProgress.hash_mib_per_second,
                static_cast<unsigned long long>(finalProgress.hash_workers),
+               static_cast<unsigned long long>(finalProgress.fingerprint_misses),
+               static_cast<unsigned long long>(finalProgress.fingerprint_uncached),
+               static_cast<unsigned long long>(
+                   finalProgress.fingerprint_device_mismatches),
+               static_cast<unsigned long long>(
+                   finalProgress.fingerprint_inode_mismatches),
+               static_cast<unsigned long long>(
+                   finalProgress.fingerprint_size_mismatches),
+               static_cast<unsigned long long>(
+                   finalProgress.fingerprint_mode_mismatches),
+               static_cast<unsigned long long>(
+                   finalProgress.fingerprint_mtime_mismatches),
+               static_cast<unsigned long long>(
+                   finalProgress.fingerprint_ctime_mismatches),
+               static_cast<unsigned long long>(
+                   finalProgress.fingerprint_missing_digests),
                static_cast<unsigned long long>(finalProgress.provider_roots_changed),
                static_cast<unsigned long long>(finalProgress.catalog_rows_loaded),
                static_cast<unsigned long long>(finalProgress.catalog_rows_written),
@@ -845,7 +879,11 @@ bool FuseConnector::mount(
 void FuseConnector::unmount()
 {
   if (!m_mounted) {
+    cleanupExternalMappings();
     clearIndexRootLocator();
+    if (m_rootBuilderEnabled) {
+      clearRootFiles();
+    }
     return;
   }
 
@@ -1971,6 +2009,23 @@ void FuseConnector::setRootBuilderEnabled(bool enabled,
   m_rootStorageDir     = storageDir;
 }
 
+void FuseConnector::prepareRootFilesForUsvfs(const MappingType& mapping)
+{
+  auto* game = qApp->property("managed_game").value<MOBase::IPluginGame*>();
+  if (game == nullptr) {
+    throw FuseConnectorException(QObject::tr("Managed game not available"));
+  }
+
+  const QString gameDir = game->gameDirectory().absolutePath();
+  const QString dataDir = game->dataDirectory().absolutePath();
+  const QString overwriteDir = Settings::instance().paths().overwrite();
+  m_gameDir = gameDir.toStdString();
+
+  if (m_rootBuilderEnabled) {
+    deployRootFiles(buildModsFromMapping(mapping, dataDir, overwriteDir));
+  }
+}
+
 static std::string findRootDir(const std::string& modPath)
 {
   // Case-insensitive search for "Root" subdirectory
@@ -2179,7 +2234,15 @@ void FuseConnector::clearRootFiles()
                      m_rootBackups);
   }
 
-  if (m_rootDeployedFiles.empty() && m_rootDeployedDirs.empty()) return;
+  if (m_rootDeployedFiles.empty() && m_rootDeployedDirs.empty() &&
+      m_rootBackups.empty()) {
+    // An interrupted no-op deployment can leave an empty manifest behind.
+    // It represents no live deployment and should not make later runs look as
+    // though Root Builder state still needs recovery.
+    fs::remove(fs::path(m_rootStorageDir) / "manifest.json", ec);
+    fs::remove(fs::path(m_rootStorageDir) / "backup", ec);
+    return;
+  }
 
   int removed = 0;
   for (const auto& dst : m_rootDeployedFiles) {

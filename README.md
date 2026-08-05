@@ -24,6 +24,14 @@ NOTE: This is primarily for my personal use but I will see about fixing issues i
 
 `#user_allow_other` to `user_allow_other` if its missing please add it.
 
+## Virtual Filesystem Backends
+
+FUSE remains the default. Each instance can optionally use the experimental
+USVFS backend for Wine/Proton executables from **Settings > Wine/Proton > VFS**.
+Native Linux launches still use FUSE, and games such as OpenMW that provide
+their own VFS are unchanged. See the
+[USVFS backend design and benchmarking guide](docs/usvfs-backend.md).
+
 ## Installing and Running
 Download the latest zip from the [releases](https://github.com/SulfurNitride/Fluorine-Manager/releases) and after you download it.
 

@@ -315,6 +315,8 @@ public:
   bool beforeRun(const QFileInfo& binary, const QDir& cwd, const QString& arguments,
                  const QString& profileName, const QString& customOverwrite,
                  const QList<MOBase::ExecutableForcedLoadSetting>& forcedLibraries,
+                 bool useProton,
+                 QString* usvfsRequestPath = nullptr,
                  QString* saveBindMountSource = nullptr,
                  QString* saveBindMountTarget = nullptr);
 
