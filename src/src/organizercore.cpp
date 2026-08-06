@@ -34,7 +34,9 @@
 #include "syncoverwritedialog.h"
 #include "virtualfiletree.h"
 #include "usvfsrequest.h"
+#include "usvfssnapshot.h"
 #include "vfsbackend.h"
+#include "vfs/vfscatalog.h"
 #include "vfs/permissionrepair.h"
 #include "vfs/gamesavemigration.h"
 #include <ipluginmodpage.h>
@@ -74,6 +76,7 @@
 #include <QRegularExpression>
 #include <QTemporaryFile>
 #include <QTextStream>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QWidget>
@@ -147,6 +150,33 @@ QString uniqueFilePath(const QDir& dir, const QString& fileName)
 }
 
 void installSlrUpdate(QWidget* parent, const SlrUpdateInfo& info);
+
+bool fileContainsAsciiMarker(const QString& path, const QByteArray& marker)
+{
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly) || marker.isEmpty()) return false;
+
+  QByteArray carry;
+  while (!file.atEnd()) {
+    QByteArray block = carry + file.read(1024 * 1024);
+    if (block.contains(marker)) return true;
+    const qsizetype keep = std::min<qsizetype>(marker.size() - 1, block.size());
+    carry = block.right(keep);
+  }
+  return false;
+}
+
+bool usvfsRuntimeSupportsResolvedSnapshots()
+{
+  const QByteArray override = qgetenv("FLUORINE_USVFS_RESOLVED_SNAPSHOT").trimmed();
+  if (override == "1") return true;
+  if (override == "0") return false;
+
+  const QString dll = QDir(QCoreApplication::applicationDirPath())
+                          .filePath(QStringLiteral("usvfs/usvfs_x64.dll"));
+  return fileContainsAsciiMarker(
+      dll, QByteArrayLiteral("usvfsVirtualLinkMappings"));
+}
 
 void promptSlrUpdate(QWidget* parent, const SlrUpdateInfo& info)
 {
@@ -3021,6 +3051,78 @@ bool OrganizerCore::beforeRun(
       const MappingType mappings = fileMapping(profileName, customOverwrite);
       m_USVFS.prepareRootFilesForUsvfs(mappings);
 
+      bool useResolvedSnapshot = false;
+      QString snapshotDataDirectory;
+      UsvfsResolvedSnapshot resolvedSnapshot;
+      if (usvfsRuntimeSupportsResolvedSnapshots() && managedGame() != nullptr) {
+        snapshotDataDirectory = managedGame()->dataDirectory().absolutePath();
+        const QString overwriteDirectory = m_Settings.paths().overwrite();
+        bool snapshotCancelled = false;
+        try {
+          const auto mods = usvfsCatalogModsFromMappings(
+              mappings, snapshotDataDirectory, overwriteDirectory);
+          VfsCatalog catalog(
+              VfsCatalog::databasePath(snapshotDataDirectory.toStdString()));
+          VfsCatalogProgress finalProgress;
+          std::unique_ptr<QProgressDialog> progress;
+          if (qApp != nullptr && QThread::currentThread() == qApp->thread()) {
+            progress = std::make_unique<QProgressDialog>(
+                tr("Checking cached file metadata for USVFS…"), tr("Cancel"),
+                0, 0, QApplication::activeWindow());
+            progress->setWindowTitle(tr("Preparing USVFS snapshot"));
+            progress->setMinimumDuration(750);
+            progress->setAutoClose(false);
+          }
+
+          auto catalogResult = catalog.reconcileAndBuild(
+              snapshotDataDirectory.toStdString(), mods,
+              overwriteDirectory.toStdString(), true,
+              [&finalProgress, &progress,
+               &snapshotCancelled](const VfsCatalogProgress& state) {
+                finalProgress = state;
+                if (!progress) return;
+                progress->setLabelText(
+                    state.fingerprint_misses == 0
+                        ? tr("Checking cached metadata: %1 files verified…\n%2")
+                              .arg(state.files_scanned)
+                              .arg(QString::fromStdString(state.current_root))
+                        : tr("Verified %1 files; hashed %2 changed/new files…\n%3")
+                              .arg(state.files_scanned)
+                              .arg(state.files_hashed)
+                              .arg(QString::fromStdString(state.current_file)));
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+                if (progress->wasCanceled()) {
+                  snapshotCancelled = true;
+                  throw std::runtime_error("USVFS catalog verification cancelled");
+                }
+              });
+          if (progress) progress->close();
+          resolvedSnapshot = buildUsvfsResolvedSnapshot(
+              catalogResult.tree, snapshotDataDirectory,
+              m_Settings.skipFileSuffixes(), m_Settings.skipDirectories());
+          useResolvedSnapshot = true;
+          const uint64_t fingerprintHits =
+              finalProgress.files_scanned -
+              std::min(finalProgress.files_scanned,
+                       finalProgress.fingerprint_misses);
+          log::info(
+              "Prepared resolved USVFS snapshot: entries={} directories={} files={} "
+              "catalog_scanned={} fingerprint_hits={} fingerprint_misses={} "
+              "hashed={}",
+              resolvedSnapshot.mappings.size(), resolvedSnapshot.directoryCount,
+              resolvedSnapshot.fileCount, finalProgress.files_scanned,
+              fingerprintHits, finalProgress.fingerprint_misses,
+              finalProgress.files_hashed);
+        } catch (const std::exception& error) {
+          if (snapshotCancelled) throw;
+          log::warn("Unable to prepare resolved USVFS snapshot; using ordinary "
+                    "recursive mappings: {}",
+                    error.what());
+          snapshotDataDirectory.clear();
+          resolvedSnapshot = {};
+        }
+      }
+
       const QString logsDirectory =
           QDir(qApp->property("dataPath").toString()).filePath("logs");
       QDir().mkpath(logsDirectory);
@@ -3029,6 +3131,9 @@ bool OrganizerCore::beforeRun(
           .workingDirectory = cwd,
           .arguments = QProcess::splitCommand(arguments),
           .mappings = mappings,
+          .useResolvedSnapshot = useResolvedSnapshot,
+          .dataDirectory = snapshotDataDirectory,
+          .resolvedMappings = std::move(resolvedSnapshot.mappings),
           .forcedLibraries = forcedLibraries,
           .executableBlacklist =
               m_Settings.executablesBlacklist().split(';', Qt::SkipEmptyParts),

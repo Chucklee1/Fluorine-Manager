@@ -44,11 +44,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Wine-side USVFS runtime ──
-# Pin the fork's full-matrix release containing only the Wine short-name
-# application change over upstream 0.5.7.2. The helper compiled by Fluorine is
-# kept separate from these third-party artifacts so updates remain auditable.
-ARG USVFS_RELEASE_TAG=v0.5.7.2-wine-shortname.3
-ARG USVFS_ARCHIVE_SHA256=91e24d6971e8f9f084d60d2f372a5c6d816587a83f2683737c22e643eb40c133
+# Pin the fork's full-matrix release containing the Wine short-name change and
+# resolved-snapshot bulk import over upstream 0.5.7.2. The helper compiled by
+# Fluorine remains separate so updates stay auditable.
+ARG USVFS_RELEASE_TAG=v0.5.7.2-wine-snapshot.2
+ARG USVFS_ARCHIVE_SHA256=e6c38a64a2c6b23cc07411180a8958e026c362e3662f1df6542a72f4adcb6ecf
 ARG USVFS_LICENSE_SHA256=6ade493f62fb87b3a2fc83d681eb5cb84e1a7a17d426b0277490c0d618017935
 RUN mkdir -p /opt/fluorine-usvfs /tmp/usvfs-extract && \
     curl -L --fail --retry 3 \

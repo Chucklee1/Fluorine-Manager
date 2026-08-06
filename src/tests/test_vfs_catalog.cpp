@@ -1,5 +1,6 @@
 #include "vfs/vfscatalog.h"
 #include "vfs/permissionrepair.h"
+#include "usvfssnapshot.h"
 
 #include <gtest/gtest.h>
 #include <sqlite3.h>
@@ -105,6 +106,69 @@ TEST(VfsCatalog, ReusesHashesAndPreservesOverwritePriority)
   VfsTree fallback = std::move(catalog.reconcileAndBuild(
       data.string(), {{"Test Mod", mod.string()}}, overwrite.string(), true).tree);
   EXPECT_EQ(winnerOrigin(fallback, "same.txt"), "Test Mod");
+}
+
+TEST(VfsCatalog, BuildsResolvedUsvfsSnapshotWithoutBaseOrSkippedFiles)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path modA = temp.path() / "ModA";
+  const fs::path modB = temp.path() / "ModB";
+  const fs::path overwrite = temp.path() / "overwrite";
+  writeFile(data / "base-only.txt", "base");
+  writeFile(modA / "meshes/actors/a.nif", "a");
+  writeFile(modA / "shared.txt", "lower");
+  writeFile(modA / ".git/ignored.txt", "ignored");
+  writeFile(modA / "hidden.mohidden", "ignored");
+  writeFile(modB / "shared.txt", "higher");
+  writeFile(overwrite / "generated/config.ini", "overwrite");
+
+  const auto catalog = VfsCatalog(temp.path() / "catalog.sqlite").reconcileAndBuild(
+      data.string(), {{"Mod A", modA.string()}, {"Mod B", modB.string()}},
+      overwrite.string(), true);
+  const auto snapshot = buildUsvfsResolvedSnapshot(
+      catalog.tree, QString::fromStdString(data.string()),
+      {QStringLiteral(".mohidden")}, {QStringLiteral(".git")});
+
+  EXPECT_EQ(snapshot.fileCount, 3u);
+  EXPECT_EQ(snapshot.directoryCount, 3u);  // meshes, actors, generated
+  ASSERT_EQ(snapshot.mappings.size(), 6u);
+  EXPECT_TRUE(std::all_of(
+      snapshot.mappings.begin(),
+      snapshot.mappings.begin() + static_cast<std::ptrdiff_t>(snapshot.directoryCount),
+      [](const Mapping& mapping) { return mapping.isDirectory; }));
+
+  auto mappedSource = [&](const fs::path& relative) -> QString {
+    const QString destination =
+        QString::fromStdString((data / relative).string());
+    const auto found = std::find_if(
+        snapshot.mappings.begin(), snapshot.mappings.end(),
+        [&](const Mapping& mapping) { return mapping.destination == destination; });
+    return found == snapshot.mappings.end() ? QString{} : found->source;
+  };
+  EXPECT_TRUE(mappedSource("base-only.txt").isEmpty());
+  EXPECT_TRUE(mappedSource(".git/ignored.txt").isEmpty());
+  EXPECT_TRUE(mappedSource("hidden.mohidden").isEmpty());
+  EXPECT_EQ(mappedSource("shared.txt"),
+            QString::fromStdString((modB / "shared.txt").string()));
+  EXPECT_EQ(mappedSource("generated/config.ini"),
+            QString::fromStdString((overwrite / "generated/config.ini").string()));
+}
+
+TEST(VfsCatalog, ExtractsOnlyUniqueDataProvidersForUsvfsCatalog)
+{
+  const MappingType mappings{
+      {QStringLiteral("/mods/A"), QStringLiteral("/game/Data"), true, false},
+      {QStringLiteral("/mods/A"), QStringLiteral("/game/Data/Sub"), true, false},
+      {QStringLiteral("/overwrite"), QStringLiteral("/game/Data"), true, true},
+      {QStringLiteral("/profile/saves"), QStringLiteral("/docs/Saves"), true, true},
+      {QStringLiteral("/profile/plugins.txt"),
+       QStringLiteral("/game/Data/plugins.txt"), false, false},
+  };
+  const auto mods = usvfsCatalogModsFromMappings(
+      mappings, QStringLiteral("/game/Data"), QStringLiteral("/overwrite"));
+  ASSERT_EQ(mods.size(), 1u);
+  EXPECT_EQ(mods.front().second, "/mods/A");
 }
 
 TEST(VfsCatalog, MetadataDriftRehashesOnlyChangedFile)

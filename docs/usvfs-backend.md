@@ -25,6 +25,9 @@ rewrite:
 - a per-instance FUSE/USVFS selector and safe FUSE default;
 - reuse of Fluorine's ordered file mappings, create-target flags, forced DLLs,
   executable blacklist and file/directory skip lists;
+- a database-backed resolved snapshot path that reuses the FUSE catalog's
+  fingerprint hits/misses and sends the winning Data file map to USVFS in one
+  bulk request;
 - a versioned binary request serializer and bounded Wine-side parser;
 - a statically linked Windows controller that creates USVFS, installs mappings,
   launches the target through `usvfsCreateProcessHooked`, drains registered
@@ -76,6 +79,8 @@ therefore writes a temporary, versioned, length-prefixed request containing:
 
 - the target executable, working directory and already-tokenized arguments;
 - the same ordered mappings used by the existing FUSE connector;
+- when the DLL supports it, a deterministic resolved Data snapshot containing
+  the winning physical source for each virtual file and its parent directories;
 - write-target flags, forced libraries, and skip lists;
 - a unique USVFS instance name and an output log path.
 
@@ -111,26 +116,58 @@ before an USVFS launch so USVFS receives physical source and destination paths.
 Executables living inside a mod are translated to their virtual game path
 before the request is serialized.
 
+### Database-backed resolved snapshots
+
+The FUSE catalog is backend-neutral: SQLite persists file fingerprints, while
+`VfsCatalog::reconcileAndBuild` produces the resolved in-memory tree. For a
+capable USVFS runtime, Fluorine now runs that same reconciliation immediately
+before launch and serializes the resolved winners instead of asking Wine to
+recursively enumerate every mod directory. Unchanged files are fingerprint
+hits; only new or changed files are hashed. Base-game-only files are omitted
+because Windows can still reach them directly through the physical Data
+directory.
+
+The launcher installs Data roots shallowly, imports the resolved directories
+and files with one `usvfsVirtualLinkMappings` call, then reapplies custom write
+targets and session file mappings so their priority remains unchanged.
+Mappings outside Data continue to use normal recursive installation. Skip
+directory and file-suffix rules are applied while the snapshot is built and
+again by USVFS.
+
+Capability detection is automatic: Fluorine enables this path only when the
+staged x64 DLL exports `usvfsVirtualLinkMappings`. Set
+`FLUORINE_USVFS_RESOLVED_SNAPSHOT=0` to force the old recursive path, or `1`
+while developing a compatible runtime. A catalog error falls back before the
+request is written; an unsupported DLL or failed bulk import falls back inside
+the launcher by clearing the partial tree and installing the original mappings
+recursively. User cancellation does not launch the game.
+
+The `mapping_install` benchmark record includes `snapshot_entries`,
+`snapshot_imported`, and `snapshot_fallback`. The Fluorine log also records
+catalog files scanned, fingerprint misses, and files hashed, which makes it
+possible to compare database verification plus bulk import against the old
+Wine-side traversal.
+
 ## Pinned components
 
 The release build downloads and verifies one immutable fork archive:
 
-- [`v0.5.7.2-wine-shortname.3`](https://github.com/SulfurNitride/usvfs/releases/tag/v0.5.7.2-wine-shortname.3),
+- [`v0.5.7.2-wine-snapshot.2`](https://github.com/SulfurNitride/usvfs/releases/tag/v0.5.7.2-wine-snapshot.2),
   archive SHA-256
-  `91e24d6971e8f9f084d60d2f372a5c6d816587a83f2683737c22e643eb40c133`.
+  `e6c38a64a2c6b23cc07411180a8958e026c362e3662f1df6542a72f4adcb6ecf`.
 - Release x64 DLL SHA-256
-  `56728c79492bd6e8bc713cd1b79ec15498ef14b2dae4e1323e50d24d8ce8dd4a`.
+  `2902ec5ac898da59a522b48bc8b6d705758e3b103ef0b7397763688d5a47ceb7`.
 - Release x86 DLL SHA-256
-  `4157835670e2f919bd3eac93b4819a548fc218e6dd6ee0116e36d97a54255a54`.
+  `bafb128bbe05084b929b5fa7ea37dac1448477e1a26d86938994f71d554c1ea7`.
 - Full fork x86/x64 Debug/Release build and test matrix
-  [`31044652426`](https://github.com/SulfurNitride/usvfs/actions/runs/31044652426).
+  [`31065013884`](https://github.com/SulfurNitride/usvfs/actions/runs/31065013884).
 
 Omni's patch detects Wine and reports the optional DOS 8.3 short-name field as
 absent instead of asking Wine to synthesize it repeatedly. Native Windows keeps
-the existing behavior. The fork release's only application-source change over
-upstream `v0.5.7.2` is commit `644eebf`; its later commits are workflow-only.
-The release remains marked prerelease until the same-save visible gate is
-confirmed.
+the existing behavior. The release adds the Wine short-name change (`644eebf`)
+and resolved snapshot bulk API (`f5dea41`, with release-context compatibility
+in `98bc3ed`) over upstream `v0.5.7.2`. Gameplay and performance acceptance
+still require a same-save visible A/B.
 
 ## Building
 
@@ -185,8 +222,13 @@ archive tools, local saves, Root Builder and custom overwrite targets.
 ## Current limitations
 
 - This is experimental and has not yet had broad modlist compatibility testing.
-- The Wine short-name optimization is present only in the x64 DLL supplied by
-  Omni. The bundled x86 DLL is the unmodified official `v0.5.7.2` build.
+- The pinned snapshot release passed the Windows conformance matrix but still
+  needs real-modlist Wine/Proton gameplay and performance testing.
+- The resolved snapshot represents directories that contain visible files;
+  empty mod directories are not currently materialized from catalog metadata.
+- Both bundled architectures are built from the same short-name and bulk
+  snapshot source; the normal game path uses x64 while x86 remains required
+  for 32-bit children and tools.
 - The helper records compact Info-level USVFS diagnostics plus structured
   `[benchmark]` records for Fluorine preparation, request serialization, DLL
   loading, VFS creation, mapping installation, injection, target lifetime,

@@ -122,7 +122,7 @@ TEST(UsvfsRequest, WritesVersionedLengthPrefixedRequest)
   ASSERT_GE(bytes.size(), 12);
   EXPECT_EQ(QByteArray("FUSVFS1\0", 8), bytes.first(8));
   qsizetype offset = 8;
-  EXPECT_EQ(1U, readU32(bytes, offset));
+  EXPECT_EQ(2U, readU32(bytes, offset));
   EXPECT_EQ(result.instanceName, readString(bytes, offset));
   EXPECT_EQ(toWinePath(options.binary.absoluteFilePath()),
             readString(bytes, offset));
@@ -133,12 +133,14 @@ TEST(UsvfsRequest, WritesVersionedLengthPrefixedRequest)
   EXPECT_EQ(QStringLiteral("--profile"), readString(bytes, offset));
   EXPECT_EQ(QStringLiteral("Test Profile"), readString(bytes, offset));
   EXPECT_EQ(1U, readU32(bytes, offset));
-  ASSERT_LT(offset + 2, bytes.size());
+  ASSERT_LT(offset + 3, bytes.size());
   EXPECT_EQ(1, bytes.at(offset++));
   EXPECT_EQ(1, bytes.at(offset++));
+  EXPECT_EQ(0, bytes.at(offset++));
   EXPECT_EQ(toWinePath(options.mappings.front().source), readString(bytes, offset));
   EXPECT_EQ(toWinePath(options.mappings.front().destination),
             readString(bytes, offset));
+  EXPECT_EQ(0U, readU32(bytes, offset));
   EXPECT_EQ(1U, readU32(bytes, offset));
   EXPECT_EQ(QStringLiteral("game.exe"), readString(bytes, offset));
   EXPECT_EQ(toWinePath(temporary.filePath(QStringLiteral("enabled-hook.dll"))),
@@ -150,4 +152,70 @@ TEST(UsvfsRequest, WritesVersionedLengthPrefixedRequest)
   EXPECT_EQ(1U, readU32(bytes, offset));
   EXPECT_EQ(QStringLiteral(".git"), readString(bytes, offset));
   EXPECT_EQ(bytes.size(), offset);
+}
+
+TEST(UsvfsRequest, MarksDataMappingsAroundResolvedSnapshot)
+{
+  QTemporaryDir temporary;
+  ASSERT_TRUE(temporary.isValid());
+  const QString data = temporary.filePath(QStringLiteral("game/Data"));
+
+  UsvfsRequestOptions options;
+  options.binary = QFileInfo(temporary.filePath(QStringLiteral("game.exe")));
+  options.workingDirectory = QDir(temporary.path());
+  options.mappings = {
+      {temporary.filePath(QStringLiteral("mod")), data, true, false},
+      {temporary.filePath(QStringLiteral("plugins.txt")),
+       QDir(data).filePath(QStringLiteral("plugins.txt")), false, false},
+      {temporary.filePath(QStringLiteral("saves")),
+       temporary.filePath(QStringLiteral("Documents/Saves")), true, true},
+  };
+  options.useResolvedSnapshot = true;
+  options.dataDirectory = data;
+  options.resolvedMappings = {
+      {temporary.filePath(QStringLiteral("mod/meshes")),
+       QDir(data).filePath(QStringLiteral("meshes")), true, false},
+      {temporary.filePath(QStringLiteral("mod/meshes/a.nif")),
+       QDir(data).filePath(QStringLiteral("meshes/a.nif")), false, false},
+  };
+
+  const UsvfsRequestResult result = writeUsvfsRequest(options);
+  ASSERT_TRUE(result) << result.error.toStdString();
+  QFile request(result.path);
+  ASSERT_TRUE(request.open(QIODevice::ReadOnly));
+  const QByteArray bytes = request.readAll();
+  request.close();
+  EXPECT_TRUE(QFile::remove(result.path));
+
+  qsizetype offset = 8;
+  ASSERT_EQ(2U, readU32(bytes, offset));
+  for (int i = 0; i < 4; ++i) (void)readString(bytes, offset);
+  ASSERT_EQ(0U, readU32(bytes, offset));
+  ASSERT_EQ(3U, readU32(bytes, offset));
+
+  EXPECT_EQ(1, bytes.at(offset++));
+  EXPECT_EQ(0, bytes.at(offset++));
+  EXPECT_EQ(1, bytes.at(offset++));  // shallow Data directory
+  (void)readString(bytes, offset);
+  (void)readString(bytes, offset);
+
+  EXPECT_EQ(0, bytes.at(offset++));
+  EXPECT_EQ(0, bytes.at(offset++));
+  EXPECT_EQ(2, bytes.at(offset++));  // file applied after snapshot
+  (void)readString(bytes, offset);
+  (void)readString(bytes, offset);
+
+  EXPECT_EQ(1, bytes.at(offset++));
+  EXPECT_EQ(1, bytes.at(offset++));
+  EXPECT_EQ(0, bytes.at(offset++));  // non-Data mapping remains ordinary
+  (void)readString(bytes, offset);
+  (void)readString(bytes, offset);
+
+  ASSERT_EQ(2U, readU32(bytes, offset));
+  EXPECT_EQ(1, bytes.at(offset++));
+  (void)readString(bytes, offset);
+  (void)readString(bytes, offset);
+  EXPECT_EQ(0, bytes.at(offset++));
+  (void)readString(bytes, offset);
+  (void)readString(bytes, offset);
 }

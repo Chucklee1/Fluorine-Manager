@@ -17,7 +17,8 @@ namespace
 {
 constexpr unsigned int LINKFLAG_CREATETARGET = 0x00000004;
 constexpr unsigned int LINKFLAG_RECURSIVE = 0x00000008;
-constexpr std::uint32_t kFormatVersion = 1;
+constexpr unsigned int LINKFLAG_DIRECTORY = 0x00000020;
+constexpr std::uint32_t kFormatVersion = 2;
 constexpr std::size_t kMaxStringBytes = 16 * 1024 * 1024;
 constexpr std::uintmax_t kMaxRequestBytes = 512 * 1024 * 1024;
 constexpr std::uint32_t kMaxEntries = 2'000'000;
@@ -25,8 +26,23 @@ using Clock = std::chrono::steady_clock;
 
 struct Mapping
 {
+  enum class InstallMode : std::uint8_t
+  {
+    Normal = 0,
+    Shallow = 1,
+    AfterSnapshot = 2,
+  };
+
   bool directory = false;
   bool createTarget = false;
+  InstallMode mode = InstallMode::Normal;
+  std::wstring source;
+  std::wstring destination;
+};
+
+struct ResolvedMapping
+{
+  bool directory = false;
   std::wstring source;
   std::wstring destination;
 };
@@ -45,6 +61,7 @@ struct Request
   std::wstring logPath;
   std::vector<std::wstring> arguments;
   std::vector<Mapping> mappings;
+  std::vector<ResolvedMapping> resolvedMappings;
   std::vector<ForcedLibrary> forcedLibraries;
   std::vector<std::wstring> executableBlacklist;
   std::vector<std::wstring> skipFileSuffixes;
@@ -141,7 +158,8 @@ Request readRequest(const std::filesystem::path& path)
   }
   bytes.erase(bytes.begin(), bytes.begin() + sizeof(magic));
   Reader reader(std::move(bytes));
-  if (reader.u32() != kFormatVersion) {
+  const std::uint32_t version = reader.u32();
+  if (version != 1 && version != kFormatVersion) {
     throw std::runtime_error("unsupported USVFS request version");
   }
 
@@ -158,9 +176,25 @@ Request readRequest(const std::filesystem::path& path)
     Mapping mapping;
     mapping.directory = reader.u8() != 0;
     mapping.createTarget = reader.u8() != 0;
+    if (version >= 2) {
+      const auto mode = reader.u8();
+      if (mode > static_cast<std::uint8_t>(Mapping::InstallMode::AfterSnapshot)) {
+        throw std::runtime_error("invalid USVFS mapping install mode");
+      }
+      mapping.mode = static_cast<Mapping::InstallMode>(mode);
+    }
     mapping.source = reader.wide();
     mapping.destination = reader.wide();
     request.mappings.push_back(std::move(mapping));
+  }
+  if (version >= 2) {
+    for (std::uint32_t count = reader.count(); count != 0; --count) {
+      ResolvedMapping mapping;
+      mapping.directory = reader.u8() != 0;
+      mapping.source = reader.wide();
+      mapping.destination = reader.wide();
+      request.resolvedMappings.push_back(std::move(mapping));
+    }
   }
   for (std::uint32_t count = reader.count(); count != 0; --count) {
     request.forcedLibraries.push_back({reader.wide(), reader.wide()});
@@ -233,9 +267,21 @@ T loadFunction(HMODULE module, const char* name)
   return reinterpret_cast<T>(address);
 }
 
+template <class T>
+T loadOptionalFunction(HMODULE module, const char* name)
+{
+  return reinterpret_cast<T>(GetProcAddress(module, name));
+}
+
 struct UsvfsApi
 {
   struct Parameters;
+  struct VirtualMapping
+  {
+    LPCWSTR source;
+    LPCWSTR destination;
+    unsigned int flags;
+  };
   using CreateParameters = Parameters* (*)();
   using FreeParameters = void (*)(Parameters*);
   using SetInstanceName = void (*)(Parameters*, const char*);
@@ -247,6 +293,7 @@ struct UsvfsApi
   using ClearMappings = void(WINAPI*)();
   using LinkDirectory = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, unsigned int);
   using LinkFile = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, unsigned int);
+  using LinkMappings = BOOL(WINAPI*)(const VirtualMapping*, std::size_t);
   using CreateHooked = BOOL(WINAPI*)(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES,
                                       LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID,
                                       LPCWSTR, LPSTARTUPINFOW,
@@ -271,6 +318,7 @@ struct UsvfsApi
   ClearMappings clearMappings{};
   LinkDirectory linkDirectory{};
   LinkFile linkFile{};
+  LinkMappings linkMappings{};
   CreateHooked createHooked{};
   ProcessList processList{};
   ClearWideList clearExecutableBlacklist{};
@@ -299,6 +347,7 @@ struct UsvfsApi
     clearMappings = loadFunction<ClearMappings>(module, "usvfsClearVirtualMappings");
     linkDirectory = loadFunction<LinkDirectory>(module, "usvfsVirtualLinkDirectoryStatic");
     linkFile = loadFunction<LinkFile>(module, "usvfsVirtualLinkFile");
+    linkMappings = loadOptionalFunction<LinkMappings>(module, "usvfsVirtualLinkMappings");
     createHooked = loadFunction<CreateHooked>(module, "usvfsCreateProcessHooked");
     processList = loadFunction<ProcessList>(module, "usvfsGetVFSProcessList");
     clearExecutableBlacklist = loadFunction<ClearWideList>(module, "usvfsClearExecutableBlacklist");
@@ -452,10 +501,11 @@ int wmain(int argc, wchar_t** argv)
 
     const auto mappingStartedAt = Clock::now();
     api.clearMappings();
-    for (const auto& mapping : request.mappings) {
+
+    auto linkOrdinary = [&](const Mapping& mapping, bool recursiveDirectories) {
       BOOL linked = FALSE;
       if (mapping.directory) {
-        unsigned int flags = LINKFLAG_RECURSIVE;
+        unsigned int flags = recursiveDirectories ? LINKFLAG_RECURSIVE : 0;
         if (mapping.createTarget) flags |= LINKFLAG_CREATETARGET;
         linked = api.linkDirectory(mapping.source.c_str(),
                                    mapping.destination.c_str(), flags);
@@ -466,13 +516,76 @@ int wmain(int argc, wchar_t** argv)
         throw std::runtime_error("USVFS mapping failed with Windows error " +
                                  std::to_string(GetLastError()));
       }
+    };
+
+    bool importedResolvedSnapshot = false;
+    bool snapshotFallback = false;
+    if (!request.resolvedMappings.empty() && api.linkMappings != nullptr) {
+      // Preserve ordered root/write-target mappings without asking Wine to
+      // recursively scan Data. Non-Data mappings retain their normal behavior.
+      for (const auto& mapping : request.mappings) {
+        if (mapping.mode == Mapping::InstallMode::AfterSnapshot) continue;
+        linkOrdinary(mapping, mapping.mode != Mapping::InstallMode::Shallow);
+      }
+
+      std::vector<UsvfsApi::VirtualMapping> snapshot;
+      snapshot.reserve(request.resolvedMappings.size());
+      for (const auto& mapping : request.resolvedMappings) {
+        snapshot.push_back({mapping.source.c_str(), mapping.destination.c_str(),
+                            mapping.directory ? LINKFLAG_DIRECTORY : 0});
+      }
+
+      if (api.linkMappings(snapshot.data(), snapshot.size())) {
+        importedResolvedSnapshot = true;
+        // A resolved directory entry may share a destination with a nested
+        // custom write target. Reapply create-target roots after the bulk
+        // import so their flag and physical target remain authoritative while
+        // retaining the imported children.
+        for (const auto& mapping : request.mappings) {
+          if (mapping.mode == Mapping::InstallMode::Shallow &&
+              mapping.createTarget) {
+            linkOrdinary(mapping, false);
+          }
+        }
+        for (const auto& mapping : request.mappings) {
+          if (mapping.mode == Mapping::InstallMode::AfterSnapshot) {
+            linkOrdinary(mapping, true);
+          }
+        }
+      } else {
+        const DWORD snapshotError = GetLastError();
+        writeLog(log, "Resolved USVFS snapshot import failed with Windows error " +
+                          std::to_string(snapshotError) +
+                          "; rebuilding ordinary recursive mappings");
+        api.clearMappings();
+        snapshotFallback = true;
+        for (const auto& mapping : request.mappings) linkOrdinary(mapping, true);
+      }
+    } else {
+      snapshotFallback = !request.resolvedMappings.empty();
+      if (snapshotFallback) {
+        writeLog(log, "USVFS runtime has no bulk snapshot export; using ordinary "
+                      "recursive mappings");
+      }
+      for (const auto& mapping : request.mappings) linkOrdinary(mapping, true);
     }
     const auto mappingsInstalledAt = Clock::now();
     writeBenchmark(log, "mapping_install", mappingStartedAt,
                    mappingsInstalledAt,
-                   "mappings=" + std::to_string(request.mappings.size()));
+                   "mappings=" + std::to_string(request.mappings.size()) +
+                       " snapshot_entries=" +
+                       std::to_string(request.resolvedMappings.size()) +
+                       " snapshot_imported=" +
+                       std::to_string(importedResolvedSnapshot ? 1 : 0) +
+                       " snapshot_fallback=" +
+                       std::to_string(snapshotFallback ? 1 : 0));
     writeLog(log, "Installed " + std::to_string(request.mappings.size()) +
-                      " USVFS mappings");
+                      " USVFS mappings" +
+                      (importedResolvedSnapshot
+                           ? " plus " +
+                                 std::to_string(request.resolvedMappings.size()) +
+                                 " resolved snapshot entries"
+                           : ""));
 
     const auto targetCreateStartedAt = Clock::now();
     std::wstring command = commandLine(request);

@@ -304,6 +304,7 @@ add_test(NAME test_vfs_index COMMAND test_vfs_index)
 # ---------------------------------------------------------------------------
 add_executable(test_vfs_catalog EXCLUDE_FROM_ALL
     test_vfs_catalog.cpp
+    ${CMAKE_SOURCE_DIR}/src/src/usvfssnapshot.cpp
     ${CMAKE_SOURCE_DIR}/src/src/vfs/vfscatalog.cpp
     ${CMAKE_SOURCE_DIR}/src/src/vfs/vfstree.cpp
     ${CMAKE_SOURCE_DIR}/src/src/vfs/permissionrepair.cpp

@@ -245,13 +245,14 @@ main menu is interactive.
 
 ## Restoring a known payload
 
-`./build.sh` always recreates the pinned short-name payload from fork
-prerelease `v0.5.7.2-wine-shortname.3`. It downloads archive SHA-256
-`91e24d6971e8f9f084d60d2f372a5c6d816587a83f2683737c22e643eb40c133`
+`./build.sh` always recreates the pinned short-name and resolved-snapshot
+payload from fork release `v0.5.7.2-wine-snapshot.2`. It downloads archive
+SHA-256
+`e6c38a64a2c6b23cc07411180a8958e026c362e3662f1df6542a72f4adcb6ecf`
 and packages x64 DLL SHA-256
-`56728c79492bd6e8bc713cd1b79ec15498ef14b2dae4e1323e50d24d8ce8dd4a`
+`2902ec5ac898da59a522b48bc8b6d705758e3b103ef0b7397763688d5a47ceb7`
 plus x86 DLL SHA-256
-`4157835670e2f919bd3eac93b4819a548fc218e6dd6ee0116e36d97a54255a54`.
+`bafb128bbe05084b929b5fa7ea37dac1448477e1a26d86938994f71d554c1ea7`.
 Run a deploy-only capture after that build to restore and verify the pinned
 payload. The former Omni x64 reference
 `7454334c1ea246a68ff8da492b5d63dae8cd2f1298f2d7105c920b5f593352aa`

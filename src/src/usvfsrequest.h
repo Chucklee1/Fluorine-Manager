@@ -15,6 +15,12 @@ struct UsvfsRequestOptions
   QDir workingDirectory;
   QStringList arguments;
   MappingType mappings;
+  // Optional catalog-resolved Data snapshot. When enabled, ordinary directory
+  // mappings into dataDirectory are installed without recursive scanning and
+  // ordinary file mappings there are applied after the snapshot.
+  bool useResolvedSnapshot = false;
+  QString dataDirectory;
+  MappingType resolvedMappings;
   QList<MOBase::ExecutableForcedLoadSetting> forcedLibraries;
   QStringList executableBlacklist;
   QStringList skipFileSuffixes;

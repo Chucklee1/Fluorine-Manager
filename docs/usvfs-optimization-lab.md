@@ -30,12 +30,12 @@ source inspection, CI/conformance results and captured A/B runs. The downloaded
 page is not committed because it is a generated 1.2 MiB third-party document.
 
 The working application is Fluorine on branch `feat/usvfs-backend`. The pinned
-USVFS source is prerelease tag `v0.5.7.2-wine-shortname.3` from
+USVFS source is release tag `v0.5.7.2-wine-snapshot.2` from
 `SulfurNitride/usvfs`, which peels to release commit
-`836b2d9228d972eb373a8aeaf685be3177e2370d`. Its only application-source
-change over upstream `v0.5.7.2` is short-name commit
-`644eebfe7e454ead93774fcda95fa9b3ddfddb09`; the two descendants change only
-the fork build workflow.
+`98bc3edb4aa0df2ea68bb59a7ba0be68b55f6e56`. It adds Wine short-name commit
+`644eebfe7e454ead93774fcda95fa9b3ddfddb09`, resolved bulk import commit
+`f5dea417eb8e5f0c654c9d9c5f50bad2a49ff0e9`, and release-context compatibility
+at the tagged head over upstream `v0.5.7.2`.
 
 The persistent source checkout is `/var/home/luke/Documents/usvfs`. Its
 `perf/fluorine-lab` base begins at that exact commit; the current checked-out
@@ -47,16 +47,16 @@ without mixing experimental changes into the Wine short-name reference.
 
 ## Known reference build
 
-- USVFS version: `0.5.7.2-wine-shortname.3` prerelease.
-- Release commit: `836b2d9228d972eb373a8aeaf685be3177e2370d`.
+- USVFS version: `0.5.7.2-wine-snapshot.2`.
+- Release commit: `98bc3edb4aa0df2ea68bb59a7ba0be68b55f6e56`.
 - Full Windows matrix:
-  [`31044652426`](https://github.com/SulfurNitride/usvfs/actions/runs/31044652426).
+  [`31065013884`](https://github.com/SulfurNitride/usvfs/actions/runs/31065013884).
 - Release archive SHA-256:
-  `91e24d6971e8f9f084d60d2f372a5c6d816587a83f2683737c22e643eb40c133`.
+  `e6c38a64a2c6b23cc07411180a8958e026c362e3662f1df6542a72f4adcb6ecf`.
 - x64 DLL SHA-256:
-  `56728c79492bd6e8bc713cd1b79ec15498ef14b2dae4e1323e50d24d8ce8dd4a`.
+  `2902ec5ac898da59a522b48bc8b6d705758e3b103ef0b7397763688d5a47ceb7`.
 - x86 DLL SHA-256:
-  `4157835670e2f919bd3eac93b4819a548fc218e6dd6ee0116e36d97a54255a54`.
+  `bafb128bbe05084b929b5fa7ea37dac1448477e1a26d86938994f71d554c1ea7`.
 - Prior independently human-validated x64 reference: Omni's build of the same
   short-name source change, SHA-256
   `7454334c1ea246a68ff8da492b5d63dae8cd2f1298f2d7105c920b5f593352aa`.
@@ -74,18 +74,16 @@ The first compact reference log installed 1,144 mappings and attached a tree
 with 405,417 nodes. Its mapping installation took 3,150 ms. That single number
 is a useful smoke-test reference, not yet a statistically valid baseline.
 
-## Current installed runtime
+## Current pinned runtime
 
-The portable and installed runtime is the fork-built Wine short-name
-prerelease above. Both locations have x64 SHA-256
-`56728c79492bd6e8bc713cd1b79ec15498ef14b2dae4e1323e50d24d8ce8dd4a`;
-the portable x86 DLL has SHA-256
-`4157835670e2f919bd3eac93b4819a548fc218e6dd6ee0116e36d97a54255a54`.
-Capture `20260805T205106Z-shortname-release-836b2d9-headless` passed the full
-headless True North/Root Builder gate with the exact release DLL. Human
-same-save/scene validation is still required before the GitHub prerelease is
-promoted to a normal release. Both exact-query exhaustion and shared-context
-locking remain configured off.
+The portable build now pins the fork-built Wine snapshot release above. Its
+x64 SHA-256 is
+`2902ec5ac898da59a522b48bc8b6d705758e3b103ef0b7397763688d5a47ceb7`;
+the x86 DLL SHA-256 is
+`bafb128bbe05084b929b5fa7ea37dac1448477e1a26d86938994f71d554c1ea7`.
+The earlier capture `20260805T205106Z-shortname-release-836b2d9-headless`
+validated the short-name parent release. The new database/bulk path still
+requires its own True North/Root Builder and same-save visible A/B.
 
 The independently gated diagnostic artifact from USVFS commit
 `687e89006868618f81c5018692742f4cdcdf845d`, GitHub Actions run `30731473176`,

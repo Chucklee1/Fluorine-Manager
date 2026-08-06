@@ -7,10 +7,22 @@
 #include <QTemporaryFile>
 #include <QUuid>
 
+#include <algorithm>
+
 namespace
 {
 constexpr char kMagic[] = {'F', 'U', 'S', 'V', 'F', 'S', '1', '\0'};
-constexpr quint32 kFormatVersion = 1;
+constexpr quint32 kFormatVersion = 2;
+constexpr quint64 kMaxEntries = 2'000'000;
+constexpr qsizetype kMaxStringBytes = 16 * 1024 * 1024;
+constexpr qsizetype kMaxRequestBytes = 512 * 1024 * 1024;
+
+enum class MappingInstallMode : quint8
+{
+  Normal = 0,
+  Shallow = 1,
+  AfterSnapshot = 2,
+};
 
 void appendU8(QByteArray& output, quint8 value)
 {
@@ -28,8 +40,8 @@ void appendU32(QByteArray& output, quint32 value)
 bool appendString(QByteArray& output, const QString& value, QString& error)
 {
   const QByteArray utf8 = value.toUtf8();
-  if (static_cast<quint64>(utf8.size()) > 0xffffffffULL) {
-    error = QStringLiteral("USVFS request contains a string larger than 4 GiB");
+  if (utf8.size() > kMaxStringBytes) {
+    error = QStringLiteral("USVFS request contains a string larger than 16 MiB");
     return false;
   }
   appendU32(output, static_cast<quint32>(utf8.size()));
@@ -45,6 +57,17 @@ bool appendStringList(QByteArray& output, const QStringList& values, QString& er
   }
   return true;
 }
+
+bool targetsDirectory(const Mapping& mapping, const QString& directory)
+{
+  if (directory.isEmpty()) return false;
+  const QString cleanDirectory =
+      QDir::cleanPath(QDir::fromNativeSeparators(directory));
+  const QString destination =
+      QDir::cleanPath(QDir::fromNativeSeparators(mapping.destination));
+  return destination == cleanDirectory ||
+         destination.startsWith(cleanDirectory + QStringLiteral("/"));
+}
 }
 
 UsvfsRequestResult writeUsvfsRequest(const UsvfsRequestOptions& options)
@@ -54,13 +77,27 @@ UsvfsRequestResult writeUsvfsRequest(const UsvfsRequestOptions& options)
     result.error = QStringLiteral("USVFS request has no target executable");
     return result;
   }
+  if (options.mappings.size() > kMaxEntries ||
+      options.resolvedMappings.size() > kMaxEntries ||
+      options.arguments.size() > kMaxEntries ||
+      options.forcedLibraries.size() > kMaxEntries ||
+      options.executableBlacklist.size() > kMaxEntries ||
+      options.skipFileSuffixes.size() > kMaxEntries ||
+      options.skipDirectories.size() > kMaxEntries) {
+    result.error = QStringLiteral("USVFS request contains too many entries");
+    return result;
+  }
 
   result.instanceName =
       QStringLiteral("fluorine-") +
       QUuid::createUuid().toString(QUuid::WithoutBraces).remove('-');
 
   QByteArray output;
-  output.reserve(4096 + static_cast<qsizetype>(options.mappings.size()) * 256);
+  const qsizetype estimatedBytes =
+      4096 + static_cast<qsizetype>(options.mappings.size() +
+                                    options.resolvedMappings.size()) *
+                 256;
+  output.reserve(std::min(estimatedBytes, kMaxRequestBytes));
   output.append(kMagic, sizeof(kMagic));
   appendU32(output, kFormatVersion);
 
@@ -79,9 +116,29 @@ UsvfsRequestResult writeUsvfsRequest(const UsvfsRequestOptions& options)
   for (const Mapping& mapping : options.mappings) {
     appendU8(output, mapping.isDirectory ? 1 : 0);
     appendU8(output, mapping.createTarget ? 1 : 0);
+    MappingInstallMode mode = MappingInstallMode::Normal;
+    if (options.useResolvedSnapshot &&
+        targetsDirectory(mapping, options.dataDirectory)) {
+      mode = mapping.isDirectory ? MappingInstallMode::Shallow
+                                 : MappingInstallMode::AfterSnapshot;
+    }
+    appendU8(output, static_cast<quint8>(mode));
     if (!appendString(output, toWinePath(mapping.source), result.error) ||
         !appendString(output, toWinePath(mapping.destination), result.error)) {
       return result;
+    }
+  }
+
+  appendU32(output, options.useResolvedSnapshot
+                        ? static_cast<quint32>(options.resolvedMappings.size())
+                        : 0);
+  if (options.useResolvedSnapshot) {
+    for (const Mapping& mapping : options.resolvedMappings) {
+      appendU8(output, mapping.isDirectory ? 1 : 0);
+      if (!appendString(output, toWinePath(mapping.source), result.error) ||
+          !appendString(output, toWinePath(mapping.destination), result.error)) {
+        return result;
+      }
     }
   }
 
@@ -101,6 +158,10 @@ UsvfsRequestResult writeUsvfsRequest(const UsvfsRequestOptions& options)
   if (!appendStringList(output, options.executableBlacklist, result.error) ||
       !appendStringList(output, options.skipFileSuffixes, result.error) ||
       !appendStringList(output, options.skipDirectories, result.error)) {
+    return result;
+  }
+  if (output.size() > kMaxRequestBytes) {
+    result.error = QStringLiteral("USVFS request is larger than 512 MiB");
     return result;
   }
 
