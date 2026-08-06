@@ -583,6 +583,16 @@ MainWindow::MainWindow(Settings& settings, OrganizerCore& organizerCore,
   ui->modList->updateModCount();
   ui->espList->updatePluginCount();
   ui->statusBar->updateNormalMessage(m_OrganizerCore);
+
+  // On Wayland the compositor owns the window position (it is never visible to
+  // the app, so the saved geometry's position is always 0,0), and geometry
+  // must be applied before the window is first shown.  Restore just the size
+  // and maximized state here; position stays compositor-managed.  On X11 the
+  // full geometry is restored later in readSettings().
+  if (QGuiApplication::platformName().startsWith(QStringLiteral("wayland"),
+                                                  Qt::CaseInsensitive)) {
+    m_OrganizerCore.settings().geometry().restoreWindowSize(this);
+  }
 }
 
 void MainWindow::setupModList()
@@ -2388,6 +2398,7 @@ void MainWindow::storeSettings()
 
   s.geometry().saveState(this);
   s.geometry().saveGeometry(this);
+  s.geometry().saveWindowSize(this);
   s.geometry().saveDocks(this);
 
   s.geometry().saveVisibility(ui->statusBar);

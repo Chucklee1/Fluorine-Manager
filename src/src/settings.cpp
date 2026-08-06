@@ -776,6 +776,45 @@ bool GeometrySettings::restoreWindowGeometry(QWidget* w) const
   return false;
 }
 
+void GeometrySettings::saveWindowSize(const QMainWindow* w) const
+{
+  // when maximized we still want the restored (normal) size, matching what
+  // saveGeometry() would store
+  const QSize size = w->isMaximized() ? w->normalGeometry().size() : w->size();
+  set(m_Settings, "Geometry", geoSettingName(w) + "_size",
+      QString("%1x%2").arg(size.width()).arg(size.height()));
+  set(m_Settings, "Geometry", geoSettingName(w) + "_maximized", w->isMaximized());
+}
+
+bool GeometrySettings::restoreWindowSize(QMainWindow* w) const
+{
+  const QString base = geoSettingName(w);
+
+  bool parsed = false;
+  int width  = 0;
+  int height = 0;
+  if (auto v = getOptional<QString>(m_Settings, "Geometry", base + "_size")) {
+    const int x = v->section(QLatin1Char('x'), 0, 0).toInt(&parsed);
+    const int y = v->section(QLatin1Char('x'), 1, 1).toInt();
+    if (parsed && y > 0) {
+      width  = x;
+      height = y;
+    } else {
+      parsed = false;
+    }
+  }
+
+  if (parsed) {
+    w->resize(width, height);
+  }
+
+  if (getOptional<bool>(m_Settings, "Geometry", base + "_maximized").value_or(false)) {
+    w->showMaximized();
+  }
+
+  return parsed;
+}
+
 void GeometrySettings::ensureWindowOnScreen(QWidget* w)
 {
   // users report that the main window and/or dialogs are displayed off-screen;

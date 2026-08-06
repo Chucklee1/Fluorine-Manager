@@ -111,6 +111,9 @@ public:
   void saveGeometry(const QMainWindow* w);
   bool restoreGeometry(QMainWindow* w) const;
 
+  void saveWindowSize(const QMainWindow* w) const;
+  bool restoreWindowSize(QMainWindow* w) const;
+
   void saveGeometry(const QDialog* d);
   bool restoreGeometry(QDialog* d) const;
 
