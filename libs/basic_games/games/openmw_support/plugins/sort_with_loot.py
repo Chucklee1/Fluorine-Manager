@@ -29,13 +29,18 @@ message instead of raising at import time.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
 import urllib.request
+from collections import deque
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable, Iterable, Mapping, Sequence
 
 from PyQt6.QtCore import (
     QCoreApplication,
@@ -49,6 +54,8 @@ from PyQt6.QtCore import (
 from PyQt6.QtWidgets import QMessageBox, QProgressDialog
 
 import mobase
+
+from .. import openmw_cfg as _openmw_cfg
 
 # libloot is optional: probe for it without exploding the whole plugin import if
 # the native wheel is missing. The real module is registered as ``loot``.
@@ -91,9 +98,16 @@ except Exception as exc:  # pragma: no cover - depends on bundled wheel
 # Directory holding the bundled ``loot`` package, so a child interpreter can find
 # it via sys.path (see the subprocess pipeline below).
 _LOOT_SITE_PACKAGES = ""
+
+
+def _loot_module_search_path(module_file: str) -> str:
+    path = Path(module_file).resolve()
+    return str(path.parent.parent if path.name == "__init__.py" else path.parent)
+
+
 try:
     if _loot is not None and getattr(_loot, "__file__", None):
-        _LOOT_SITE_PACKAGES = os.path.dirname(os.path.dirname(_loot.__file__))
+        _LOOT_SITE_PACKAGES = _loot_module_search_path(_loot.__file__)
 except Exception:
     _LOOT_SITE_PACKAGES = ""
 
@@ -106,7 +120,7 @@ except Exception:
 # sidesteps that entirely and lets us enforce a hard timeout, so the UI can never
 # freeze. Protocol: argv[1]=request.json (inputs), argv[2]=response.json (result).
 _LOOT_SUBPROCESS_SRC = r'''
-import sys, os, json
+import sys, os, json, shutil, tempfile
 
 def main():
     req_path, resp_path = sys.argv[1], sys.argv[2]
@@ -120,27 +134,21 @@ def main():
         import loot as L
         gt = getattr(L.GameType, "OpenMW")
         game_path = req["game_path"]
-        local_path = req.get("local_path")
-        if local_path:
+        local_path = tempfile.mkdtemp(prefix="fluorine_loot_state_")
+        try:
+            with open(os.path.join(local_path, "openmw.cfg"), "w", encoding="utf-8") as cfg:
+                for plugin in req.get("condition_active", []):
+                    cfg.write("content=%s\n" % plugin)
             game = L.Game(gt, game_path, local_path)
-        else:
-            game = L.Game(gt, game_path)
-        try:
             game.set_additional_data_paths(list(req.get("data_dirs", [])))
-        except Exception:
-            pass
-        try:
-            game.load_current_load_order_state()
-        except Exception:
-            pass
-        masterlist = req.get("masterlist")
-        if masterlist:
-            try:
+            masterlist = req.get("masterlist")
+            if masterlist:
                 game.database().load_masterlist(masterlist)
-            except Exception:
-                pass
-        game.load_plugins(list(req["plugin_paths"]))
-        resp["sorted"] = list(game.sort_plugins(list(req["active"])))
+            game.load_current_load_order_state()
+            game.load_plugins(list(req["plugin_paths"]))
+            resp["sorted"] = list(game.sort_plugins(list(req["active"])))
+        finally:
+            shutil.rmtree(local_path, ignore_errors=True)
     except Exception as exc:
         resp["error"] = "%s: %s" % (type(exc).__name__, exc)
     with open(resp_path, "w", encoding="utf-8") as fh:
@@ -150,16 +158,501 @@ main()
 '''
 
 
-# OpenMW shares Morrowind's LOOT masterlist (same plugins); there is no separate
-# loot/openmw repo. The v0.26 branch matches the current metadata syntax and is
-# self-contained (its prelude is inlined), so plain load_masterlist() suffices.
+# OpenMW shares Morrowind's LOOT masterlist. This is intentionally pinned to the
+# commit at the v0.26 branch tip on 2025-12-09. Updating either value is a
+# separate, tested dependency update; sparse public metadata does not fully
+# describe curated lists such as NEMAS.
+_MASTERLIST_COMMIT = "748db08e41c2bfae6c82e9d4529b796b2df80666"
 _DEFAULT_MASTERLIST_URL = (
-    "https://raw.githubusercontent.com/loot/morrowind/v0.26/masterlist.yaml"
+    "https://raw.githubusercontent.com/loot/morrowind/"
+    f"{_MASTERLIST_COMMIT}/masterlist.yaml"
 )
-# Re-download the cached masterlist when it is older than this many seconds.
+_DEFAULT_MASTERLIST_SHA256 = (
+    "ffd36bc08df55565e9ad5f179b72ffe53e4404c06ec8c46773defe354a2f69c6"
+)
+# Re-download an unpinned override when its cache is older than this many seconds.
 _MASTERLIST_MAX_AGE = 24 * 60 * 60
 # Kezyma "OpenMW Player" stub esps — never feed these to LOOT.
 _STUB_SUFFIXES = (".omwaddon.esp", ".omwscripts.esp", ".omwgame.esp")
+
+
+@dataclass(frozen=True)
+class PluginSlot:
+    """One canonical state slot used by the non-destructive LOOT merge."""
+
+    name: str
+    active: bool
+    available: bool = True
+    primary: bool = False
+    groundcover: bool = False
+    required_masters: tuple[str, ...] = ()
+
+    @property
+    def wrapper(self) -> bool:
+        return self.name.casefold().endswith(_STUB_SUFFIXES)
+
+    @property
+    def omwscripts(self) -> bool:
+        return self.name.casefold().endswith(".omwscripts")
+
+    @property
+    def movable(self) -> bool:
+        return (
+            self.active
+            and self.available
+            and not self.primary
+            and not self.groundcover
+            and not self.omwscripts
+            and not self.wrapper
+        )
+
+    @property
+    def submitted_to_loot(self) -> bool:
+        return self.active and self.available and (self.primary or self.movable)
+
+
+@dataclass(frozen=True)
+class LootMerge:
+    order: tuple[str, ...]
+    request: tuple[str, ...]
+    moved: int
+
+
+@dataclass(frozen=True)
+class ResourceSelection:
+    root: Path
+    installation: str
+
+
+_OPENMW_PATH_TOKENS = ("?local?", "?userconfig?", "?userdata?", "?global?")
+
+
+def _resolve_openmw_path(
+    value: str, cfg_path: Path, token_roots: Mapping[str, Path]
+) -> Path:
+    """Resolve one OpenMW path in the context of its config source."""
+    parsed = _openmw_cfg.parse_openmw_path(value.strip())
+    if not parsed:
+        raise ValueError(f"Empty OpenMW path in {cfg_path}")
+    for token in _OPENMW_PATH_TOKENS:
+        if not parsed.startswith(token):
+            continue
+        root = token_roots.get(token)
+        if root is None:
+            raise ValueError(f"Unresolved OpenMW path token {token} in {cfg_path}")
+        suffix = parsed[len(token) :].lstrip("/\\")
+        return (root / suffix).expanduser().resolve(strict=False)
+    if parsed.startswith("?"):
+        raise ValueError(f"Unknown OpenMW path token in {cfg_path}: {parsed!r}")
+
+    path = Path(parsed).expanduser()
+    if not path.is_absolute():
+        path = cfg_path.parent / path
+    return path.resolve(strict=False)
+
+
+def _read_resource_source(
+    cfg_path: Path, token_roots: Mapping[str, Path]
+) -> tuple[Path | None, list[Path], bool]:
+    resource: Path | None = None
+    config_dirs: list[Path] = []
+    replace_config = False
+    lines = cfg_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        raw_key, raw_value = line.split("=", 1)
+        key = raw_key.strip().casefold()
+        value = raw_value.strip()
+        if key == "replace":
+            replace_config = replace_config or any(
+                target.casefold() == "config" for target in value.split()
+            )
+        elif key == "config" and value:
+            config_dirs.append(_resolve_openmw_path(value, cfg_path, token_roots))
+        elif key == "resources" and value:
+            resource = _resolve_openmw_path(value, cfg_path, token_roots)
+    return resource, config_dirs, replace_config
+
+
+def _effective_resource_from_cfg(
+    cfg_path: Path, token_roots: Mapping[str, Path]
+) -> Path | None:
+    """Return the effective scalar ``resources`` value for one config chain."""
+    root = cfg_path.expanduser().resolve(strict=False)
+    pending = deque([(root, frozenset())])
+    discovered: set[Path] = set()
+    sources: list[Path | None] = []
+
+    while pending:
+        path, ancestors = pending.popleft()
+        path = path.resolve(strict=False)
+        if path in ancestors:
+            raise ValueError(f"Cycle in OpenMW config chain at {path}")
+        if path in discovered:
+            raise ValueError(f"Repeated OpenMW config source: {path}")
+        discovered.add(path)
+        if not path.is_file():
+            continue
+
+        resource, config_dirs, replace_config = _read_resource_source(
+            path, token_roots
+        )
+        if replace_config and sources:
+            # The base local/global source is not itself selected by config=.
+            sources[1:] = []
+            pending.clear()
+            discovered = {root, path}
+        sources.append(resource)
+        next_ancestors = ancestors | {path}
+        pending.extend(
+            (directory / "openmw.cfg", next_ancestors)
+            for directory in config_dirs
+        )
+
+    return next((value for value in reversed(sources) if value is not None), None)
+
+
+def _native_token_roots(executable_dir: Path, prefix: Path) -> dict[str, Path]:
+    config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    ).expanduser()
+    data_home = Path(
+        os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))
+    ).expanduser()
+    return {
+        "?local?": executable_dir,
+        "?userconfig?": config_home / "openmw",
+        "?userdata?": data_home / "openmw",
+        "?global?": prefix / "share/games/openmw",
+    }
+
+
+def _flatpak_token_roots(deployment: Path | None) -> dict[str, Path]:
+    app_home = Path.home() / ".var/app/org.openmw.OpenMW"
+    roots = {
+        "?userconfig?": app_home / "config/openmw",
+        "?userdata?": app_home / "data/openmw",
+    }
+    if deployment is not None:
+        files = deployment / "files"
+        roots["?local?"] = files / "bin"
+        roots["?global?"] = files / "share/games/openmw"
+    return roots
+
+
+def _casefold_index(names: Iterable[str], label: str) -> dict[str, str]:
+    index: dict[str, str] = {}
+    for name in names:
+        key = name.casefold()
+        if key in index:
+            raise ValueError(
+                f"{label} contains duplicate or casing-ambiguous plugin "
+                f"identities: '{index[key]}' and '{name}'."
+            )
+        index[key] = name
+    return index
+
+
+def loot_sort_request(slots: Sequence[PluginSlot]) -> tuple[str, ...]:
+    request = tuple(slot.name for slot in slots if slot.submitted_to_loot)
+    if not request:
+        raise ValueError("There are no movable active plugins to sort with LOOT.")
+    _casefold_index(request, "The LOOT request")
+    return request
+
+
+def validate_required_masters(slots: Sequence[PluginSlot]) -> None:
+    """Reject missing, unavailable, or inactive masters before invoking LOOT."""
+    by_name = _casefold_index((slot.name for slot in slots), "The plugin state")
+    states = {slot.name.casefold(): slot for slot in slots}
+    for slot in slots:
+        if not slot.movable:
+            continue
+        for master in slot.required_masters:
+            master_slot = states.get(master.casefold())
+            if master_slot is None:
+                raise ValueError(
+                    f"'{slot.name}' requires missing master '{master}'."
+                )
+            if not master_slot.available:
+                raise ValueError(
+                    f"'{slot.name}' requires unavailable master "
+                    f"'{by_name[master.casefold()]}'."
+                )
+            if not master_slot.active:
+                raise ValueError(
+                    f"'{slot.name}' requires inactive master "
+                    f"'{by_name[master.casefold()]}'."
+                )
+
+
+def merge_active_slots(
+    slots: Sequence[PluginSlot],
+    sorted_request: Sequence[str],
+    primary_order: Sequence[str],
+) -> LootMerge:
+    """Merge a validated LOOT result into movable active slots only."""
+    validate_required_masters(slots)
+    request = loot_sort_request(slots)
+    request_index = _casefold_index(request, "The LOOT request")
+    result_index = _casefold_index(sorted_request, "The LOOT result")
+    if len(sorted_request) != len(request) or set(result_index) != set(request_index):
+        raise ValueError(
+            "LOOT returned a plugin set that does not exactly match the request."
+        )
+
+    canonical_result = tuple(request_index[name.casefold()] for name in sorted_request)
+    primary_keys = {name.casefold() for name in primary_order}
+    for slot in slots:
+        if slot.primary != (slot.name.casefold() in primary_keys):
+            raise ValueError(
+                f"Primary classification for '{slot.name}' does not match the "
+                "canonical primary list."
+            )
+    request_primaries = tuple(
+        name for name in request if name.casefold() in primary_keys
+    )
+    expected_primaries = tuple(
+        request_index[name.casefold()]
+        for name in primary_order
+        if name.casefold() in request_index
+    )
+    if request_primaries != expected_primaries:
+        raise ValueError("Primary plugins are not in canonical primary order.")
+
+    for index, name in enumerate(request):
+        if (
+            name.casefold() in primary_keys
+            and canonical_result[index].casefold() != name.casefold()
+        ):
+            raise ValueError(f"LOOT attempted to move fixed primary plugin '{name}'.")
+
+    movable_result = iter(
+        name for name in canonical_result if name.casefold() not in primary_keys
+    )
+    merged: list[str] = []
+    moved = 0
+    for slot in slots:
+        if slot.movable:
+            replacement = next(movable_result)
+            merged.append(replacement)
+            if replacement.casefold() != slot.name.casefold():
+                moved += 1
+        else:
+            merged.append(slot.name)
+    try:
+        next(movable_result)
+    except StopIteration:
+        pass
+    else:  # defensive: request/result validation should make this unreachable
+        raise ValueError("LOOT returned too many movable plugins.")
+
+    movable_indices = [index for index, slot in enumerate(slots) if slot.movable]
+    for barrier, script in (
+        (index, slot.name)
+        for index, slot in enumerate(slots)
+        if slot.name.casefold().endswith(".omwscripts")
+    ):
+        before = {
+            slots[index].name.casefold()
+            for index in movable_indices
+            if index < barrier
+        }
+        after = {
+            merged[index].casefold()
+            for index in movable_indices
+            if index < barrier
+        }
+        if before != after:
+            raise ValueError(
+                f"LOOT attempted to move plugins across fixed script slot "
+                f"{script!r}."
+            )
+
+    positions = {name.casefold(): index for index, name in enumerate(merged)}
+    for slot in slots:
+        if not slot.movable:
+            continue
+        for master in slot.required_masters:
+            if positions[master.casefold()] > positions[slot.name.casefold()]:
+                raise ValueError(
+                    f"LOOT placed '{slot.name}' before required master '{master}'."
+                )
+    return LootMerge(tuple(merged), request, moved)
+
+
+def _normalize_resource_root(candidate: Path) -> Path:
+    candidate = candidate.expanduser().resolve(strict=False)
+    return candidate.parent if candidate.name.casefold() == "resources" else candidate
+
+
+def _valid_resource_root(candidate: Path) -> Path | None:
+    root = _normalize_resource_root(candidate)
+    required = root / "resources" / "vfs"
+    if (
+        root.is_dir()
+        and required.is_dir()
+        and os.access(root, os.R_OK | os.X_OK)
+        and os.access(required, os.R_OK | os.X_OK)
+    ):
+        return root.resolve()
+    return None
+
+
+def select_resource_root(
+    override: str,
+    native_candidates: Sequence[Path],
+    flatpak_candidates: Sequence[Path],
+) -> ResourceSelection:
+    """Select one host-readable libloot OpenMW resource root."""
+    if override.strip():
+        selected = _valid_resource_root(Path(override.strip()))
+        if selected is None:
+            raise ValueError(
+                "The configured openmw_install_path is invalid or unreadable; it "
+                "must be an install root (or resources directory) containing "
+                "resources/vfs."
+            )
+        return ResourceSelection(selected, "override")
+
+    def valid_unique(candidates: Sequence[Path]) -> list[Path]:
+        roots: dict[str, Path] = {}
+        for candidate in candidates:
+            root = _valid_resource_root(candidate)
+            if root is not None:
+                roots.setdefault(os.path.normcase(str(root)), root)
+        return list(roots.values())
+
+    native = valid_unique(native_candidates)
+    flatpak = valid_unique(flatpak_candidates)
+    native_keys = {os.path.normcase(str(root)) for root in native}
+    flatpak = [
+        root
+        for root in flatpak
+        if os.path.normcase(str(root)) not in native_keys
+    ]
+    if len(native) > 1:
+        raise ValueError(
+            "Multiple native OpenMW resource installations were found; set "
+            "openmw_install_path explicitly."
+        )
+    if len(flatpak) > 1:
+        raise ValueError(
+            "Multiple Flatpak OpenMW resource installations were found; set "
+            "openmw_install_path to a host-visible path explicitly."
+        )
+    if native and flatpak:
+        raise ValueError(
+            "Both native and Flatpak OpenMW resources are available; select one "
+            "with openmw_install_path. This does not change the launch executable."
+        )
+    if native:
+        return ResourceSelection(native[0], "native")
+    if flatpak:
+        return ResourceSelection(flatpak[0], "flatpak")
+    if flatpak_candidates:
+        raise ValueError(
+            "Flatpak OpenMW resources are not host-readable; set "
+            "openmw_install_path to an explicit host-visible resources path."
+        )
+    raise ValueError(
+        "No valid OpenMW resources installation was found; set "
+        "openmw_install_path explicitly."
+    )
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_masterlist(
+    cache_path: Path,
+    url: str,
+    expected_sha256: str | None,
+    download: bool,
+    opener: Callable[..., object] = urllib.request.urlopen,
+) -> Path | None:
+    """Return a verified cache, updating it atomically when needed."""
+    cached_data: bytes | None = None
+    try:
+        cached_data = cache_path.read_bytes()
+    except FileNotFoundError:
+        pass
+    cache_valid = bool(cached_data) and (
+        expected_sha256 is None or _sha256(cached_data or b"") == expected_sha256
+    )
+
+    # Immutable pinned content never needs a network refresh once verified.
+    fresh = False
+    if cache_valid:
+        try:
+            fresh = (time.time() - cache_path.stat().st_mtime) < _MASTERLIST_MAX_AGE
+        except OSError:
+            pass
+    if cache_valid and (expected_sha256 is not None or fresh or not download):
+        return cache_path
+    if not download:
+        return None
+
+    try:
+        with opener(url, timeout=15) as response:  # type: ignore[attr-defined]
+            downloaded = response.read()
+    except Exception:
+        if cache_valid:
+            return cache_path
+        return None
+    if not downloaded:
+        if cache_valid:
+            return cache_path
+        raise RuntimeError("The LOOT masterlist download was empty.")
+    if expected_sha256 is not None and _sha256(downloaded) != expected_sha256:
+        if cache_valid:
+            return cache_path
+        raise RuntimeError(
+            "The downloaded LOOT masterlist failed SHA-256 verification."
+        )
+    _atomic_write_bytes(cache_path, downloaded)
+    return cache_path
+
+
+class _LootProgressDialog(QProgressDialog):
+    """Modal progress that cannot outlive its non-interruptible worker."""
+
+    def __init__(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        super().__init__(*args, **kwargs)
+        self._worker_finished = False
+
+    def finishWorker(self) -> None:
+        self._worker_finished = True
+        self.close()
+
+    def reject(self) -> None:
+        if self._worker_finished:
+            super().reject()
+
+    def closeEvent(self, event) -> None:  # noqa: ANN001
+        if not self._worker_finished:
+            event.ignore()
+            return
+        super().closeEvent(event)
 
 
 class _LootWorker(QObject):
@@ -181,8 +674,10 @@ class _LootWorker(QObject):
         local_path: str | None,
         data_dirs: list[str],
         active: list[str],
+        condition_active: list[str],
         masterlist_cache: str | None,
         masterlist_url: str,
+        masterlist_sha256: str | None,
         masterlist_download: bool,
     ) -> None:
         super().__init__()
@@ -190,8 +685,10 @@ class _LootWorker(QObject):
         self._local_path = local_path
         self._data_dirs = data_dirs
         self._active = active
+        self._condition_active = condition_active
         self._ml_cache = masterlist_cache
         self._ml_url = masterlist_url
+        self._ml_sha256 = masterlist_sha256
         self._ml_download = masterlist_download
         # Result, stashed here so the main thread can read it after join. The
         # finished signal is only used to stop the thread/close the dialog.
@@ -203,23 +700,22 @@ class _LootWorker(QObject):
         if not self._ml_cache:
             return None
         path = Path(self._ml_cache)
-        fresh = (
-            path.is_file()
-            and (time.time() - path.stat().st_mtime) < _MASTERLIST_MAX_AGE
-        )
-        if self._ml_download and not fresh:
-            try:
-                qInfo(f"OpenMW LOOT: downloading masterlist from {self._ml_url}")
-                with urllib.request.urlopen(self._ml_url, timeout=15) as resp:
-                    data = resp.read()
-                if data:
-                    path.write_bytes(data)
-            except Exception as exc:
-                qWarning(
-                    f"OpenMW LOOT: masterlist download failed ({exc}); "
-                    "using cache if present."
-                )
-        return str(path) if path.is_file() else None
+        try:
+            result = ensure_masterlist(
+                path,
+                self._ml_url,
+                self._ml_sha256,
+                self._ml_download,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Could not update the LOOT masterlist ({exc}).")
+        if result is None:
+            qWarning(
+                "OpenMW LOOT: no verified masterlist is available; continuing "
+                "with dependency-only sorting."
+            )
+            return None
+        return str(result)
 
     def _resolve_plugin_paths(self) -> tuple[list[str], list[str]]:
         """Map each active plugin name to its absolute file path.
@@ -267,10 +763,9 @@ class _LootWorker(QObject):
             # to its real file in the data dirs is both correct and fast.
             plugin_paths, missing = self._resolve_plugin_paths()
             if missing:
-                qWarning(
-                    "OpenMW LOOT: could not locate %d plugin file(s) in the data "
-                    "dirs; sorting the rest: %s"
-                    % (len(missing), ", ".join(missing[:10]))
+                raise RuntimeError(
+                    "Could not locate every requested plugin in the active data "
+                    "directories: %s" % ", ".join(missing[:10])
                 )
 
             self.progress.emit(
@@ -281,12 +776,17 @@ class _LootWorker(QObject):
             self.result_sorted = sorted_active
             self.result_error = ""
             self.result_done = True
-            self.finished.emit(sorted_active, "")
         except Exception as exc:  # any failure -> leave the order untouched
             self.result_sorted = None
             self.result_error = str(exc)
             self.result_done = True
-            self.finished.emit(None, str(exc))
+        application = QCoreApplication.instance()
+        if application is not None:
+            # moveToThread must be called from the object's current thread.
+            # Returning affinity to the GUI thread makes later Python/Qt object
+            # destruction safe after the worker thread has been joined.
+            self.moveToThread(application.thread())
+        self.finished.emit(self.result_sorted, self.result_error)
 
     def _sort_in_subprocess(
         self, plugin_paths: list[str], masterlist: str | None
@@ -311,6 +811,7 @@ class _LootWorker(QObject):
             "data_dirs": list(self._data_dirs),
             "plugin_paths": list(plugin_paths),
             "active": list(self._active),
+            "condition_active": list(self._condition_active),
             "masterlist": masterlist,
         }
 
@@ -455,13 +956,13 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
             ),
             mobase.PluginSetting(
                 "masterlist_url",
-                "URL of the LOOT masterlist to download",
+                "Advanced unpinned masterlist URL override",
                 _DEFAULT_MASTERLIST_URL,
             ),
             mobase.PluginSetting(
                 "openmw_install_path",
-                "OpenMW install dir (contains resources/). Empty = auto-detect "
-                "from openmw.cfg.",
+                "OpenMW install root or resources dir. Empty = explicit native/"
+                "Flatpak auto-detection when unambiguous.",
                 "",
             ),
         ]
@@ -517,6 +1018,26 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
     def _info(self, text: str) -> None:
         self._message(QMessageBox.Icon.Information, "Sort with LOOT", text)
 
+    def _confirm_sort(self) -> bool:
+        parent = None
+        try:
+            parent = self._parentWidget()
+        except Exception:
+            pass
+        answer = QMessageBox.question(
+            parent,
+            self._tr("Sort with LOOT"),
+            self._tr(
+                "LOOT metadata is not a substitute for list-specific compatibility "
+                "patches. Curated Wabbajack orders may depend on their exact order. "
+                "Sort only a copied/test profile unless the list author supports "
+                "LOOT sorting.\n\nContinue?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _setting(self, key: str, default):  # noqa: ANN001
         assert self._organizer is not None
         try:
@@ -527,27 +1048,79 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
 
     # --- inputs from the game / mod list -------------------------------
 
-    def _active_plugins_from_tab(self, game) -> list[str]:  # noqa: ANN001
-        """Active plugin filenames in the tab's load order, stubs dropped.
-
-        Reuses the game's own helper so the tool and the launch-time cfg export
-        agree on exactly which plugins are active and in what order.
-        """
+    def _game_plugins_feature(self):  # noqa: ANN201
         assert self._organizer is not None
-        plugin_list = self._organizer.pluginList()
         try:
-            return list(game._content_from_plugin_list(plugin_list))
-        except Exception:
-            # Fallback: derive it ourselves if the helper is unavailable.
-            names = list(plugin_list.pluginNames())
-            active = [
-                n
-                for n in names
-                if plugin_list.state(n) == mobase.PluginState.ACTIVE
-                and not n.lower().endswith(_STUB_SUFFIXES)
-            ]
-            active.sort(key=lambda n: plugin_list.priority(n))
-            return active
+            return self._organizer.gameFeatures().gameFeature(mobase.GamePlugins)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not access the OpenMW GamePlugins feature ({exc})."
+            )
+
+    def _loot_snapshot(
+        self, plugin_list: mobase.IPluginList
+    ) -> tuple[object, object, tuple[PluginSlot, ...]]:
+        """Read the state-backed adapter's complete immutable sort snapshot.
+
+        Required adapter contract:
+        ``lootSortSnapshot(plugin_list) -> {revision, rows}``, where rows are in
+        complete canonical state order and include name/active/available/primary/
+        groundcover. ``applyLootOrder`` below owns UI mutation, three-file
+        persistence, exact verification, and rollback.
+        """
+        feature = self._game_plugins_feature()
+        snapshotter = getattr(feature, "lootSortSnapshot", None)
+        applier = getattr(feature, "applyLootOrder", None)
+        if not callable(snapshotter) or not callable(applier):
+            raise RuntimeError(
+                "OpenMW GamePlugins does not yet provide the state-backed LOOT "
+                "transaction API (lootSortSnapshot/applyLootOrder). No order was "
+                "changed."
+            )
+        snapshot = snapshotter(plugin_list)
+        if not isinstance(snapshot, Mapping) or "revision" not in snapshot:
+            raise RuntimeError("GamePlugins returned an invalid LOOT snapshot.")
+        raw_rows = snapshot.get("rows")
+        if not isinstance(raw_rows, Sequence):
+            raise RuntimeError("GamePlugins returned no canonical LOOT rows.")
+
+        rows: list[PluginSlot] = []
+        for raw in raw_rows:
+            if isinstance(raw, PluginSlot):
+                slot = raw
+            elif isinstance(raw, Mapping):
+                try:
+                    slot = PluginSlot(
+                        name=str(raw["name"]),
+                        active=bool(raw["active"]),
+                        available=bool(raw["available"]),
+                        primary=bool(raw["primary"]),
+                        groundcover=bool(raw["groundcover"]),
+                    )
+                except (KeyError, TypeError) as exc:
+                    raise RuntimeError(
+                        f"GamePlugins returned an invalid LOOT row ({exc})."
+                    )
+            else:
+                raise RuntimeError("GamePlugins returned an invalid LOOT row type.")
+            if slot.movable:
+                try:
+                    masters = tuple(
+                        str(name) for name in plugin_list.masters(slot.name)
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Could not read required masters for '{slot.name}' ({exc})."
+                    )
+                slot = replace(slot, required_masters=masters)
+            rows.append(slot)
+
+        _casefold_index((slot.name for slot in rows), "The canonical plugin state")
+        validate_required_masters(rows)
+        if not any(slot.movable for slot in rows):
+            raise ValueError("There are no movable active plugins to sort with LOOT.")
+        loot_sort_request(rows)
+        return feature, snapshot["revision"], tuple(rows)
 
     def _data_directories(self, game) -> list[Path]:  # noqa: ANN001
         """Every directory LOOT must search to resolve a plugin filename.
@@ -596,219 +1169,202 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
             pass
         return dirs
 
-    def _locate_cfg(self, game) -> Path | None:  # noqa: ANN001
-        """Find the openmw.cfg, reusing the game module's detection."""
+    @staticmethod
+    def _resource_from_cfg(
+        cfg: Path, token_roots: Mapping[str, Path] | None = None
+    ) -> Path | None:
+        if token_roots is None:
+            token_roots = {token: cfg.parent for token in _OPENMW_PATH_TOKENS}
         try:
-            from ...game_openmw import _detect_openmw_cfg, _flatpak_installed
-
-            return _detect_openmw_cfg(prefer_flatpak=_flatpak_installed())
-        except Exception:
+            return _effective_resource_from_cfg(cfg, token_roots)
+        except (OSError, ValueError):
             return None
 
-    def _resolve_game_path(self, cfg: Path | None) -> Path | None:
-        """OpenMW install dir (the one whose resources/vfs holds the engine VFS).
+    def _resource_candidates(self) -> tuple[list[Path], list[Path]]:
+        """Discover native and Flatpak resources without choosing launch config."""
+        native: list[Path] = []
+        flatpak: list[Path] = []
+        executable_contexts: dict[tuple[Path, Path], tuple[Path, Path]] = {}
 
-        Order of preference: the user override setting, then the ``resources=``
-        line in openmw.cfg (its parent), then the cfg's own directory as a last
-        resort. libloot only reads engine builtins from here; for sorting we feed
-        the real plugin dirs via set_additional_data_paths, so a slightly-off
-        game_path (e.g. a Flatpak path unreachable from the host) is tolerated.
-        """
-        override = str(self._setting("openmw_install_path", "")).strip()
-        if override:
-            p = Path(override)
-            if p.is_dir():
-                return p
-            qWarning(f"OpenMW LOOT: openmw_install_path '{override}' is not a dir.")
+        for executable_name in ("openmw", "openmw-launcher"):
+            executable = shutil.which(executable_name)
+            if not executable:
+                continue
+            resolved = Path(executable).resolve()
+            prefix = resolved.parent.parent
+            executable_contexts.setdefault(
+                (resolved.parent, prefix), (resolved.parent, prefix)
+            )
+            native.extend(
+                (
+                    resolved.parent,
+                    prefix,
+                    prefix / "share/games/openmw",
+                )
+            )
+        try:
+            configured_executables = self._organizer.executablesList().executables()
+            for configured in configured_executables:
+                resolved = Path(
+                    configured.binaryInfo().absoluteFilePath()
+                ).resolve()
+                if resolved.name.casefold() not in ("openmw", "openmw-launcher"):
+                    continue
+                prefix = resolved.parent.parent
+                executable_contexts.setdefault(
+                    (resolved.parent, prefix), (resolved.parent, prefix)
+                )
+                native.extend(
+                    (
+                        resolved.parent,
+                        prefix,
+                        prefix / "share/games/openmw",
+                    )
+                )
+        except Exception:
+            pass
 
-        if cfg is not None and cfg.is_file():
+        if not executable_contexts:
+            executable_contexts[(Path("/usr/bin"), Path("/usr"))] = (
+                Path("/usr/bin"),
+                Path("/usr"),
+            )
+        for executable_dir, prefix in executable_contexts.values():
+            roots = _native_token_roots(executable_dir, prefix)
+            local_cfg = executable_dir / "openmw.cfg"
+            package_cfg = prefix / "etc/openmw/openmw.cfg"
+            system_cfg = Path("/etc/openmw/openmw.cfg")
+            if local_cfg.is_file():
+                cfg = local_cfg
+            elif package_cfg.is_file():
+                cfg = package_cfg
+            elif system_cfg.is_file():
+                cfg = system_cfg
+            else:
+                # This fallback is useful for portable/custom setups whose base
+                # source is not host-visible, while still treating the user file
+                # as one chain instead of collecting every resources= occurrence.
+                cfg = roots["?userconfig?"] / "openmw.cfg"
+            candidate = self._resource_from_cfg(cfg, roots)
+            if candidate is not None:
+                native.append(candidate)
+
+        flatpak_cfg = (
+            Path.home()
+            / ".var/app/org.openmw.OpenMW/config/openmw/openmw.cfg"
+        )
+        flatpak_location: Path | None = None
+        flatpak_executable = shutil.which("flatpak")
+        if flatpak_executable:
             try:
-                for raw in cfg.read_text(
-                    encoding="utf-8", errors="replace"
-                ).splitlines():
-                    line = raw.strip()
-                    if line.startswith("resources"):
-                        _, _, value = line.partition("=")
-                        value = value.strip().strip('"')
-                        if value:
-                            res = Path(value)
-                            if res.name.lower() == "resources":
-                                return res.parent
-                            return res.parent
-            except Exception:
-                pass
-            return cfg.parent
-        return None
+                result = subprocess.run(
+                    [
+                        flatpak_executable,
+                        "info",
+                        "--show-location",
+                        "org.openmw.OpenMW",
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    location = Path(
+                        result.stdout.decode("utf-8", "replace").strip()
+                    )
+                    if location.is_absolute():
+                        flatpak_location = location
+                        flatpak.extend(
+                            (
+                                location / "files/share/games/openmw",
+                                location / "share/games/openmw",
+                            )
+                        )
+            except Exception as exc:
+                qWarning(f"OpenMW LOOT: Flatpak resource discovery failed: {exc}")
 
-    def _masterlist_plan(self) -> tuple[str | None, str, bool]:
+        if flatpak_location is not None:
+            flatpak_roots = _flatpak_token_roots(flatpak_location)
+            flatpak_base_cfgs = (
+                flatpak_location / "files/bin/openmw.cfg",
+                flatpak_location / "files/etc/openmw/openmw.cfg",
+            )
+            flatpak_root_cfg = next(
+                (cfg for cfg in flatpak_base_cfgs if cfg.is_file()), flatpak_cfg
+            )
+            candidate = self._resource_from_cfg(flatpak_root_cfg, flatpak_roots)
+            if candidate is not None:
+                flatpak.append(candidate)
+        return native, flatpak
+
+    def _resolve_game_path(self) -> ResourceSelection:
+        native, flatpak = self._resource_candidates()
+        return select_resource_root(
+            str(self._setting("openmw_install_path", "")), native, flatpak
+        )
+
+    def _masterlist_plan(self) -> tuple[str | None, str, str | None, bool]:
         """Prepare the masterlist cache path/url on the main thread.
 
         The actual (blocking) download happens in the worker thread; here we only
         touch the organizer (main-thread only) to resolve the cache dir + settings.
-        Returns (cache_path | None, url, want_download).
+        Returns (cache_path | None, url, expected_sha256 | None, want_download).
         """
         assert self._organizer is not None
         url = str(self._setting("masterlist_url", _DEFAULT_MASTERLIST_URL))
         want_download = bool(self._setting("download_masterlist", True))
+        expected_sha256 = (
+            _DEFAULT_MASTERLIST_SHA256 if url == _DEFAULT_MASTERLIST_URL else None
+        )
+        if expected_sha256 is None:
+            qWarning(f"OpenMW LOOT: using unpinned advanced masterlist URL: {url}")
         try:
             cache_dir = Path(self._organizer.pluginDataPath()) / "openmw_loot"
             cache_dir.mkdir(parents=True, exist_ok=True)
-            return str(cache_dir / "masterlist.yaml"), url, want_download
+            if expected_sha256 is not None:
+                cache_name = f"masterlist-{_MASTERLIST_COMMIT[:12]}.yaml"
+            else:
+                url_key = hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+                cache_name = f"masterlist-unpinned-{url_key}.yaml"
+            return (
+                str(cache_dir / cache_name),
+                url,
+                expected_sha256,
+                want_download,
+            )
         except Exception as exc:
             qWarning(f"OpenMW LOOT: cannot prepare masterlist cache: {exc}")
-            return None, url, want_download
+            return None, url, expected_sha256, want_download
 
     # --- apply ---------------------------------------------------------
-
-    def _current_order(self, plugin_list: mobase.IPluginList) -> list[str]:
-        names = list(plugin_list.pluginNames())
-
-        def key(n: str):
-            try:
-                lo = plugin_list.loadOrder(n)
-                if lo is not None and lo >= 0:
-                    return lo
-            except Exception:
-                pass
-            try:
-                return plugin_list.priority(n)
-            except Exception:
-                return 0
-
-        return sorted(names, key=key)
 
     def _apply(
         self,
         plugin_list: mobase.IPluginList,
-        active_old: list[str],
-        sorted_active: list[str],
+        feature: object,
+        revision: object,
+        slots: Sequence[PluginSlot],
+        sorted_request: Sequence[str],
+        primary_order: Sequence[str],
     ) -> int:
-        """Rewrite the tab from the LOOT result. Returns plugins moved.
-
-        Validates that LOOT returned exactly the active set before touching
-        anything: a mismatch means we abort with no change.
-        """
-        old_set = {n.lower() for n in active_old}
-        new_set = {n.lower() for n in sorted_active}
-        if not sorted_active or old_set != new_set:
-            raise ValueError(
-                "LOOT returned a plugin set that does not match the active "
-                "plugins; refusing to apply."
-            )
-
-        current = self._current_order(plugin_list)
-        active_lower = old_set
-        inactive_tail = [n for n in current if n.lower() not in active_lower]
-        new_full = list(sorted_active) + inactive_tail
-
-        moved = sum(1 for a, b in zip(active_old, sorted_active) if a != b)
-        # IPluginList::setLoadOrder is void (it sets priorities in place); it has
-        # no return value to test. Apply, then verify by reading priorities back.
-        # NB: setLoadOrder refreshes priority() immediately but NOT loadOrder()
-        # (that is only resynced on a later refresh), so verify via priority().
-        plugin_list.setLoadOrder(new_full)
-
-        def _prio(name: str) -> int:
-            try:
-                return plugin_list.priority(name)
-            except Exception:
-                return -1
-
-        applied_active = sorted(active_old, key=_prio)
-        if [n.lower() for n in applied_active] != [n.lower() for n in sorted_active]:
-            raise RuntimeError(
-                "the core did not accept the new load order (read-back mismatch)."
-            )
-
-        # Persist to disk. setLoadOrder() only updates in-memory priorities;
-        # organizer.refresh(save_changes=True) saves the MODLIST, not the plugin
-        # order, and actually re-reads the ESP list from disk — so without an
-        # explicit write the new order is lost on the next refresh/restart (and
-        # re-running LOOT would recompute the same moves). The GamePlugins feature
-        # writes <profile>/plugins.txt + loadorder.txt from the current priorities,
-        # which is exactly what the launch-time openmw.cfg export then reads.
-        self._persist_load_order(plugin_list)
-
-        try:
-            self._organizer.refresh()  # type: ignore[union-attr]
-        except Exception:
-            pass
-        return moved
-
-    def _persist_load_order(self, plugin_list: mobase.IPluginList) -> None:
-        """Write <profile>/plugins.txt + loadorder.txt to disk.
-
-        Must run BEFORE any refresh: a refresh re-reads the ESP list from disk,
-        so persisting first is what makes the new order survive and reload.
-
-        We first ask the GamePlugins feature (the "proper" MO path), but that
-        call can silently no-op (e.g. its internal _last_read guard, or a pybind
-        object-identity quirk when the feature is fetched back from Python), so
-        we always verify the files exist and write them directly if not. The
-        direct write mirrors MO's own format: one plugin per line, ordered by
-        priority(), with a generated-by-MO header — loadorder.txt lists every
-        plugin, plugins.txt only the active ones.
-        """
+        """Delegate mutation/persistence/rollback to the state-backed adapter."""
+        merge = merge_active_slots(slots, sorted_request, primary_order)
+        applier = getattr(feature, "applyLootOrder", None)
+        if not callable(applier):
+            raise RuntimeError("GamePlugins lost its state-backed LOOT apply API.")
+        result = applier(plugin_list, revision, list(merge.order))
+        if result is False:
+            raise RuntimeError("GamePlugins rejected the transactional LOOT order.")
         assert self._organizer is not None
-
-        profile_dir = Path(self._organizer.profile().absolutePath())
-        plugins_txt = profile_dir / "plugins.txt"
-        loadorder_txt = profile_dir / "loadorder.txt"
-
-        # 1) Best-effort: the canonical GamePlugins path.
         try:
-            game_plugins = self._organizer.gameFeatures().gameFeature(
-                mobase.GamePlugins
+            self._organizer.refresh()
+        except Exception as exc:
+            qWarning(
+                "OpenMW LOOT: order persisted successfully, but refresh failed: "
+                f"{exc}"
             )
-            if game_plugins is not None:
-                game_plugins.writePluginLists(plugin_list)
-        except Exception as exc:  # never let this abort the (verified) direct write
-            qWarning(f"OpenMW LOOT: GamePlugins.writePluginLists failed: {exc}")
-
-        # 2) Verify; if the feature did not actually write, do it ourselves.
-        if self._files_nonempty(plugins_txt, loadorder_txt):
-            qInfo(f"OpenMW LOOT: persisted load order to {profile_dir}")
-            return
-
-        names = list(plugin_list.pluginNames())
-
-        def _prio(name: str) -> int:
-            try:
-                return plugin_list.priority(name)
-            except Exception:
-                return 1 << 30
-
-        ordered = sorted(names, key=_prio)
-
-        def _is_active(name: str) -> bool:
-            try:
-                return plugin_list.state(name) == mobase.PluginState.ACTIVE
-            except Exception:
-                return False
-
-        header = "# This file was automatically generated by Mod Organizer.\n"
-        try:
-            loadorder_txt.write_text(
-                header + "".join(f"{n}\n" for n in ordered), encoding="utf-8"
-            )
-            active_lines = [n for n in ordered if _is_active(n)]
-            plugins_txt.write_text(
-                header + "".join(f"{n}\n" for n in active_lines), encoding="utf-8"
-            )
-        except OSError as exc:
-            raise RuntimeError(f"could not write the load order to disk ({exc}).")
-
-        qInfo(
-            "OpenMW LOOT: persisted load order to %s (%d plugins, %d active)"
-            % (profile_dir, len(ordered), len(active_lines))
-        )
-
-    @staticmethod
-    def _files_nonempty(*paths: Path) -> bool:
-        try:
-            return all(p.is_file() and p.stat().st_size > 0 for p in paths)
-        except OSError:
-            return False
+        return merge.moved
 
     # --- main ----------------------------------------------------------
 
@@ -834,30 +1390,34 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
             self._error("Could not resolve the OpenMW game plugin.")
             return
 
-        active = self._active_plugins_from_tab(game)
-        if not active:
-            self._info(
-                "There are no active plugins to sort. Enable some plugins in "
-                "the Plugins tab first."
-            )
+        plugin_list = self._organizer.pluginList()
+        try:
+            feature, revision, slots = self._loot_snapshot(plugin_list)
+        except Exception as exc:
+            self._error(str(exc))
+            return
+        request = loot_sort_request(slots)
+        primary_order = tuple(str(name) for name in game.primaryPlugins())
+        if not self._confirm_sort():
             return
 
-        cfg = self._locate_cfg(game)
-        game_path = self._resolve_game_path(cfg)
-        if game_path is None:
-            self._error(
-                "Could not locate the OpenMW install. Run OpenMW once to create "
-                "openmw.cfg, or set 'openmw_install_path' in this tool's "
-                "settings, then try again."
-            )
+        try:
+            resources = self._resolve_game_path()
+        except Exception as exc:
+            self._error(str(exc))
             return
-        local_path = cfg.parent if cfg is not None else None
         data_dirs = self._data_directories(game)
-        ml_cache, ml_url, ml_download = self._masterlist_plan()
+        ml_cache, ml_url, ml_sha256, ml_download = self._masterlist_plan()
         qInfo(
-            "OpenMW LOOT: [ck0] inputs gathered on main thread; game_path=%r "
-            "cfg=%r data_dirs=%d active=%d ml_cache=%r"
-            % (str(game_path), str(cfg), len(data_dirs), len(active), ml_cache)
+            "OpenMW LOOT: inputs gathered; resource_root=%r installation=%s "
+            "data_dirs=%d request=%d ml_cache=%r"
+            % (
+                str(resources.root),
+                resources.installation,
+                len(data_dirs),
+                len(request),
+                ml_cache,
+            )
         )
 
         # --- run the blocking libloot pipeline off the UI thread -------
@@ -865,12 +1425,18 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
         # The result is applied back here, on the main thread, after the dialog
         # closes. On any failure the load order is left exactly as it was.
         worker = _LootWorker(
-            str(game_path),
-            str(local_path) if local_path is not None else None,
+            str(resources.root),
+            None,
             [str(p) for p in data_dirs],
-            list(active),
+            list(request),
+            [
+                slot.name
+                for slot in slots
+                if slot.active and slot.available and not slot.groundcover
+            ],
             ml_cache,
             ml_url,
+            ml_sha256,
             ml_download,
         )
         # No parent: `self` is a mobase plugin (IPluginTool/IPlugin), NOT a
@@ -885,7 +1451,7 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
         except Exception:
             parent = None
 
-        dialog = QProgressDialog(
+        dialog = _LootProgressDialog(
             self._tr("Preparing to sort with LOOT..."), "", 0, 0, parent
         )
         dialog.setWindowTitle(self._tr("Sort with LOOT (OpenMW)"))
@@ -911,14 +1477,22 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
         )
         # Stop the thread's event loop and close the modal dialog (which makes
         # exec() return) once the worker is done.
-        worker.finished.connect(thread.quit, Qt.ConnectionType.QueuedConnection)
-        worker.finished.connect(dialog.close, Qt.ConnectionType.QueuedConnection)
+        # quit() is thread-safe. A direct connection is required so an early
+        # title-bar close followed by wait() cannot starve a queued quit call on
+        # the blocked GUI thread.
+        worker.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+        worker.finished.connect(
+            dialog.finishWorker, Qt.ConnectionType.QueuedConnection
+        )
         thread.started.connect(worker.run)
 
         try:
             thread.start()
             dialog.exec()  # spins the event loop until the worker is done
-            thread.wait(5000)
+            # The title-bar close button can end dialog.exec() even though the
+            # worker is still inside libloot. Never release a live QThread; the
+            # subprocess has its own bounded timeout and will eventually finish.
+            thread.wait()
         finally:
             self._sort_dialog = None
             self._sort_thread = None
@@ -948,13 +1522,20 @@ class OpenMWSortWithLoot(mobase.IPluginTool, mobase.IPlugin):
 
         try:
             moved = self._apply(
-                self._organizer.pluginList(), list(active), list(sorted_active)
+                plugin_list,
+                feature,
+                revision,
+                slots,
+                list(sorted_active),
+                primary_order,
             )
         except Exception as exc:
             import traceback
 
-            qWarning("OpenMW LOOT: _apply failed: %s\n%s"
-                     % (exc, traceback.format_exc()))
+            qWarning(
+                "OpenMW LOOT: _apply failed: %s\n%s"
+                % (exc, traceback.format_exc())
+            )
             self._error(
                 "The sorted order from LOOT could not be applied safely, so the "
                 f"load order was left unchanged.\n\n{exc}"

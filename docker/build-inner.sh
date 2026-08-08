@@ -357,11 +357,12 @@ else
 fi
 
 # ── Bundle PBS Python 3.12 runtime ──
-# PYTHONHOME only needs lib/python3.12/ (the stdlib). We do NOT copy the
-# binary, headers, static lib, or .py sources — only stripped .pyc + .so.
+# Bundle the matching interpreter for isolated helpers plus lib/python3.12/.
+# Headers, static libraries, and source-only development files remain excluded.
 PBS_SRC="/opt/python-bundled"
 PYTHON_OUT="${OUT_DIR}/python"
-mkdir -p "${PYTHON_OUT}/lib"
+mkdir -p "${PYTHON_OUT}/bin" "${PYTHON_OUT}/lib"
+cp -Lf "${PBS_SRC}/bin/python3.12" "${PYTHON_OUT}/bin/python3.12"
 
 # Copy only the stdlib directory
 cp -a "${PBS_SRC}/lib/python3.12" "${PYTHON_OUT}/lib/"

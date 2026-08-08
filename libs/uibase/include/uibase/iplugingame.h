@@ -19,6 +19,25 @@ class QString;
 namespace MOBase
 {
 
+class IPluginGamePolicies
+{
+public:
+  virtual ~IPluginGamePolicies() = default;
+
+  virtual QStringList ignoredPluginFileSuffixes() const = 0;
+  virtual bool genericPluginStateFollowsModState() const = 0;
+  virtual bool parsePluginHeader(const QString& fileName) const = 0;
+  virtual bool enforcePluginRelationships() const = 0;
+};
+
+}  // namespace MOBase
+
+Q_DECLARE_INTERFACE(MOBase::IPluginGamePolicies,
+                    "com.tannin.ModOrganizer.PluginGamePolicies/1.0")
+
+namespace MOBase
+{
+
 // Game plugins can be loaded without an IOrganizer being available, in which
 // case detectGame() is called, but not init().
 //
@@ -437,6 +456,51 @@ public:
     }
     map[""] = dataDirs;
     return map;
+  }
+
+  /**
+   * @return filename suffixes that should not be exposed as load-order plugins
+   */
+  QStringList ignoredPluginFileSuffixes() const
+  {
+    if (const auto* policies = qobject_cast<const IPluginGamePolicies*>(this)) {
+      return policies->ignoredPluginFileSuffixes();
+    }
+    return {};
+  }
+
+  /**
+   * @return true if enabling or disabling a mod should also change the state of
+   *         its load-order plugins
+   */
+  bool genericPluginStateFollowsModState() const
+  {
+    if (const auto* policies = qobject_cast<const IPluginGamePolicies*>(this)) {
+      return policies->genericPluginStateFollowsModState();
+    }
+    return true;
+  }
+
+  /**
+   * @return true if metadata should be parsed from the given load-order plugin
+   */
+  bool parsePluginHeader(const QString& fileName) const
+  {
+    if (const auto* policies = qobject_cast<const IPluginGamePolicies*>(this)) {
+      return policies->parsePluginHeader(fileName);
+    }
+    return true;
+  }
+
+  /**
+   * @return true if the generic plugin list should enforce master relationships
+   */
+  bool enforcePluginRelationships() const
+  {
+    if (const auto* policies = qobject_cast<const IPluginGamePolicies*>(this)) {
+      return policies->enforcePluginRelationships();
+    }
+    return true;
   }
 };
 

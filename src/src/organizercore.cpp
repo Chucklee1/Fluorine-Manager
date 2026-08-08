@@ -2074,6 +2074,10 @@ void OrganizerCore::updateModActiveState(int index, bool active)
 void OrganizerCore::updateModsActiveState(const QList<unsigned int>& modIndices,
                                           bool active)
 {
+  if (!managedGame()->genericPluginStateFollowsModState()) {
+    return;
+  }
+
   int enabled = 0;
   // Use the game's own plugin extensions instead of a hardcoded esm/esl/esp
   // set, so games with their own formats (OpenMW: .omwaddon/.omwgame/

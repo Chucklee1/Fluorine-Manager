@@ -398,9 +398,11 @@ namespace mo2::python {
     };
 
     // game
-    class PyPluginGame : public PyPluginBaseNoFinal<IPluginGame> {
+    class PyPluginGame : public PyPluginBaseNoFinal<IPluginGame>,
+                         public IPluginGamePolicies {
         Q_OBJECT
-        Q_INTERFACES(MOBase::IPlugin MOBase::IPluginGame)
+        Q_INTERFACES(MOBase::IPlugin MOBase::IPluginGame
+                         MOBase::IPluginGamePolicies)
     public:
         void detectGame() override
         {
@@ -445,6 +447,36 @@ namespace mo2::python {
         QStringList pluginFileExtensions() const override
         {
             PYBIND11_OVERRIDE(QStringList, IPluginGame, pluginFileExtensions, );
+        }
+        QStringList ignoredPluginFileSuffixes() const override
+        {
+            pybind11::gil_scoped_acquire gil;
+            pybind11::function override_fn = pybind11::get_override(
+                static_cast<const IPluginGame*>(this), "ignoredPluginFileSuffixes");
+            return override_fn ? override_fn().cast<QStringList>() : QStringList{};
+        }
+        bool genericPluginStateFollowsModState() const override
+        {
+            pybind11::gil_scoped_acquire gil;
+            pybind11::function override_fn = pybind11::get_override(
+                static_cast<const IPluginGame*>(this),
+                "genericPluginStateFollowsModState");
+            return override_fn ? override_fn().cast<bool>() : true;
+        }
+        bool parsePluginHeader(const QString& fileName) const override
+        {
+            pybind11::gil_scoped_acquire gil;
+            pybind11::function override_fn = pybind11::get_override(
+                static_cast<const IPluginGame*>(this), "parsePluginHeader");
+            return override_fn ? override_fn(fileName).cast<bool>() : true;
+        }
+        bool enforcePluginRelationships() const override
+        {
+            pybind11::gil_scoped_acquire gil;
+            pybind11::function override_fn = pybind11::get_override(
+                static_cast<const IPluginGame*>(this),
+                "enforcePluginRelationships");
+            return override_fn ? override_fn().cast<bool>() : true;
         }
         QString sortToolName() const override
         {

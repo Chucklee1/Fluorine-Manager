@@ -28,6 +28,14 @@ add_test(
     NAME test_palworld_game_metadata
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_palworld_game_metadata.py
 )
+add_test(
+    NAME test_openmw_game_plugins
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_openmw_game_plugins.py
+)
+add_test(
+    NAME test_openmw_loot_sort
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_openmw_loot_sort.py
+)
 
 # ---------------------------------------------------------------------------
 # TES3 metadata and OpenMW Player stub parsing tests
