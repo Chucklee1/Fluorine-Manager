@@ -33,4 +33,15 @@ UsvfsResolvedSnapshot buildUsvfsResolvedSnapshot(
     const QStringList& skipFileSuffixes = {},
     const QStringList& skipDirectories = {});
 
+// Build the same conflict-resolved snapshot directly from MO2's ordered
+// directory mappings. USVFS only needs the winning physical path for each
+// visible file; catalog hashes, archive manifests, and base-game metadata are
+// unnecessary here. The providers are still enumerated on every launch, so
+// files added, removed, or replaced outside Fluorine are picked up without a
+// stale persistent snapshot cache.
+UsvfsResolvedSnapshot buildUsvfsResolvedSnapshotFromMappings(
+    const MappingType& mappings, const QString& dataDirectory,
+    const QStringList& skipFileSuffixes = {},
+    const QStringList& skipDirectories = {});
+
 #endif

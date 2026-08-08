@@ -3052,73 +3052,28 @@ bool OrganizerCore::beforeRun(
       // The Data tab may have mounted a preview FUSE tree earlier. USVFS maps
       // the original physical destinations, so tear the preview down first.
       m_USVFS.unmount();
+      const auto usvfsUnmountedAt = std::chrono::steady_clock::now();
       const MappingType mappings = fileMapping(profileName, customOverwrite);
+      const auto usvfsMappingsBuiltAt = std::chrono::steady_clock::now();
       m_USVFS.prepareRootFilesForUsvfs(mappings);
+      const auto usvfsRootPreparedAt = std::chrono::steady_clock::now();
 
       bool useResolvedSnapshot = false;
       QString snapshotDataDirectory;
       UsvfsResolvedSnapshot resolvedSnapshot;
       if (usvfsRuntimeSupportsResolvedSnapshots() && managedGame() != nullptr) {
         snapshotDataDirectory = managedGame()->dataDirectory().absolutePath();
-        const QString overwriteDirectory = m_Settings.paths().overwrite();
-        bool snapshotCancelled = false;
         try {
-          const auto mods = usvfsCatalogModsFromMappings(
-              mappings, snapshotDataDirectory, overwriteDirectory);
-          VfsCatalog catalog(
-              VfsCatalog::databasePath(snapshotDataDirectory.toStdString()));
-          VfsCatalogProgress finalProgress;
-          std::unique_ptr<QProgressDialog> progress;
-          if (qApp != nullptr && QThread::currentThread() == qApp->thread()) {
-            progress = std::make_unique<QProgressDialog>(
-                tr("Checking cached file metadata for USVFS…"), tr("Cancel"),
-                0, 0, QApplication::activeWindow());
-            progress->setWindowTitle(tr("Preparing USVFS snapshot"));
-            progress->setMinimumDuration(750);
-            progress->setAutoClose(false);
-          }
-
-          auto catalogResult = catalog.reconcileAndBuild(
-              snapshotDataDirectory.toStdString(), mods,
-              overwriteDirectory.toStdString(), true,
-              [&finalProgress, &progress,
-               &snapshotCancelled](const VfsCatalogProgress& state) {
-                finalProgress = state;
-                if (!progress) return;
-                progress->setLabelText(
-                    state.fingerprint_misses == 0
-                        ? tr("Checking cached metadata: %1 files verified…\n%2")
-                              .arg(state.files_scanned)
-                              .arg(QString::fromStdString(state.current_root))
-                        : tr("Verified %1 files; hashed %2 changed/new files…\n%3")
-                              .arg(state.files_scanned)
-                              .arg(state.files_hashed)
-                              .arg(QString::fromStdString(state.current_file)));
-                QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
-                if (progress->wasCanceled()) {
-                  snapshotCancelled = true;
-                  throw std::runtime_error("USVFS catalog verification cancelled");
-                }
-              });
-          if (progress) progress->close();
-          resolvedSnapshot = buildUsvfsResolvedSnapshot(
-              catalogResult.tree, snapshotDataDirectory,
-              m_Settings.skipFileSuffixes(), m_Settings.skipDirectories());
+          resolvedSnapshot = buildUsvfsResolvedSnapshotFromMappings(
+              mappings, snapshotDataDirectory, m_Settings.skipFileSuffixes(),
+              m_Settings.skipDirectories());
           useResolvedSnapshot = true;
-          const uint64_t fingerprintHits =
-              finalProgress.files_scanned -
-              std::min(finalProgress.files_scanned,
-                       finalProgress.fingerprint_misses);
           log::info(
-              "Prepared resolved USVFS snapshot: entries={} directories={} files={} "
-              "catalog_scanned={} fingerprint_hits={} fingerprint_misses={} "
-              "hashed={}",
+              "Prepared resolved USVFS snapshot directly: entries={} "
+              "directories={} files={}",
               resolvedSnapshot.mappings.size(), resolvedSnapshot.directoryCount,
-              resolvedSnapshot.fileCount, finalProgress.files_scanned,
-              fingerprintHits, finalProgress.fingerprint_misses,
-              finalProgress.files_hashed);
+              resolvedSnapshot.fileCount);
         } catch (const std::exception& error) {
-          if (snapshotCancelled) throw;
           log::warn("Unable to prepare resolved USVFS snapshot; using ordinary "
                     "recursive mappings: {}",
                     error.what());
@@ -3166,6 +3121,26 @@ bool OrganizerCore::beforeRun(
                         mappingPreparedAt - usvfsPreparationStart)
                         .count()
                  << " mappings=" << mappings.size() << Qt::endl;
+          stream << "[benchmark] format=1 phase=fuse_unmount elapsed_ms="
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        usvfsUnmountedAt - usvfsPreparationStart)
+                        .count()
+                 << Qt::endl;
+          stream << "[benchmark] format=1 phase=file_mapping elapsed_ms="
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        usvfsMappingsBuiltAt - usvfsUnmountedAt)
+                        .count()
+                 << Qt::endl;
+          stream << "[benchmark] format=1 phase=root_builder elapsed_ms="
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        usvfsRootPreparedAt - usvfsMappingsBuiltAt)
+                        .count()
+                 << Qt::endl;
+          stream << "[benchmark] format=1 phase=resolved_snapshot elapsed_ms="
+                 << std::chrono::duration_cast<std::chrono::milliseconds>(
+                        mappingPreparedAt - usvfsRootPreparedAt)
+                        .count()
+                 << Qt::endl;
           stream << "[benchmark] format=1 phase=request_serialize elapsed_ms="
                  << std::chrono::duration_cast<std::chrono::milliseconds>(
                         requestWrittenAt - requestWriteStart)

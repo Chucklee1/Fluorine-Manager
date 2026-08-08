@@ -155,6 +155,106 @@ TEST(VfsCatalog, BuildsResolvedUsvfsSnapshotWithoutBaseOrSkippedFiles)
             QString::fromStdString((overwrite / "generated/config.ini").string()));
 }
 
+TEST(VfsCatalog, DirectUsvfsSnapshotMatchesCatalogResolution)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path modA = temp.path() / "ModA";
+  const fs::path modB = temp.path() / "ModB";
+  const fs::path overwrite = temp.path() / "overwrite";
+  writeFile(data / "base-only.txt", "base");
+  writeFile(modA / "meshes/actors/a.nif", "a");
+  writeFile(modA / "shared.txt", "lower");
+  writeFile(modA / "meta.ini", "metadata");
+  writeFile(modA / ".git/ignored.txt", "ignored");
+  writeFile(modA / "hidden.mohidden", "ignored");
+  writeFile(modB / "shared.txt", "higher");
+  writeFile(overwrite / "generated/config.ini", "overwrite");
+
+  const MappingType mappings{
+      {QString::fromStdString(modA.string()),
+       QString::fromStdString(data.string()), true, false},
+      {QString::fromStdString(modB.string()),
+       QString::fromStdString(data.string()), true, false},
+      {QString::fromStdString(overwrite.string()),
+       QString::fromStdString(data.string()), true, true},
+  };
+  const auto catalog = VfsCatalog(temp.path() / "catalog.sqlite").reconcileAndBuild(
+      data.string(), {{"Mod A", modA.string()}, {"Mod B", modB.string()}},
+      overwrite.string(), true);
+  const auto expected = buildUsvfsResolvedSnapshot(
+      catalog.tree, QString::fromStdString(data.string()),
+      {QStringLiteral(".mohidden")}, {QStringLiteral(".git")});
+  const auto direct = buildUsvfsResolvedSnapshotFromMappings(
+      mappings, QString::fromStdString(data.string()),
+      {QStringLiteral(".mohidden")}, {QStringLiteral(".git")});
+
+  ASSERT_EQ(direct.directoryCount, expected.directoryCount);
+  ASSERT_EQ(direct.fileCount, expected.fileCount);
+  ASSERT_EQ(direct.mappings.size(), expected.mappings.size());
+  for (std::size_t index = 0; index < direct.mappings.size(); ++index) {
+    EXPECT_EQ(direct.mappings[index].source, expected.mappings[index].source);
+    EXPECT_EQ(direct.mappings[index].destination,
+              expected.mappings[index].destination);
+    EXPECT_EQ(direct.mappings[index].isDirectory,
+              expected.mappings[index].isDirectory);
+  }
+}
+
+TEST(VfsCatalog, DirectUsvfsSnapshotHonorsDestinationSubdirectories)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path mod = temp.path() / "Mod";
+  writeFile(mod / "plugin.dll", "plugin");
+
+  const auto snapshot = buildUsvfsResolvedSnapshotFromMappings(
+      {{QString::fromStdString(mod.string()),
+        QString::fromStdString((data / "SKSE/Plugins").string()), true, false}},
+      QString::fromStdString(data.string()));
+
+  EXPECT_EQ(snapshot.fileCount, 1u);
+  const auto file = std::find_if(
+      snapshot.mappings.begin(), snapshot.mappings.end(),
+      [](const Mapping& mapping) { return !mapping.isDirectory; });
+  ASSERT_NE(file, snapshot.mappings.end());
+  EXPECT_EQ(file->source, QString::fromStdString((mod / "plugin.dll").string()));
+  EXPECT_EQ(file->destination,
+            QString::fromStdString((data / "SKSE/Plugins/plugin.dll").string()));
+}
+
+TEST(VfsCatalog, DirectUsvfsSnapshotReadsLiveProviderContents)
+{
+  TempRoot temp;
+  const fs::path data = temp.path() / "Data";
+  const fs::path mod = temp.path() / "Mod";
+  writeFile(mod / "old.txt", "old");
+  const MappingType mappings{{QString::fromStdString(mod.string()),
+                              QString::fromStdString(data.string()), true, false}};
+
+  const auto initial = buildUsvfsResolvedSnapshotFromMappings(
+      mappings, QString::fromStdString(data.string()));
+  EXPECT_EQ(initial.fileCount, 1u);
+
+  fs::remove(mod / "old.txt");
+  writeFile(mod / "new.txt", "new");
+  const auto refreshed = buildUsvfsResolvedSnapshotFromMappings(
+      mappings, QString::fromStdString(data.string()));
+  EXPECT_EQ(refreshed.fileCount, 1u);
+  EXPECT_TRUE(std::any_of(
+      refreshed.mappings.begin(), refreshed.mappings.end(),
+      [&](const Mapping& mapping) {
+        return !mapping.isDirectory &&
+               mapping.source == QString::fromStdString((mod / "new.txt").string());
+      }));
+  EXPECT_TRUE(std::none_of(
+      refreshed.mappings.begin(), refreshed.mappings.end(),
+      [&](const Mapping& mapping) {
+        return !mapping.isDirectory &&
+               mapping.source == QString::fromStdString((mod / "old.txt").string());
+      }));
+}
+
 TEST(VfsCatalog, ExtractsOnlyUniqueDataProvidersForUsvfsCatalog)
 {
   const MappingType mappings{

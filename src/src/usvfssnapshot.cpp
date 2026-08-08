@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <map>
 #include <set>
+#include <system_error>
 
 namespace
 {
@@ -61,6 +62,16 @@ void collectVisibleFiles(const VfsNode& node, const fs::path& relative,
 std::size_t pathDepth(const fs::path& path)
 {
   return static_cast<std::size_t>(std::distance(path.begin(), path.end()));
+}
+
+std::vector<std::string> pathComponents(const fs::path& path)
+{
+  std::vector<std::string> components;
+  for (const fs::path& component : path) {
+    const std::string value = component.string();
+    if (!value.empty() && value != ".") components.push_back(value);
+  }
+  return components;
 }
 }
 
@@ -156,4 +167,82 @@ UsvfsResolvedSnapshot buildUsvfsResolvedSnapshot(
          QString::fromStdString((dataRoot / file.relative).string()), false, false});
   }
   return result;
+}
+
+UsvfsResolvedSnapshot buildUsvfsResolvedSnapshotFromMappings(
+    const MappingType& mappings, const QString& dataDirectory,
+    const QStringList& skipFileSuffixes, const QStringList& skipDirectories)
+{
+  const QString cleanData =
+      QDir::cleanPath(QDir::fromNativeSeparators(dataDirectory));
+  const QString dataPrefix = cleanData + QStringLiteral("/");
+  VfsTree tree;
+  tree.root.is_directory = true;
+  tree.dir_count = 1;
+
+  for (const Mapping& mapping : mappings) {
+    if (!mapping.isDirectory) continue;
+
+    const QString source =
+        QDir::cleanPath(QDir::fromNativeSeparators(mapping.source));
+    const QString destination =
+        QDir::cleanPath(QDir::fromNativeSeparators(mapping.destination));
+    if (destination != cleanData && !destination.startsWith(dataPrefix)) {
+      continue;
+    }
+
+    const fs::path sourceRoot(source.toStdString());
+    std::error_code error;
+    if (!fs::is_directory(sourceRoot, error)) continue;
+
+    fs::path destinationPrefix;
+    if (destination != cleanData) {
+      destinationPrefix = fs::path(
+          destination.mid(dataPrefix.size()).toStdString());
+    }
+    const std::vector<std::string> prefix =
+        pathComponents(destinationPrefix);
+
+    for (fs::recursive_directory_iterator iterator(
+             sourceRoot, fs::directory_options::skip_permission_denied, error),
+         end;
+         !error && iterator != end; iterator.increment(error)) {
+      const fs::directory_entry& entry = *iterator;
+      const fs::path relative = entry.path().lexically_relative(sourceRoot);
+      if (relative.empty() || relative == fs::path("meta.ini")) continue;
+
+      // The catalog uses lstat and deliberately excludes symlinks. Match that
+      // behavior while letting directory_entry reuse the d_type supplied by
+      // readdir instead of issuing a stat syscall for every ordinary file.
+      if (entry.is_symlink(error)) {
+        error.clear();
+        if (entry.is_directory(error)) iterator.disable_recursion_pending();
+        error.clear();
+        continue;
+      }
+      if (entry.is_directory(error)) {
+        error.clear();
+        continue;
+      }
+      if (error) {
+        error.clear();
+        continue;
+      }
+      if (!entry.is_regular_file(error)) {
+        error.clear();
+        continue;
+      }
+
+      std::vector<std::string> components = prefix;
+      const auto relativeComponents = pathComponents(relative);
+      components.insert(components.end(), relativeComponents.begin(),
+                        relativeComponents.end());
+      tree.root.insertFile(components, entry.path().string(), 0, {},
+                           sourceRoot.filename().string(), false, 0);
+      ++tree.file_count;
+    }
+  }
+
+  return buildUsvfsResolvedSnapshot(
+      tree, dataDirectory, skipFileSuffixes, skipDirectories);
 }

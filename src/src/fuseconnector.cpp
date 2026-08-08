@@ -2063,6 +2063,24 @@ static bool reflinkCopy(const std::string& src, const std::string& dst)
   return fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
 }
 
+static bool reflinkBackupCopy(const std::string& src, const std::string& dst)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::create_directories(fs::path(dst).parent_path(), ec);
+
+  // Root payloads commonly replace large upscaler DLLs. On copy-on-write
+  // filesystems an ordinary backup needlessly reads and writes hundreds of
+  // MiB on every launch, while a reflink is effectively metadata-only.
+  if (QProcess::execute("cp", {"--reflink=auto", "--preserve=all", "--",
+                                QString::fromStdString(src),
+                                QString::fromStdString(dst)}) == 0) {
+    return true;
+  }
+
+  return fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+}
+
 static void loadRootManifest(const std::string& storageDir,
                              std::vector<std::string>& deployed,
                              std::vector<std::string>& dirs,
@@ -2190,8 +2208,14 @@ void FuseConnector::deployRootFiles(
       if (fs::exists(dst, ec) && !deployedSet.contains(dst)) {
         const auto bak = (fs::path(backupDir) / relPath).string();
         fs::create_directories(fs::path(bak).parent_path(), ec);
-        fs::copy_file(dst, bak, fs::copy_options::overwrite_existing, ec);
-        m_rootBackups[dst] = bak;
+        if (reflinkBackupCopy(dst, bak)) {
+          m_rootBackups[dst] = bak;
+        } else {
+          std::fprintf(stderr,
+                       "[RootBuilder] failed to back up '%s' -> '%s'\n",
+                       dst.c_str(), bak.c_str());
+          continue;
+        }
       }
 
       // Deploy: always copy (exe/dll need it, and symlinks can confuse Wine)
