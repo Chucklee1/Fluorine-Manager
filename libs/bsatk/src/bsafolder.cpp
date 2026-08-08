@@ -18,6 +18,7 @@ License along with this library; if not, write to the Free Software
 Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 */
 
+#include <algorithm>
 #include <filesystem>
 #include <limits.h>
 
@@ -30,6 +31,13 @@ using std::fstream;
 
 namespace BSA
 {
+
+static std::filesystem::path archivePath(const std::string& value)
+{
+  std::string normalized = value;
+  std::replace(normalized.begin(), normalized.end(), '\\', '/');
+  return std::filesystem::path(normalized);
+}
 
 Folder::Folder() : m_Parent(nullptr), m_Name()
 {
@@ -138,7 +146,7 @@ std::string Folder::getFullPath() const
 
 void Folder::addFolderInt(Folder::Ptr folder)
 {
-  std::filesystem::path path(folder->m_Name);
+  std::filesystem::path path = archivePath(folder->m_Name);
   if (path.empty()) {
     folder->m_Parent = this;
     if (m_SubFoldersByName.contains("")) {
@@ -186,7 +194,7 @@ void Folder::addFolderInt(Folder::Ptr folder)
 
 Folder::Ptr Folder::addOrFindFolderInt(Folder* folder)
 {
-  std::filesystem::path path(folder->m_Name);
+  std::filesystem::path path = archivePath(folder->m_Name);
   if (path.empty()) {
     if (m_SubFoldersByName.contains("")) {
       return m_SubFoldersByName.at("");
@@ -252,7 +260,7 @@ Folder::Ptr Folder::addFolderFromFile(std::string filePath, BSAUInt size,
                                       FO4TextureHeader header,
                                       std::vector<FO4TextureChunk>& texChunks)
 {
-  std::filesystem::path file(filePath);
+  std::filesystem::path file = archivePath(filePath);
 
   Folder* tempFolder = new Folder();
 

@@ -29,19 +29,16 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
 #include <boost/thread.hpp>
 #include <cctype>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <lz4.h>
 #include <lz4frame.h>
 #include <memory>
+#include <optional>
 #include <queue>
 #include <sstream>
-#include <sys/stat.h>
 #include <zlib.h>
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <Windows.h>
-#endif
 
 using std::fstream;
 
@@ -1079,18 +1076,51 @@ void Archive::readFiles(std::queue<FileInfo>& queue, boost::mutex& mutex,
   }
 }
 
-inline bool fileExists(const std::string& name)
+static std::optional<std::filesystem::path>
+outputFilePath(const std::string& targetDirectory, const std::string& archivePath)
 {
-  struct stat buffer;
-  return stat(name.c_str(), &buffer) != -1;
+  namespace fs = std::filesystem;
+
+  std::string normalized = archivePath;
+  std::replace(normalized.begin(), normalized.end(), '\\', '/');
+  while (!normalized.empty() && normalized.front() == '/') {
+    normalized.erase(normalized.begin());
+  }
+
+  if (normalized.empty() || (normalized.size() >= 2 &&
+                             std::isalpha(static_cast<unsigned char>(normalized[0])) &&
+                             normalized[1] == ':')) {
+    return std::nullopt;
+  }
+
+  fs::path relativePath;
+  for (const fs::path& component : fs::path(normalized)) {
+    if (component.empty() || component == ".") {
+      continue;
+    }
+    if (component == "..") {
+      return std::nullopt;
+    }
+    relativePath /= component;
+  }
+
+  if (relativePath.empty() || relativePath.is_absolute() ||
+      relativePath.has_root_name()) {
+    return std::nullopt;
+  }
+
+  return fs::path(targetDirectory) / relativePath;
 }
 
 void Archive::extractFiles(const std::string& targetDirectory,
                            std::queue<FileInfo>& queue, boost::mutex& mutex,
                            boost::interprocess::interprocess_semaphore& bufferCount,
                            boost::interprocess::interprocess_semaphore& queueFree,
-                           int totalFiles, bool overwrite, int& filesDone)
+                           int totalFiles, bool overwrite, int& filesDone,
+                           EErrorCode& extractionResult)
 {
+  namespace fs = std::filesystem;
+
   for (int i = 0; i < totalFiles; ++i) {
     bufferCount.wait();
     if (boost::this_thread::interruption_requested()) {
@@ -1109,18 +1139,42 @@ void Archive::extractFiles(const std::string& targetDirectory,
 
     DataBuffer dataBuffer = fileInfo.data;
 
-    std::string fileName = makeString("%s\\%s", targetDirectory.c_str(),
-                                      fileInfo.file->getFilePath().c_str());
-    if (!overwrite && fileExists(fileName)) {
+    const auto fileName = outputFilePath(targetDirectory, fileInfo.file->getFilePath());
+    if (!fileName) {
+      if (extractionResult == ERROR_NONE) {
+        extractionResult = ERROR_INVALIDDATA;
+      }
       continue;
     }
 
-    std::ofstream outputFile(fileName.c_str(),
+    std::error_code error;
+    fs::create_directories(fileName->parent_path(), error);
+    if (error) {
+      if (extractionResult == ERROR_NONE) {
+        extractionResult = ERROR_ACCESSFAILED;
+      }
+      continue;
+    }
+
+    const bool exists = fs::exists(*fileName, error);
+    if (error) {
+      if (extractionResult == ERROR_NONE) {
+        extractionResult = ERROR_ACCESSFAILED;
+      }
+      continue;
+    }
+    if (!overwrite && exists) {
+      continue;
+    }
+
+    std::ofstream outputFile(*fileName,
                              fstream::out | fstream::binary | fstream::trunc);
 
     if (!outputFile.is_open()) {
+      if (extractionResult == ERROR_NONE) {
+        extractionResult = ERROR_ACCESSFAILED;
+      }
       continue;
-      // return ERROR_ACCESSFAILED;
     }
 
     if (m_Type != TYPE_FALLOUT4 && m_Type != TYPE_STARFIELD &&
@@ -1141,6 +1195,9 @@ void Archive::extractFiles(const std::string& targetDirectory,
               buffer.reset();
             }
           } catch (const std::exception&) {
+            if (extractionResult == ERROR_NONE) {
+              extractionResult = ERROR_INVALIDDATA;
+            }
             dataBuffer.first.reset();
             fileInfo.data.first.reset();
             continue;
@@ -1209,27 +1266,20 @@ void Archive::extractFiles(const std::string& targetDirectory,
                            dataBuffer.second);
         }
       } catch (const std::exception&) {
+        if (extractionResult == ERROR_NONE) {
+          extractionResult = ERROR_INVALIDDATA;
+        }
         dataBuffer.first.reset();
         fileInfo.data.first.reset();
         continue;
       }
     }
+    outputFile.flush();
+    if (!outputFile.good() && extractionResult == ERROR_NONE) {
+      extractionResult = ERROR_ACCESSFAILED;
+    }
     dataBuffer.first.reset();
     fileInfo.data.first.reset();
-  }
-}
-
-void Archive::createFolders(const std::string& targetDirectory, Folder::Ptr folder)
-{
-  for (std::vector<Folder::Ptr>::iterator iter = folder->m_SubFolders.begin();
-       iter != folder->m_SubFolders.end(); ++iter) {
-    std::string subDirName = targetDirectory + "/" + (*iter)->getName();
-#ifdef _WIN32
-    ::CreateDirectoryA(subDirName.c_str(), nullptr);
-#else
-    mkdir(subDirName.c_str(), 0755);
-#endif
-    createFolders(subDirName, *iter);
   }
 }
 
@@ -1238,8 +1288,6 @@ EErrorCode Archive::extractAll(
     const std::function<bool(int value, std::string fileName)>& progress,
     bool overwrite)
 {
-  createFolders(outputDirectory, m_RootFolder);
-
   std::vector<File::Ptr> fileList;
   m_RootFolder->collectFiles(fileList);
   std::sort(fileList.begin(), fileList.end(), ByOffset);
@@ -1247,7 +1295,8 @@ EErrorCode Archive::extractAll(
 
   std::queue<FileInfo> buffers;
   boost::mutex queueMutex;
-  int filesDone = 0;
+  int filesDone               = 0;
+  EErrorCode extractionResult = ERROR_NONE;
   boost::interprocess::interprocess_semaphore bufferCount(0);
   boost::interprocess::interprocess_semaphore queueFree(100);
 
@@ -1256,10 +1305,13 @@ EErrorCode Archive::extractAll(
                                          boost::ref(bufferCount), boost::ref(queueFree),
                                          fileList.begin(), fileList.end()));
 
-  boost::thread extractThread(boost::bind(
-      &Archive::extractFiles, this, outputDirectory, boost::ref(buffers),
-      boost::ref(queueMutex), boost::ref(bufferCount), boost::ref(queueFree),
-      static_cast<int>(fileList.size()), overwrite, boost::ref(filesDone)));
+  boost::thread extractThread([this, outputDirectory, &buffers, &queueMutex,
+                               &bufferCount, &queueFree, &fileList, overwrite,
+                               &filesDone, &extractionResult] {
+    extractFiles(outputDirectory, buffers, queueMutex, bufferCount, queueFree,
+                 static_cast<int>(fileList.size()), overwrite, filesDone,
+                 extractionResult);
+  });
 
   bool readerDone  = false;
   bool extractDone = false;
@@ -1287,7 +1339,7 @@ EErrorCode Archive::extractAll(
     }
   }
 
-  return ERROR_NONE;
+  return extractionResult;
 }
 
 bool Archive::compressed(const File::Ptr& file) const

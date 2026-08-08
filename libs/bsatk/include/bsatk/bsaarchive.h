@@ -231,8 +231,6 @@ private:
   EErrorCode extractDirect(File::Ptr file, std::ostream& outFile) const;
   EErrorCode extractCompressed(File::Ptr file, std::ostream& outFile) const;
 
-  void createFolders(const std::string& targetDirectory, Folder::Ptr folder);
-
   void readFiles(std::queue<FileInfo>& queue, boost::mutex& mutex,
                  boost::interprocess::interprocess_semaphore& bufferCount,
                  boost::interprocess::interprocess_semaphore& queueFree,
@@ -243,7 +241,8 @@ private:
                     boost::mutex& mutex,
                     boost::interprocess::interprocess_semaphore& bufferCount,
                     boost::interprocess::interprocess_semaphore& queueFree,
-                    int totalFiles, bool overwrite, int& filesDone);
+                    int totalFiles, bool overwrite, int& filesDone,
+                    EErrorCode& extractionResult);
 
   void cleanFolder(Folder::Ptr folder);
 

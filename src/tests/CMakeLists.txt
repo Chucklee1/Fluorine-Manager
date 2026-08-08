@@ -56,6 +56,27 @@ target_link_libraries(test_esptk_tes3 PRIVATE
 add_test(NAME test_esptk_tes3 COMMAND test_esptk_tes3)
 
 # ---------------------------------------------------------------------------
+# BSA/BA2 extraction path normalization tests
+# ---------------------------------------------------------------------------
+add_executable(test_bsatk_extraction EXCLUDE_FROM_ALL
+    test_bsatk_extraction.cpp
+)
+set_target_properties(test_bsatk_extraction PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_compile_definitions(test_bsatk_extraction PRIVATE
+    FLUORINE_TEST_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+target_link_libraries(test_bsatk_extraction PRIVATE
+    mo2::bsatk
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_bsatk_extraction COMMAND test_bsatk_extraction)
+
+# ---------------------------------------------------------------------------
 # Session-only plugin compatibility policy tests
 # ---------------------------------------------------------------------------
 add_executable(test_plugincompatibility EXCLUDE_FROM_ALL
@@ -367,9 +388,35 @@ target_link_libraries(test_staging_promotion PRIVATE
 )
 add_test(NAME test_staging_promotion COMMAND test_staging_promotion)
 
+# ---------------------------------------------------------------------------
+# Embedded-Python package replacement across in-process instance switches
+# ---------------------------------------------------------------------------
+add_executable(test_python_module_switch EXCLUDE_FROM_ALL
+    ${CMAKE_SOURCE_DIR}/libs/plugin_python/tests/runner/test_module_switch.cpp
+)
+set_target_properties(test_python_module_switch PROPERTIES
+    AUTOMOC OFF
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+)
+target_include_directories(test_python_module_switch PRIVATE
+    ${CMAKE_SOURCE_DIR}/libs/plugin_python/src/runner
+)
+target_link_libraries(test_python_module_switch PRIVATE
+    runner
+    GTest::gtest
+    GTest::gtest_main
+)
+add_test(NAME test_python_module_switch COMMAND test_python_module_switch)
+set_tests_properties(test_python_module_switch PROPERTIES
+    ENVIRONMENT
+        "PLUGIN_DIR=${CMAKE_SOURCE_DIR}/libs/plugin_python/tests/runner/plugins;PYTHONPATH=$<TARGET_FILE_DIR:mobase>"
+)
+
 # Register a "fluorine-tests" umbrella target that builds every test exe.
 add_custom_target(fluorine-tests
-    DEPENDS test_esptk_tes3 test_plugincompatibility test_metainiutils
+    DEPENDS test_esptk_tes3 test_bsatk_extraction
+            test_plugincompatibility test_metainiutils
             test_vfs_backend
             test_fluorineconfigownership
             test_heroicjson test_protondetection
@@ -377,4 +424,4 @@ add_custom_target(fluorine-tests
             test_vfs_descriptor_cleanup test_vfs_runtime_index
             test_game_save_migration
             test_vfs_catalog test_vfs_index
-            test_staging_promotion)
+            test_staging_promotion test_python_module_switch)

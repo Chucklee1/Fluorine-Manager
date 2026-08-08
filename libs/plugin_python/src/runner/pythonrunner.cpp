@@ -16,6 +16,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 
 #include "pybind11_qt/pybind11_qt.h"
 #include <pybind11/embed.h>
@@ -311,12 +312,30 @@ namespace mo2::python {
         py::module_ sys  = py::module_::import("sys");
         py::list sysPath = sys.attr("path");
 
-        // Converting to QStringList for Qt::CaseInsensitive and because .index()
-        // raise an exception:
-        const QStringList currentPath = sysPath.cast<QStringList>();
-        if (!currentPath.contains(folder, Qt::CaseInsensitive)) {
-            sysPath.insert(0, folder);
+        // Loading two directory plugins with the same package name relies on the
+        // selected plugin's parent directory taking precedence. Merely leaving an
+        // existing entry somewhere in sys.path can make Python resolve the package
+        // from an instance that was active earlier in this process.
+        const auto caseSensitivity =
+#ifdef _WIN32
+            Qt::CaseInsensitive;
+#else
+            Qt::CaseSensitive;
+#endif
+        const QString cleanFolder = QDir::cleanPath(folder);
+        for (py::ssize_t i = py::len(sysPath) - 1; i >= 0; --i) {
+            const py::handle item = sysPath[i];
+            if (!py::isinstance<py::str>(item)) {
+                continue;
+            }
+            const QString existing = QDir::cleanPath(py::cast<QString>(item));
+            if (existing.compare(cleanFolder, caseSensitivity) == 0) {
+                if (PySequence_DelItem(sysPath.ptr(), i) != 0) {
+                    throw py::error_already_set();
+                }
+            }
         }
+        sysPath.insert(0, cleanFolder);
     }
 
     QList<QObject*> PythonRunner::load(const QString& identifier)
@@ -360,20 +379,116 @@ namespace mo2::python {
             }
             else {
                 // Retrieve the module name:
-                QStringList parts      = identifier.split("/");
-                std::string moduleName = ToString(parts.takeLast());
-                ensureFolderInPath(parts.join("/"));
+                const QString moduleName = idInfo.fileName();
+                QString moduleFolderPath = idInfo.canonicalFilePath();
+                if (moduleFolderPath.isEmpty()) {
+                    moduleFolderPath = idInfo.absoluteFilePath();
+                }
+                const QDir moduleFolder(moduleFolderPath);
+                ensureFolderInPath(idInfo.absoluteDir().absolutePath());
 
                 // check if the module is already loaded
-                py::dict modules = py::module_::import("sys").attr("modules");
-                if (modules.contains(moduleName)) {
-                    py::module_ prev = modules[py::str(moduleName)];
+                py::module_ sys = py::module_::import("sys");
+                py::dict modules = sys.attr("modules");
+                const py::str moduleKey(moduleName.toStdString());
+
+                auto tryCastPath = [](const py::handle& object)
+                    -> std::optional<QString> {
+                    if (object.is_none() || !py::isinstance<py::str>(object)) {
+                        return {};
+                    }
+                    return py::cast<QString>(object);
+                };
+
+                auto pathBelongsToPlugin = [&moduleFolder](const QString& path) {
+                    if (path.isEmpty()) {
+                        return false;
+                    }
+
+                    QFileInfo pathInfo(path);
+                    QString absolutePath = pathInfo.canonicalFilePath();
+                    if (absolutePath.isEmpty()) {
+                        absolutePath = pathInfo.absoluteFilePath();
+                    }
+
+                    const QString relative =
+                        moduleFolder.relativeFilePath(absolutePath);
+                    return relative == "." ||
+                           (relative != ".." && !relative.startsWith("../") &&
+                            !QDir::isAbsolutePath(relative));
+                };
+
+                auto moduleBelongsToPlugin = [&](const py::handle& module) {
+                    if (module.is_none()) {
+                        return false;
+                    }
+
+                    if (PyObject_HasAttrString(module.ptr(), "__file__")) {
+                        const auto path = tryCastPath(module.attr("__file__"));
+                        if (path && pathBelongsToPlugin(*path)) {
+                            return true;
+                        }
+                    }
+
+                    if (PyObject_HasAttrString(module.ptr(), "__path__")) {
+                        const py::object paths = module.attr("__path__");
+                        for (py::ssize_t i = 0; i < py::len(paths); ++i) {
+                            const auto path = tryCastPath(paths[py::int_(i)]);
+                            if (path && pathBelongsToPlugin(*path)) {
+                                return true;
+                            }
+                        }
+                    }
+
+                    return false;
+                };
+
+                if (modules.contains(moduleKey) &&
+                    !moduleBelongsToPlugin(modules[moduleKey])) {
+                    // The embedded interpreter outlives in-process instance
+                    // switches. A package with this name may therefore still be
+                    // cached from the previous instance. Remove the package and
+                    // every child module before importing the selected copy.
+                    const QString childPrefix = moduleName + ".";
+                    const py::list keys = modules.attr("keys")();
+                    QStringList modulesToRemove;
+                    for (py::ssize_t i = 0; i < py::len(keys); ++i) {
+                        const py::handle key = keys[i];
+                        if (!py::isinstance<py::str>(key)) {
+                            continue;
+                        }
+                        const QString name = py::cast<QString>(key);
+                        if (name == moduleName || name.startsWith(childPrefix)) {
+                            modulesToRemove.append(name);
+                        }
+                    }
+
+                    std::sort(modulesToRemove.begin(), modulesToRemove.end(),
+                              [](const QString& lhs, const QString& rhs) {
+                                  return lhs.count('.') > rhs.count('.');
+                              });
+                    for (const auto& name : modulesToRemove) {
+                        const py::str key(name.toStdString());
+                        if (PyDict_Contains(modules.ptr(), key.ptr()) == 1 &&
+                            PyDict_DelItem(modules.ptr(), key.ptr()) != 0) {
+                            throw py::error_already_set();
+                        }
+                    }
+
+                    py::module_::import("importlib").attr("invalidate_caches")();
+                    log::debug(
+                        "discarded cached python package '{}' before loading '{}'",
+                        moduleName, identifier);
+                }
+
+                if (modules.contains(moduleKey)) {
+                    py::module_ prev = modules[moduleKey];
                     py::module_(prev).reload();
                     moduleDict = prev.attr("__dict__");
                 }
                 else {
-                    moduleDict =
-                        py::module_::import(moduleName.c_str()).attr("__dict__");
+                    moduleDict = py::module_::import(ToString(moduleName).c_str())
+                                     .attr("__dict__");
                 }
             }
 

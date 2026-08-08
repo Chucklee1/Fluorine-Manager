@@ -15,6 +15,7 @@ mo2_target_sources(runner-tests
 		test_installer.cpp
 		test_iplugin.cpp
 		test_lifetime.cpp
+		test_module_switch.cpp
 )
 mo2_target_sources(runner-tests
 	FOLDER src/mocks
@@ -30,6 +31,10 @@ mo2_target_sources(runner-tests
 		plugins/dummy-game.py
 		plugins/dummy-installer.py
 		plugins/dummy-iplugin.py
+		plugins/module_switch_a/same_plugin/__init__.py
+		plugins/module_switch_a/same_plugin/identity.py
+		plugins/module_switch_b/same_plugin/__init__.py
+		plugins/module_switch_b/same_plugin/identity.py
 )
 mo2_configure_tests(runner-tests NO_SOURCES WARNINGS 4)
 
