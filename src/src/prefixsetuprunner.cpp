@@ -2562,8 +2562,22 @@ bool PrefixSetupRunner::ensure7zz()
   const QString binDir = fluorineBinDir();
   m_7zzPath = binDir + "/7zz";
 
-  if (QFileInfo::exists(m_7zzPath))
-    return true;
+  if (QFileInfo::exists(m_7zzPath)) {
+    QFile helper(m_7zzPath);
+    const QByteArray header = helper.open(QIODevice::ReadOnly) ? helper.read(5)
+                                                               : QByteArray{};
+    const bool isElf64 =
+        header.size() == 5 && header[0] == '\x7f' && header.mid(1, 3) == "ELF" &&
+        static_cast<unsigned char>(header[4]) == 2;
+    if (isElf64)
+      return true;
+
+    emit logMessage("Replacing incompatible 7-Zip helper...");
+    if (!QFile::remove(m_7zzPath)) {
+      emit logMessage("ERROR: Failed to replace incompatible 7-Zip helper");
+      return false;
+    }
+  }
 
   emit logMessage("Downloading 7-Zip...");
   QDir().mkpath(binDir);
