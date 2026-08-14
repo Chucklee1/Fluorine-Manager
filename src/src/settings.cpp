@@ -809,7 +809,11 @@ bool GeometrySettings::restoreWindowSize(QMainWindow* w) const
   }
 
   if (getOptional<bool>(m_Settings, "Geometry", base + "_maximized").value_or(false)) {
-    w->showMaximized();
+    // Preserve the normal startup order: showMaximized() would make the
+    // window visible immediately while MainWindow is still being constructed.
+    // A state set on a hidden window takes effect when MOApplication calls
+    // show() after installing the remaining application-level connections.
+    w->setWindowState(w->windowState() | Qt::WindowMaximized);
   }
 
   return parsed;

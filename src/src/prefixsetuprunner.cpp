@@ -57,7 +57,7 @@ static const char* CABEXTRACT_URL =
     "cabextract-linux-x86_64.zip";
 
 static const char* SEVENZIP_URL =
-    "https://github.com/ip7z/7zip/releases/download/26.00/7z2600-linux-x86.tar.xz";
+    "https://github.com/ip7z/7zip/releases/download/26.00/7z2600-linux-x64.tar.xz";
 
 static const char* DOTNET9_X86_URL =
     "https://builds.dotnet.microsoft.com/dotnet/Runtime/9.0.14/"
